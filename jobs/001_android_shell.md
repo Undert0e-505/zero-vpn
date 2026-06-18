@@ -38,7 +38,7 @@ and a Settings/About screen. No networking. No VPN service yet.
 ## Constraints
 
 - Kotlin + Jetpack Compose
-- `compileSdk` 34, `minSdk` 29 (Android 10+)
+- `compileSdk` 36, `minSdk` 29 (Android 10+)
 - Dark theme only (TubePulse-style)
 - No third-party UI libraries (Material3 + Compose only)
 - Windows-native PowerShell build
