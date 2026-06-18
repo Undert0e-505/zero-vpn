@@ -1,0 +1,41 @@
+# Android
+*.apk
+*.aab
+*.dex
+*.class
+*.iml
+.gradle/
+build/
+local.properties
+*.keystore
+*.jks
+keystore.properties
+
+# Node / npm
+node_modules/
+
+# IDE
+.idea/
+*.swp
+*.swo
+*~
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Secrets — never commit these
+*.key
+*.pem
+*.conf.private
+secrets/
+.env
+.env.local
+
+# WireGuard configs (may contain private keys)
+*.conf
+!docs/examples/*.conf
+
+# Project brief (internal, not for public release)
+PROJECT_BRIEF.md
