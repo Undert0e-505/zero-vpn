@@ -451,11 +451,13 @@ def do_provision(state, token, priv_obj):
 
     # Phase 6: WireGuard
     emit(Phase.WIREGUARD, Status.RUNNING, "Installing WireGuard...")
+    # Use semicolons instead of && — apt post-invoke hooks can return non-zero
+    # even when packages install successfully. Check with `which wg` instead.
     r = subprocess.run(["ssh"] + opts + [
-        "sudo apt-get update -y && sudo apt-get install -y wireguard wireguard-tools"
+        "sudo apt-get update -y; sudo apt-get install -y wireguard wireguard-tools; which wg || exit 1"
     ], capture_output=True, text=True, timeout=180)
     if r.returncode != 0:
-        raise Exception(f"apt install failed: {r.stderr[-200:]}")
+        raise Exception(f"apt install failed: {r.stderr[-300:]}")
 
     r = subprocess.run(["ssh"] + opts + [
         'sudo sh -c "umask 077; wg genkey > /etc/wireguard/server.key; '
@@ -514,12 +516,27 @@ def do_destroy(state, token=None, priv_obj=None):
                'tenancy': state["tenancy_ocid"]}
         net = VirtualNetworkClient(cfg, signer=signer)
         compute = ComputeClient(cfg, signer=signer)
-        cid = state["tenancy_ocid"]
-    elif os.path.exists(os.path.join(DIR, "oci-config.txt")):
+    elif os.path.exists(os.path.join(DIR, "oci-config.txt")) and os.path.exists(os.path.join(DIR, "oci-key.pem")):
         config = oci.config.from_file(os.path.join(DIR, "oci-config.txt"))
-        net = VirtualNetworkClient(config)
-        compute = ComputeClient(config)
-        cid = config['tenancy']
+        try:
+            net = VirtualNetworkClient(config)
+            compute = ComputeClient(config)
+            # Test auth with a simple call
+            compute.list_instances(compartment_id=config['tenancy'], limit=1)
+        except Exception:
+            # API key auth failed — need to re-auth
+            log("  API key auth failed. Re-authenticating...")
+            re_token, _, re_priv_obj, re_auth = do_browser_auth(state)
+            if re_token:
+                state.update(re_auth)
+                signer = oci.auth.signers.SecurityTokenSigner(re_token, re_priv_obj)
+                cfg = {'region': state.get("home_region", state["region"]),
+                       'tenancy': state["tenancy_ocid"]}
+                net = VirtualNetworkClient(cfg, signer=signer)
+                compute = ComputeClient(cfg, signer=signer)
+            else:
+                log("  Re-auth failed. Cannot destroy.")
+                return
     else:
         log("  No auth available for destroy")
         return
