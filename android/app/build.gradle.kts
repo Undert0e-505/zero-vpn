@@ -29,6 +29,8 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
+            // Sign release with debug keystore for spike testing
+            signingConfig = signingConfigs.getByName("debug")
         }
     }
 
