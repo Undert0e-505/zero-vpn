@@ -15,6 +15,9 @@ collect Oracle credentials or card details.
 **Signup instructions:**
 <https://docs.oracle.com/en-us/iaas/Content/GSG/Tasks/signingup_topic-Sign_Up_for_Free_Oracle_Cloud_Promotion.htm>
 
+**Oracle Terms of Use:**
+<https://www.oracle.com/legal/terms/>
+
 **Preferred flow:**
 1. App opens Oracle signup in Chrome Custom Tab / external browser
 2. User signs up directly with Oracle
