@@ -20,22 +20,25 @@ Oracle credentials or card details.
 
 **Deployment paths:**
 
-1. **Cloud Shell script (developer/first-run path):** user opens OCI
+1. **In-app bootstrap (Phase 2A — primary product path):** user taps
+   "Create Oracle Free Exit" in the Android app, logs in via Oracle's
+   browser (Chrome Custom Tab), app provisions VM automatically. See
+   `docs/PHASE_2A_ORACLE_IN_APP.md`.
+2. **Cloud Shell script (developer/first-run path):** user opens OCI
    Cloud Shell, pastes one command, script creates all infrastructure
    via pre-authenticated OCI CLI. See `cloud-shell/oci-bootstrap.sh`.
-2. **Resource Manager / Terraform stack (product path):** user clicks
-   a link, OCI creates the stack, user reviews and applies. Future
-   work — not yet built.
+3. **Resource Manager / Terraform stack (alternative product path):**
+   user clicks a link, OCI creates the stack, user reviews and applies.
+   Future work — not yet built.
 
-**Both paths create:**
+**Both automated paths create:**
 - VCN + public subnet + internet gateway + route table
 - Security list with SSH (22/tcp) and WireGuard (51820/udp) ingress
 - Always Free eligible Ubuntu VM with public IP
 - SSH key injection from project keypair
 - Output: public IP, SSH username, connection instructions
 
-**Manual console navigation is NOT a supported path.** The OCI console
-VNIC/networking/firewall flow is too complex for a phone-based user.
+**Manual console navigation is NOT a supported path.**
 
 **Must not do:**
 - Automate Oracle signup
