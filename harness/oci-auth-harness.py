@@ -59,40 +59,46 @@ def generate_keypair():
 def public_key_to_jwk(public_key):
     """
     Convert an RSA public key to JWK format, then base64url-encode it.
-    This replicates exactly what the OCI CLI does in cli_setup_bootstrap.py.
+    This replicates EXACTLY what the OCI CLI does in cli_setup_bootstrap.py
+    via cli_util.to_jwk() and cli_util.base64url_encode().
     """
-    from cryptography.hazmat.primitives.asymmetric import rsa as rsa_mod
-    
-    # Get the public numbers
     numbers = public_key.public_numbers()
     
-    # Encode modulus and exponent as base64url
-    # The CLI uses: base64.urlsafe_b64encode (WITH padding)
-    # But for the JWK itself, we need unsigned big-endian bytes
+    # CLI uses bytes_from_int which computes minimal byte length
+    # (no leading 0x00 sign byte, same as our fixed version)
+    def bytes_from_int(val):
+        remaining = val
+        byte_length = 0
+        while remaining != 0:
+            remaining = remaining >> 8
+            byte_length += 1
+        return val.to_bytes(byte_length, 'big', signed=False)
     
-    # modulus as unsigned bytes
-    n_int = numbers.n
-    n_bytes = n_int.to_bytes((n_int.bit_length() + 7) // 8, 'big')
+    # CLI's base64url_encode STRIPS padding (.replace(b'=', b''))
+    def base64url_encode(data):
+        return base64.urlsafe_b64encode(data).replace(b'=', b'')
     
-    # exponent as unsigned bytes
-    e_int = numbers.e
-    e_bytes = e_int.to_bytes((e_int.bit_length() + 7) // 8, 'big')
+    def to_base64url_uint(val):
+        int_bytes = bytes_from_int(val)
+        if len(int_bytes) == 0:
+            int_bytes = b'\x00'
+        return base64url_encode(int_bytes)
     
-    # base64url encode (Python's urlsafe_b64encode includes padding)
-    n_b64 = base64.urlsafe_b64encode(n_bytes).decode('UTF-8')
-    e_b64 = base64.urlsafe_b64encode(e_bytes).decode('UTF-8')
+    # CLI JWK format: kty, n, e, kid — NO alg, NO use
+    n_b64 = to_base64url_uint(numbers.n).decode('UTF-8')
+    e_b64 = to_base64url_uint(numbers.e).decode('UTF-8')
     
-    jwk = {
-        "kty": "RSA",
-        "e": e_b64,
-        "n": n_b64,
-        "alg": "RS256",
-        "use": "sig"
+    jwk_obj = {
+        'kty': 'RSA',
+        'n': n_b64,
+        'e': e_b64,
+        'kid': 'Ignored'  # CLI includes this field
     }
-    
-    jwk_json = json.dumps(jwk, separators=(',', ':'))
+    jwk_json = json.dumps(jwk_obj)
     
     # CLI does: base64.urlsafe_b64encode(jwk_content.encode('UTF-8')).decode('UTF-8')
+    # This is the OUTER encoding for the public_key param — includes padding
+    # (but in practice the JSON length is always 396, divisible by 3, so no padding)
     jwk_b64 = base64.urlsafe_b64encode(jwk_json.encode('UTF-8')).decode('UTF-8')
     
     return jwk_json, jwk_b64
@@ -253,19 +259,25 @@ def main():
     jwk_obj = json.loads(jwk_json)
     assert jwk_obj['kty'] == 'RSA', f"kty should be RSA, got {jwk_obj['kty']}"
     assert jwk_obj['e'] == 'AQAB', f"e should be AQAB, got {jwk_obj['e']}"
+    assert jwk_obj['kid'] == 'Ignored', f"kid should be Ignored, got {jwk_obj.get('kid')}"
     assert 'n' in jwk_obj, "n field missing"
     
-    # Verify n is valid base64url
-    n_bytes = base64.urlsafe_b64decode(jwk_obj['n'])
-    assert len(n_bytes) == 256, f"n should be 256 bytes for 2048-bit RSA, got {len(n_bytes)}"
+    # Verify n is valid base64url WITHOUT padding
+    n_raw = jwk_obj['n']
+    assert '=' not in n_raw, "n should not have padding (=)"
+    assert '+' not in n_raw, "n contains + (should be base64url)"
+    assert '/' not in n_raw, "n contains / (should be base64url)"
     
-    # Verify no + or / in n (should be base64url, not base64)
-    assert '+' not in jwk_obj['n'], "n contains + (should be base64url)"
-    assert '/' not in jwk_obj['n'], "n contains / (should be base64url)"
+    # Decode n (add padding back for Python decoder)
+    n_padded = n_raw + '=' * (4 - len(n_raw) % 4) if len(n_raw) % 4 else n_raw
+    n_bytes = base64.urlsafe_b64decode(n_padded)
+    assert len(n_bytes) == 256, f"n should be 256 bytes for 2048-bit RSA, got {len(n_bytes)}"
     
     print(f"    kty: {jwk_obj['kty']} OK")
     print(f"    e: {jwk_obj['e']} OK")
-    print(f"    n: {len(jwk_obj['n'])} chars, {len(n_bytes)} bytes OK")
+    print(f"    kid: {jwk_obj['kid']} OK")
+    print(f"    n: {len(n_raw)} chars, {len(n_bytes)} bytes OK")
+    print(f"    No padding in n: OK")
     print(f"    No + or / in n: OK")
     print(f"    base64url(JWK): {jwk_b64[:60]}...")
     print()
