@@ -1,10 +1,12 @@
 package com.zerovpn.app.oci
 
-import android.app.Activity
-import android.content.Intent
-import android.net.Uri
+import android.annotation.SuppressLint
 import android.os.Bundle
 import android.util.Log
+import android.view.ViewGroup
+import android.webkit.WebResourceRequest
+import android.webkit.WebView
+import android.webkit.WebViewClient
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -15,25 +17,27 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.viewinterop.AndroidView
 import com.zerovpn.app.ui.theme.*
 import java.security.interfaces.RSAPublicKey
+import java.util.UUID
 
 /**
- * OCI Bootstrap Spike Activity
+ * OCI Bootstrap Spike Activity — WebView approach
  *
- * This is a minimal test to verify that the Oracle OAuth2 flow works
- * from an Android app using Chrome Custom Tab with a custom redirect URI.
+ * Oracle OAuth2 rejects custom-scheme redirect URIs ("invalid redirect uri").
+ * The CLI uses redirect_uri=http://localhost:8181 with a local HTTP server.
+ * Android can't run a localhost HTTP server, but we CAN use a WebView and
+ * intercept the redirect before it tries to load localhost.
  *
  * Flow:
  * 1. Generate RSA keypair
- * 2. Build Oracle OAuth2 authorize URL with public key as JWK
- * 3. Open in Chrome Custom Tab
+ * 2. Build Oracle OAuth2 authorize URL with redirect_uri=http://localhost:8181
+ * 3. Load it in a WebView
  * 4. User logs in to Oracle
- * 5. Oracle redirects to zerovpn://auth/callback with security token
- * 6. We capture the token and extract user/tenancy OCIDs
- *
- * If this works, the full bootstrap (API key upload + VM provisioning)
- * can be built on top of it.
+ * 5. Oracle redirects to http://localhost:8181/?security_token=<JWT>#...
+ * 6. WebViewClient intercepts the navigation, extracts the token from the URL
+ * 7. Show the extracted token + user/tenancy OCIDs
  */
 class OciBootstrapActivity : ComponentActivity() {
 
@@ -41,14 +45,16 @@ class OciBootstrapActivity : ComponentActivity() {
         private const val TAG = "OciBootstrap"
         private const val REGION = "uk-london-1"
         private const val REALM = "oraclecloud.com"
-        private const val REDIRECT_URI = "zerovpn://auth/callback"
+        private const val REDIRECT_URI = "http://localhost:8181"
+        private const val REDIRECT_HOST = "localhost"
     }
 
     private var bootstrapState by mutableStateOf(BootstrapState.IDLE)
     private var statusMessage by mutableStateOf("")
-    private var capturedToken by mutableStateOf<String?>(null)
     private var extractedInfo by mutableStateOf("")
+    private var authUrl by mutableStateOf("")
 
+    @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
@@ -57,57 +63,9 @@ class OciBootstrapActivity : ComponentActivity() {
                 state = bootstrapState,
                 statusMessage = statusMessage,
                 extractedInfo = extractedInfo,
+                authUrl = authUrl,
                 onStart = { startBootstrap() },
             )
-        }
-
-        // Check if we were launched via the redirect URI
-        handleIntent(intent)
-    }
-
-    override fun onNewIntent(intent: Intent) {
-        super.onNewIntent(intent)
-        handleIntent(intent)
-    }
-
-    private fun handleIntent(intent: Intent?) {
-        val data = intent?.data ?: return
-        Log.d(TAG, "Received redirect: $data")
-
-        if (data.toString().startsWith(REDIRECT_URI)) {
-            bootstrapState = BootstrapState.REDIRECT_RECEIVED
-            statusMessage = "Redirect received! Extracting token..."
-
-            val token = OciRequestSigner.extractSecurityToken(data.toString())
-            if (token != null) {
-                capturedToken = token
-                val claims = OciRequestSigner.decodeJwt(token)
-                val userOcid = claims["sub"] as? String ?: "unknown"
-                val tenancyOcid = claims["tenant"] as? String ?: "unknown"
-
-                extractedInfo = """
-                    ✅ Security token captured!
-                    
-                    User OCID: $userOcid
-                    Tenancy OCID: $tenancyOcid
-                    
-                    Token length: ${token.length} chars
-                    Token prefix: ${token.take(50)}...
-                    
-                    Next steps (not implemented in spike):
-                    1. Upload public key as API key
-                    2. Use API key signing for all calls
-                    3. Provision VCN + subnet + VM
-                    4. Return public IP to caller
-                """.trimIndent()
-
-                bootstrapState = BootstrapState.SUCCESS
-                statusMessage = "Auth spike successful!"
-            } else {
-                extractedInfo = "❌ No security_token found in redirect URL.\n\nFull URL: $data"
-                bootstrapState = BootstrapState.FAILED
-                statusMessage = "Token extraction failed"
-            }
         }
     }
 
@@ -124,8 +82,8 @@ class OciBootstrapActivity : ComponentActivity() {
             val jwk = OciRequestSigner.publicKeyToJwk(publicKey)
             val jwkBase64 = OciRequestSigner.base64UrlEncode(jwk)
 
-            // 3. Build authorize URL
-            val authUrl = OciRequestSigner.buildAuthorizeUrl(
+            // 3. Build authorize URL with localhost redirect (same as CLI)
+            authUrl = OciRequestSigner.buildAuthorizeUrl(
                 region = REGION,
                 realm = REALM,
                 publicKeyJwkBase64 = jwkBase64,
@@ -133,23 +91,186 @@ class OciBootstrapActivity : ComponentActivity() {
             )
 
             Log.d(TAG, "Authorize URL: $authUrl")
-            statusMessage = "Opening Oracle login in Chrome Custom Tab..."
-            bootstrapState = BootstrapState.OPENING_BROWSER
-
-            // 4. Open in Chrome Custom Tab
-            val uri = Uri.parse(authUrl)
-            val intent = Intent(Intent.ACTION_VIEW, uri).apply {
-                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            }
-            startActivity(intent)
-
-            statusMessage = "Waiting for Oracle login redirect..."
+            statusMessage = "Loading Oracle login in WebView..."
             bootstrapState = BootstrapState.WAITING_FOR_REDIRECT
 
         } catch (e: Exception) {
             Log.e(TAG, "Bootstrap failed", e)
             bootstrapState = BootstrapState.FAILED
             statusMessage = "Error: ${e.message}"
+        }
+    }
+
+    @SuppressLint("SetJavaScriptEnabled")
+    @Composable
+    private fun OracleWebView() {
+        AndroidView(
+            factory = { context ->
+                WebView(context).apply {
+                    settings.javaScriptEnabled = true
+                    settings.domStorageEnabled = true
+                    layoutParams = ViewGroup.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                    )
+                    webViewClient = object : WebViewClient() {
+                        override fun shouldOverrideUrlLoading(
+                            view: WebView?,
+                            request: WebResourceRequest?,
+                        ): Boolean {
+                            val url = request?.url?.toString() ?: return false
+                            Log.d(TAG, "Navigation: $url")
+
+                            // Check if this is the redirect to localhost
+                            if (url.startsWith(REDIRECT_URI) || url.contains(REDIRECT_HOST)) {
+                                // Extract the security token from the URL
+                                // The token may be in the query (?security_token=...)
+                                // or in the fragment (#security_token=...)
+                                val token = OciRequestSigner.extractSecurityToken(url)
+                                    ?: extractTokenFromFragment(url)
+
+                                if (token != null) {
+                                    handleToken(token)
+                                    return true // Stop the WebView from loading localhost
+                                }
+                            }
+                            return false // Let other URLs load normally
+                        }
+                    }
+                    loadUrl(authUrl)
+                }
+            },
+            modifier = Modifier.fillMaxSize(),
+        )
+    }
+
+    private fun extractTokenFromFragment(url: String): String? {
+        // Oracle redirects with the token in the fragment: #security_token=...
+        // But the WebView may give us the full URL or just the localhost URL
+        val fragment = url.substringAfter("#", "")
+        val params = fragment.split("&").associate {
+            val (k, v) = it.split("=", limit = 2)
+            k to (v ?: "")
+        }
+        return params["security_token"]
+    }
+
+    private fun handleToken(token: String) {
+        runOnUiThread {
+            bootstrapState = BootstrapState.REDIRECT_RECEIVED
+            statusMessage = "Token captured!"
+
+            try {
+                val claims = OciRequestSigner.decodeJwt(token)
+                val userOcid = claims["sub"] as? String ?: "unknown"
+                val tenancyOcid = claims["tenant"] as? String ?: "unknown"
+
+                extractedInfo = """
+                    ✅ Security token captured!
+
+                    User OCID: $userOcid
+                    Tenancy OCID: $tenancyOcid
+
+                    Token length: ${token.length} chars
+                    Token prefix: ${token.take(50)}...
+
+                    Next steps (not implemented in spike):
+                    1. Upload public key as API key
+                    2. Use API key signing for all calls
+                    3. Provision VCN + subnet + VM
+                    4. Return public IP to caller
+                """.trimIndent()
+
+                bootstrapState = BootstrapState.SUCCESS
+                statusMessage = "Auth spike successful! WebView approach works."
+            } catch (e: Exception) {
+                extractedInfo = "Token captured but JWT decode failed: ${e.message}\n\nToken: ${token.take(200)}..."
+                bootstrapState = BootstrapState.SUCCESS
+                statusMessage = "Token captured (JWT decode issue)"
+            }
+        }
+    }
+
+    @Composable
+    private fun BootstrapScreen(
+        state: BootstrapState,
+        statusMessage: String,
+        extractedInfo: String,
+        authUrl: String,
+        onStart: () -> Unit,
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(Bg)
+                .padding(24.dp),
+            verticalArrangement = Arrangement.spacedBy(16.dp),
+        ) {
+            Text(
+                text = "OCI Bootstrap Spike",
+                style = MaterialTheme.typography.headlineMedium,
+                color = TextPrimary,
+            )
+
+            when (state) {
+                BootstrapState.IDLE -> {
+                    Text(
+                        text = "This tests the Oracle OAuth2 flow using a WebView. " +
+                            "The custom-scheme redirect was rejected by Oracle, " +
+                            "so we use redirect_uri=localhost and intercept it.",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = TextDim,
+                    )
+                    Button(
+                        onClick = onStart,
+                        colors = ButtonDefaults.buttonColors(containerColor = Accent),
+                    ) {
+                        Text("Start Oracle Login", color = Bg)
+                    }
+                }
+
+                BootstrapState.GENERATING_KEY,
+                BootstrapState.OPENING_BROWSER -> {
+                    CircularProgressIndicator(color = Accent)
+                    Text(statusMessage, color = TextPrimary, fontFamily = FontFamily.Monospace)
+                }
+
+                BootstrapState.WAITING_FOR_REDIRECT -> {
+                    Text(
+                        text = "Complete the login in the WebView below.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = TextDim,
+                    )
+                    OracleWebView()
+                }
+
+                BootstrapState.REDIRECT_RECEIVED,
+                BootstrapState.SUCCESS,
+                BootstrapState.FAILED -> {
+                    Text(
+                        text = "Status: $statusMessage",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = if (state == BootstrapState.SUCCESS) Accent else Danger,
+                        fontFamily = FontFamily.Monospace,
+                    )
+                    if (extractedInfo.isNotEmpty()) {
+                        HorizontalDivider(color = Surface)
+                        Text(
+                            text = extractedInfo,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = TextPrimary,
+                            fontFamily = FontFamily.Monospace,
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                    }
+                    Button(
+                        onClick = { finish() },
+                        colors = ButtonDefaults.buttonColors(containerColor = Surface),
+                    ) {
+                        Text("Close", color = TextPrimary)
+                    }
+                }
+            }
         }
     }
 }
@@ -162,70 +283,4 @@ enum class BootstrapState {
     REDIRECT_RECEIVED,
     SUCCESS,
     FAILED,
-}
-
-@Composable
-private fun BootstrapScreen(
-    state: BootstrapState,
-    statusMessage: String,
-    extractedInfo: String,
-    onStart: () -> Unit,
-) {
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(Bg)
-            .padding(24.dp),
-        verticalArrangement = Arrangement.spacedBy(16.dp),
-    ) {
-        Text(
-            text = "OCI Bootstrap Spike",
-            style = MaterialTheme.typography.headlineMedium,
-            color = TextPrimary,
-        )
-
-        Text(
-            text = "This is a development test to verify the Oracle OAuth2 redirect flow works from Android.",
-            style = MaterialTheme.typography.bodyMedium,
-            color = TextDim,
-        )
-
-        if (state == BootstrapState.IDLE) {
-            Button(
-                onClick = onStart,
-                colors = ButtonDefaults.buttonColors(containerColor = Accent),
-            ) {
-                Text("Start Oracle Login", color = Bg)
-            }
-        }
-
-        if (statusMessage.isNotEmpty()) {
-            Text(
-                text = "Status: $statusMessage",
-                style = MaterialTheme.typography.bodyMedium,
-                color = TextPrimary,
-                fontFamily = FontFamily.Monospace,
-            )
-        }
-
-        if (extractedInfo.isNotEmpty()) {
-            HorizontalDivider(color = Surface)
-            Text(
-                text = extractedInfo,
-                style = MaterialTheme.typography.bodySmall,
-                color = TextPrimary,
-                fontFamily = FontFamily.Monospace,
-                modifier = Modifier.fillMaxWidth(),
-            )
-        }
-
-        if (state == BootstrapState.WAITING_FOR_REDIRECT) {
-            CircularProgressIndicator(color = Accent)
-            Text(
-                text = "Complete the login in the browser tab. You'll be redirected back here automatically.",
-                style = MaterialTheme.typography.bodySmall,
-                color = TextDim,
-            )
-        }
-    }
 }
