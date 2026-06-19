@@ -154,18 +154,24 @@ def upload_api_key(auth):
         f.write(priv_pem)
 
     auth['config'] = oci.config.from_file(cfg_path)
+    # Keep the token signer for immediate use — API key propagation can take 30s+
+    auth['token_signer'] = signer
+    auth['priv_pem'] = priv_pem
     log("  OK")
 
 # ── Create network + VM ──────────────────────────────────────
 
 def create_vm(auth):
     log("[3/6] Network + VM")
-    config = auth['config']
-    cid = config['tenancy']
-    net = VirtualNetworkClient(config)
-    compute = ComputeClient(config)
+    # Use token signer (works immediately) instead of API key (needs propagation)
+    config = {'region': auth['home'], 'tenancy': auth['tenancy']}
+    signer = auth['token_signer']
+    cid = auth['tenancy']
+    net = VirtualNetworkClient(config, signer=signer)
+    compute = ComputeClient(config, signer=signer)
+    id_client = IdentityClient(config, signer=signer)
 
-    ad = IdentityClient(config).list_availability_domains(compartment_id=cid).data[0].name
+    ad = id_client.list_availability_domains(compartment_id=cid).data[0].name
     imgs = compute.list_images(compartment_id=cid, operating_system="Canonical Ubuntu",
         operating_system_version="22.04", shape="VM.Standard.E2.1.Micro",
         sort_by="TIMECREATED", sort_order="DESC")
