@@ -5,6 +5,7 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.QrCodeScanner
+import androidx.compose.material.icons.filled.Cloud
 import androidx.compose.material.icons.filled.VolunteerActivism
 import androidx.compose.material.icons.filled.Wifi
 import androidx.compose.material3.SnackbarHostState
@@ -12,9 +13,12 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import com.zerovpn.app.ui.components.OptionButton
 import com.zerovpn.app.ui.theme.*
+import android.content.Intent
+import com.zerovpn.app.oci.OciBootstrapActivity
 import kotlinx.coroutines.launch
 
 @Composable
@@ -23,6 +27,7 @@ fun AddExitScreen(
     modifier: Modifier = Modifier,
 ) {
     val scope = rememberCoroutineScope()
+    val context = LocalContext.current
 
     Column(
         modifier = modifier
@@ -82,6 +87,17 @@ fun AddExitScreen(
                 scope.launch {
                     snackbarHostState.showSnackbar("Coming soon")
                 }
+            },
+        )
+
+        Spacer(modifier = Modifier.height(8.dp))
+
+        OptionButton(
+            icon = Icons.Default.Cloud,
+            label = "Create Oracle Free Exit",
+            onClick = {
+                val intent = Intent(context, OciBootstrapActivity::class.java)
+                context.startActivity(intent)
             },
         )
     }
