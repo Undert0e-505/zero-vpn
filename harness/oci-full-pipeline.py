@@ -131,6 +131,7 @@ class CallbackHandler(BaseHTTPRequestHandler):
             if 'security_token' in params:
                 CallbackHandler.captured_token = params['security_token'][0]
                 log("  [HTTP] Token captured!")
+                self.server.stop = True
             self.send_response(200)
             self.end_headers()
             self.wfile.write(b'OK')

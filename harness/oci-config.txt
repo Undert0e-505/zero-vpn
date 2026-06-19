@@ -1,0 +1,6 @@
+[DEFAULT]
+user = REDACTED_OCID
+tenancy = REDACTED_OCID
+fingerprint = bb:11:39:f9:fd:cb:5d:d4:24:db:86:5b:bb:94:29:9c
+key_file = D:/dev/zero-vpn/harness/oci-key.pem
+region = uk-london-1
