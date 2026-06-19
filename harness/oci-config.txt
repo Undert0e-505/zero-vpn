@@ -1,6 +1,0 @@
-[DEFAULT]
-user = ocid1.user.oc1..aaaaaaaa6poihyf6suo2jc3mruufwx43jiadli7kumucbzf67axqve27i46a
-tenancy = ocid1.tenancy.oc1..aaaaaaaafpq6zdzvulhc7ix5efxzm7diasm7pdthxiuvdmbr5ugiym5sdwbq
-fingerprint = bb:11:39:f9:fd:cb:5d:d4:24:db:86:5b:bb:94:29:9c
-key_file = D:/dev/zero-vpn/harness/oci-key.pem
-region = uk-london-1
