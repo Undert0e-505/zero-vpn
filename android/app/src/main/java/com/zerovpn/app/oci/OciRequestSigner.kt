@@ -51,25 +51,46 @@ object OciRequestSigner {
         return hash.joinToString(":") { "%02x".format(it) }
     }
 
-    /**
+        /**
      * Encode a public key as a JWK (JSON Web Key) for the OAuth2 bootstrap URL.
      * OCI expects the JWK in the `public_key` query parameter.
      *
      * The JWK format for RSA:
      * {"kty":"RSA","e":"<base64url e>","n":"<base64url n>","alg":"RS256","use":"sig"}
+     *
+     * IMPORTANT: BigInteger.toByteArray() may include a leading 0x00 sign byte
+     * for positive numbers when the high bit is set. This must be stripped
+     * for JWK compliance — the modulus must be unsigned big-endian bytes.
      */
     fun publicKeyToJwk(publicKey: RSAPublicKey): String {
-        val encoder = Base64.getUrlEncoder().withoutPadding()
-        val n = encoder.encodeToString(publicKey.modulus.toByteArray())
-        val e = encoder.encodeToString(publicKey.publicExponent.toByteArray())
+        // Strip leading 0x00 sign byte from modulus if present
+        val nBytes = publicKey.modulus.toByteArray()
+        val nStripped = if (nBytes.isNotEmpty() && nBytes[0] == 0x00.toByte()) {
+            nBytes.copyOfRange(1, nBytes.size)
+        } else {
+            nBytes
+        }
+        // Also strip from exponent (usually 65537 = 0x010001, no sign byte, but be safe)
+        val eBytes = publicKey.publicExponent.toByteArray()
+        val eStripped = if (eBytes.isNotEmpty() && eBytes[0] == 0x00.toByte()) {
+            eBytes.copyOfRange(1, eBytes.size)
+        } else {
+            eBytes
+        }
+
+        // OCI CLI uses base64.urlsafe_b64encode which INCLUDES padding
+        val encoder = Base64.getUrlEncoder() // WITH padding, matching Python CLI
+        val n = encoder.encodeToString(nStripped)
+        val e = encoder.encodeToString(eStripped)
         return """{"kty":"RSA","e":"$e","n":"$n","alg":"RS256","use":"sig"}"""
     }
 
     /**
      * Base64url-encode a string (for the OAuth2 public_key parameter).
+     * Uses padding to match the OCI CLI's base64.urlsafe_b64encode behavior.
      */
     fun base64UrlEncode(input: String): String {
-        return Base64.getUrlEncoder().withoutPadding().encodeToString(input.toByteArray())
+        return Base64.getUrlEncoder().encodeToString(input.toByteArray())
     }
 
     /**
