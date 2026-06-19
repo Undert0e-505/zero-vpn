@@ -31,6 +31,18 @@ sealed class ProvisioningState {
     data object Idle : ProvisioningState()
     data object PreStart : ProvisioningState()
     data object Running : ProvisioningState()
-    data class Success(val publicIp: String, val wireGuardPort: Int) : ProvisioningState()
-    data class Failure(val failedPhase: Phase, val lastSuccessPhase: Phase?) : ProvisioningState()
+    data class UkWarning(val homeRegion: String) : ProvisioningState()
+    data class Success(
+        val publicIp: String,
+        val wireGuardPort: Int,
+        val region: String,
+        val isDevMode: Boolean,
+    ) : ProvisioningState()
+    data class Failure(
+        val failedPhase: Phase,
+        val lastSuccessPhase: Phase?,
+        val errorMessage: String?,
+    ) : ProvisioningState()
+    data object Destroying : ProvisioningState()
+    data object Destroyed : ProvisioningState()
 }

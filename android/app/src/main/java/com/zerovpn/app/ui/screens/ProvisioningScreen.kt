@@ -58,7 +58,13 @@ fun ProvisioningScreen(
     val currentPhase by viewModel.currentPhase.collectAsState()
     val publicIp by viewModel.publicIp.collectAsState()
     val wireGuardPort by viewModel.wireGuardPort.collectAsState()
+    val isDevMode by viewModel.isDevMode.collectAsState()
     val context = LocalContext.current
+
+    // Initialize prefs on first composition
+    LaunchedEffect(Unit) {
+        viewModel.initPrefs(context)
+    }
 
     Column(
         modifier = modifier
@@ -91,14 +97,14 @@ fun ProvisioningScreen(
         when (val s = state) {
             is ProvisioningState.Idle -> {
                 PreStartContent(
-                    onStart = { viewModel.startProvisioning() },
+                    onStart = { viewModel.startProvisioning(context) },
                     onCancel = { viewModel.cancel(); onBack() },
                 )
             }
 
             is ProvisioningState.PreStart -> {
                 PreStartContent(
-                    onStart = { viewModel.startProvisioning() },
+                    onStart = { viewModel.startProvisioning(context) },
                     onCancel = { viewModel.cancel(); onBack() },
                 )
             }
@@ -110,10 +116,20 @@ fun ProvisioningScreen(
                 )
             }
 
+            is ProvisioningState.UkWarning -> {
+                UkWarningContent(
+                    homeRegion = s.homeRegion,
+                    onContinue = { viewModel.continueAfterUkWarning(context) },
+                    onCancel = { viewModel.cancel(); onBack() },
+                )
+            }
+
             is ProvisioningState.Success -> {
                 SuccessContent(
                     publicIp = s.publicIp,
                     wireGuardPort = s.wireGuardPort,
+                    region = s.region,
+                    isDevMode = s.isDevMode,
                     onConnect = {
                         android.widget.Toast.makeText(
                             context,
@@ -121,7 +137,7 @@ fun ProvisioningScreen(
                             android.widget.Toast.LENGTH_SHORT,
                         ).show()
                     },
-                    onDestroy = { viewModel.destroyNode() },
+                    onDestroy = { viewModel.destroyNode(context) },
                 )
             }
 
@@ -129,9 +145,23 @@ fun ProvisioningScreen(
                 FailureContent(
                     failedPhase = s.failedPhase,
                     lastSuccessPhase = s.lastSuccessPhase,
+                    errorMessage = s.errorMessage,
                     events = events,
-                    onRetry = { viewModel.retry() },
-                    onCleanup = { viewModel.cleanup() },
+                    onRetry = { viewModel.retry(context) },
+                    onCleanup = { viewModel.cleanup(context) },
+                )
+            }
+
+            is ProvisioningState.Destroying -> {
+                ProgressContent(
+                    events = events,
+                    currentPhase = currentPhase,
+                )
+            }
+
+            is ProvisioningState.Destroyed -> {
+                DestroyedContent(
+                    onBack = onBack,
                 )
             }
         }
@@ -156,15 +186,17 @@ private fun PreStartContent(
             color = TextPrimary,
         )
 
-        Text(
-            text = "Creating your Oracle exit usually takes 4-6 minutes. " +
-                "Keep ZeroVPN open while it creates the cloud network, " +
-                "VM, WireGuard server, and local phone config.",
-            fontSize = 15.sp,
-            fontWeight = FontWeight.Normal,
-            color = TextDim,
-            lineHeight = 22.sp,
-        )
+        Column(
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            BulletPoint("Oracle signup or login may be required")
+            BulletPoint("Oracle may require card and 2FA")
+            BulletPoint("ZeroVPN never sees your Oracle password, card, 2FA, or cookies")
+            BulletPoint("Home region cannot be changed later")
+            BulletPoint("UK London region: dev/test mode only. This validates the pipeline but is not a non-UK exit.")
+            BulletPoint("Setup takes 4-6 minutes")
+        }
 
         Spacer(modifier = Modifier.height(8.dp))
 
@@ -192,6 +224,100 @@ private fun PreStartContent(
                 ),
             ) {
                 Text("Start", fontSize = 14.sp, fontWeight = FontWeight.Bold)
+            }
+        }
+    }
+}
+
+@Composable
+private fun BulletPoint(text: String) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        Text(
+            text = "•",
+            fontSize = 15.sp,
+            color = Accent,
+            fontWeight = FontWeight.Bold,
+        )
+        Text(
+            text = text,
+            fontSize = 14.sp,
+            fontWeight = FontWeight.Normal,
+            color = TextDim,
+            lineHeight = 20.sp,
+            modifier = Modifier.weight(1f),
+        )
+    }
+}
+
+// -- UK Warning ------------------------------------------------
+
+@Composable
+private fun UkWarningContent(
+    homeRegion: String,
+    onContinue: () -> Unit,
+    onCancel: () -> Unit,
+) {
+    Column(
+        modifier = Modifier.fillMaxWidth(),
+        verticalArrangement = Arrangement.spacedBy(16.dp),
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            Icon(
+                imageVector = Icons.Default.Warning,
+                contentDescription = null,
+                tint = WarningYellow,
+                modifier = Modifier.size(32.dp),
+            )
+            Text(
+                text = "UK Region Detected",
+                fontSize = 18.sp,
+                fontWeight = FontWeight.SemiBold,
+                color = WarningYellow,
+            )
+        }
+
+        Text(
+            text = "Your Oracle home region is $homeRegion. " +
+                "This can be used for development/testing, but not as a non-UK " +
+                "Always Free exit. Create an Oracle account with a non-UK home region " +
+                "(e.g., us-ashburn-1, eu-frankfurt-1) for a production exit.",
+            fontSize = 14.sp,
+            color = TextDim,
+            lineHeight = 20.sp,
+        )
+
+        Spacer(modifier = Modifier.height(8.dp))
+
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            OutlinedButton(
+                onClick = onCancel,
+                modifier = Modifier.weight(1f).height(48.dp),
+                shape = RoundedCornerShape(8.dp),
+                colors = ButtonDefaults.outlinedButtonColors(
+                    contentColor = TextDim,
+                ),
+            ) {
+                Text("Cancel", fontSize = 14.sp, fontWeight = FontWeight.Medium)
+            }
+            Button(
+                onClick = onContinue,
+                modifier = Modifier.weight(1f).height(48.dp),
+                shape = RoundedCornerShape(8.dp),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = WarningYellow,
+                    contentColor = Bg,
+                ),
+            ) {
+                Text("Continue (dev/test)", fontSize = 13.sp, fontWeight = FontWeight.Bold)
             }
         }
     }
@@ -292,6 +418,8 @@ private fun ProgressContent(
 private fun SuccessContent(
     publicIp: String,
     wireGuardPort: Int,
+    region: String,
+    isDevMode: Boolean,
     onConnect: () -> Unit,
     onDestroy: () -> Unit,
 ) {
@@ -326,7 +454,8 @@ private fun SuccessContent(
         ) {
             InfoRow("Public IP", publicIp)
             InfoRow("WireGuard Port", "$wireGuardPort/udp")
-            InfoRow("Region", "uk-london-1")
+            val regionLabel = if (isDevMode) "$region (dev/test mode)" else region
+            InfoRow("Region", regionLabel)
         }
 
         Spacer(modifier = Modifier.height(8.dp))
@@ -378,6 +507,7 @@ private fun SuccessContent(
 private fun FailureContent(
     failedPhase: Phase,
     lastSuccessPhase: Phase?,
+    errorMessage: String?,
     events: List<ProvisioningEvent>,
     onRetry: () -> Unit,
     onCleanup: () -> Unit,
@@ -416,6 +546,14 @@ private fun FailureContent(
                         text = "Last success: ${lastSuccessPhase.label}",
                         fontSize = 13.sp,
                         color = TextDim,
+                    )
+                }
+                if (errorMessage != null) {
+                    Text(
+                        text = errorMessage,
+                        fontSize = 12.sp,
+                        color = Danger,
+                        modifier = Modifier.padding(top = 4.dp),
                     )
                 }
             }
@@ -512,6 +650,49 @@ private fun FailureContent(
                 Spacer(modifier = Modifier.width(8.dp))
                 Text("Retry", fontSize = 14.sp, fontWeight = FontWeight.Bold)
             }
+        }
+    }
+}
+
+// -- Destroyed ------------------------------------------------
+
+@Composable
+private fun DestroyedContent(
+    onBack: () -> Unit,
+) {
+    Column(
+        modifier = Modifier.fillMaxWidth(),
+        verticalArrangement = Arrangement.spacedBy(16.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        Icon(
+            imageVector = Icons.Default.CheckCircle,
+            contentDescription = null,
+            tint = SuccessGreen,
+            modifier = Modifier.size(48.dp),
+        )
+        Text(
+            text = "Node destroyed",
+            fontSize = 18.sp,
+            fontWeight = FontWeight.SemiBold,
+            color = TextPrimary,
+        )
+        Text(
+            text = "All resources have been released.",
+            fontSize = 14.sp,
+            color = TextDim,
+        )
+        Spacer(modifier = Modifier.height(8.dp))
+        Button(
+            onClick = onBack,
+            modifier = Modifier.height(48.dp),
+            shape = RoundedCornerShape(8.dp),
+            colors = ButtonDefaults.buttonColors(
+                containerColor = Accent,
+                contentColor = Bg,
+            ),
+        ) {
+            Text("Back", fontSize = 14.sp, fontWeight = FontWeight.Bold)
         }
     }
 }
