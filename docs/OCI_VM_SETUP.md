@@ -1,8 +1,17 @@
-# OCI VM Setup Guide (Manual Console)
+# OCI VM Setup Guide
 
-This guide gives the owner exact steps to create an Always Free eligible
-Ubuntu VM in the Oracle Cloud console. The agent does not handle Oracle
-credentials, card details, 2FA, or browser sessions.
+> **⚠️ Deprecated path.** Manual console setup is no longer the
+> recommended approach. The OCI console VNIC/networking/firewall flow
+> is too complex for phone-based operation. Use the **Cloud Shell
+> bootstrap script** instead:
+> ```
+> bash <(curl -sL https://raw.githubusercontent.com/Undert0e-505/zero-vpn/main/cloud-shell/oci-bootstrap.sh)
+> ```
+> This guide is kept as reference only.
+
+This guide covers manual console steps to create an Always Free eligible
+Ubuntu VM in Oracle Cloud. The agent does not handle Oracle credentials,
+card details, 2FA, or browser sessions.
 
 ## What the agent has prepared
 

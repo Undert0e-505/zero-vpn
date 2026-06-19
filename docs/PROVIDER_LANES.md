@@ -6,11 +6,11 @@ handles cloud credentials or card details.
 
 ## 1. Oracle Free Exit
 
-**Status:** Research phase.
+**Status:** Phase 2 — active development.
 
-Oracle's Always Free tier may provide a durable overseas VM suitable
-for a WireGuard exit node. Signup is card-gated — the app must not
-collect Oracle credentials or card details.
+Oracle's Always Free tier provides a durable VM suitable for a
+WireGuard exit node. Signup is card-gated — the app must not collect
+Oracle credentials or card details.
 
 **Signup instructions:**
 <https://docs.oracle.com/en-us/iaas/Content/GSG/Tasks/signingup_topic-Sign_Up_for_Free_Oracle_Cloud_Promotion.htm>
@@ -18,11 +18,24 @@ collect Oracle credentials or card details.
 **Oracle Terms of Use:**
 <https://www.oracle.com/legal/terms/>
 
-**Preferred flow:**
-1. App opens Oracle signup in Chrome Custom Tab / external browser
-2. User signs up directly with Oracle
-3. App guides deployment via Oracle's console or Resource Manager
-4. App imports the resulting WireGuard config
+**Deployment paths:**
+
+1. **Cloud Shell script (developer/first-run path):** user opens OCI
+   Cloud Shell, pastes one command, script creates all infrastructure
+   via pre-authenticated OCI CLI. See `cloud-shell/oci-bootstrap.sh`.
+2. **Resource Manager / Terraform stack (product path):** user clicks
+   a link, OCI creates the stack, user reviews and applies. Future
+   work — not yet built.
+
+**Both paths create:**
+- VCN + public subnet + internet gateway + route table
+- Security list with SSH (22/tcp) and WireGuard (51820/udp) ingress
+- Always Free eligible Ubuntu VM with public IP
+- SSH key injection from project keypair
+- Output: public IP, SSH username, connection instructions
+
+**Manual console navigation is NOT a supported path.** The OCI console
+VNIC/networking/firewall flow is too complex for a phone-based user.
 
 **Must not do:**
 - Automate Oracle signup
@@ -30,12 +43,19 @@ collect Oracle credentials or card details.
 - Proxy credentials
 - Attempt to bypass eligibility rules
 
-**Research questions (validate before implementing):**
-- Current Always Free tier limits (VM shapes, memory, CPU)
-- Available regions (non-UK)
-- Public IP behaviour (reserved vs ephemeral)
-- Bandwidth terms and acceptable-use constraints
-- Whether ARM (Ampere) instances are suitable
+**Validated (2026-06-19):**
+- Always Free tier: 2 × VM.Standard.E2.1.Micro (AMD, 1/8 OCPU, 1 GB)
+  or equivalent Ampere A1 Flex (2 OCPU, 12 GB after Oracle's cut)
+- 200 GB Always Free block storage (min 47 GB boot volume)
+- Instances must be in home region
+- Idle reclamation: <20% CPU/network/memory for 7 days → reclaim risk
+- `--assign-public-ip true` on `oci compute instance launch` works
+  when subnet is public (no `--prohibit-public-ip`)
+
+**Still open:**
+- Bandwidth terms and acceptable-use constraints (TBD)
+- Non-UK region selection for production exits (home region is UK South
+  for Aaron's account — may need a second account or region migration)
 
 ## 2. Azure Student Exit
 
