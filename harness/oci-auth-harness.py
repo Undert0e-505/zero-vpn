@@ -1,10 +1,10 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """
-OCI Auth Harness — standalone test of the Oracle browser-auth/bootstrap flow.
+OCI Auth Harness â€” standalone test of the Oracle browser-auth/bootstrap flow.
 
 This script replicates what `oci setup bootstrap` and `oci session authenticate`
 do, but in an instrumented, debuggable way. It runs on the Windows machine with
-a real browser — no Android, no WebView.
+a real browser â€” no Android, no WebView.
 
 Steps:
 1. Generate RSA keypair locally
@@ -33,6 +33,7 @@ import uuid
 import webbrowser
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlparse, parse_qs, urlencode
+from datetime import datetime
 
 # Use the oci SDK's crypto utilities (same as the CLI does)
 import oci
@@ -41,6 +42,14 @@ from oci.regions import REGIONS, REALMS, REGION_REALMS, REGIONS_SHORT_NAMES, is_
 # --- Config ---
 BOOTSTRAP_PORT = 8181
 CONSOLE_AUTH_URL_FORMAT = "https://login.{region}.{realm}/v1/oauth2/authorize"
+LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "auth-run.log")
+
+def log(msg):
+    """Log to both stdout and file."""
+    line = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}"
+    print(line, flush=True)
+    with open(LOG_FILE, 'a', encoding='utf-8') as f:
+        f.write(line + '\n')
 
 
 def generate_keypair():
@@ -84,7 +93,7 @@ def public_key_to_jwk(public_key):
             int_bytes = b'\x00'
         return base64url_encode(int_bytes)
     
-    # CLI JWK format: kty, n, e, kid — NO alg, NO use
+    # CLI JWK format: kty, n, e, kid â€” NO alg, NO use
     n_b64 = to_base64url_uint(numbers.n).decode('UTF-8')
     e_b64 = to_base64url_uint(numbers.e).decode('UTF-8')
     
@@ -97,14 +106,14 @@ def public_key_to_jwk(public_key):
     jwk_json = json.dumps(jwk_obj)
     
     # CLI does: base64.urlsafe_b64encode(jwk_content.encode('UTF-8')).decode('UTF-8')
-    # This is the OUTER encoding for the public_key param — includes padding
+    # This is the OUTER encoding for the public_key param â€” includes padding
     # (but in practice the JSON length is always 396, divisible by 3, so no padding)
     jwk_b64 = base64.urlsafe_b64encode(jwk_json.encode('UTF-8')).decode('UTF-8')
     
     return jwk_json, jwk_b64
 
 
-def public_key_fingerprint(public_key):
+def public_key_fingerlog(public_key):
     """Compute the SHA-256 fingerprint of a public key (OCI format)."""
     from cryptography.hazmat.primitives import serialization
     der = public_key.public_bytes(
@@ -150,11 +159,11 @@ class CallbackHandler(BaseHTTPRequestHandler):
     
     def log_message(self, format, *args):
         # Log everything for debugging
-        print(f"  [HTTP] {format % args}")
+        log(f"  [HTTP] {format % args}")
     
     def do_GET(self):
-        print(f"\n  >>> CALLBACK RECEIVED: {self.path}")
-        print(f"  >>> Headers: {dict(self.headers)}")
+        log(f"\n  >>> CALLBACK RECEIVED: {self.path}")
+        log(f"  >>> Headers: {dict(self.headers)}")
         
         if self.path == '/' or self.path.startswith('/?'):
             # This is the initial redirect from Oracle
@@ -188,30 +197,30 @@ class CallbackHandler(BaseHTTPRequestHandler):
         elif self.path.startswith('/token?'):
             # The JS on the redirect page sends the token here
             query_components = parse_qs(urlparse(self.path).query)
-            print(f"\n  >>> TOKEN QUERY PARAMS: {list(query_components.keys())}")
+            log(f"\n  >>> TOKEN QUERY PARAMS: {list(query_components.keys())}")
             
             if 'security_token' in query_components:
                 token = query_components['security_token'][0]
                 CallbackHandler.captured_token = token
-                print(f"\n  >>> SECURITY TOKEN CAPTURED!")
-                print(f"  >>> Token length: {len(token)} chars")
-                print(f"  >>> Token prefix: {token[:50]}...")
+                log(f"\n  >>> SECURITY TOKEN CAPTURED!")
+                log(f"  >>> Token length: {len(token)} chars")
+                log(f"  >>> Token prefix: {token[:50]}...")
                 
                 self.send_response(200)
                 self.end_headers()
                 self.wfile.write(b'OK')
             else:
-                print(f"  >>> No security_token in query params")
+                log(f"  >>> No security_token in query params")
                 self.send_response(200)
                 self.end_headers()
                 self.wfile.write(b'No token found')
         else:
-            print(f"  >>> Unknown path: {self.path}")
+            log(f"  >>> Unknown path: {self.path}")
             self.send_response(404)
             self.end_headers()
     
     def do_POST(self):
-        print(f"\n  >>> POST RECEIVED: {self.path}")
+        log(f"\n  >>> POST RECEIVED: {self.path}")
         self.send_response(200)
         self.end_headers()
 
@@ -236,26 +245,26 @@ def main():
                        help='Tenancy name (optional)')
     args = parser.parse_args()
     
-    print("=" * 60)
-    print("  OCI AUTH HARNESS")
-    print("=" * 60)
-    print()
+    log("=" * 60)
+    log("  OCI AUTH HARNESS")
+    log("=" * 60)
+    log("")
     
     # Step 1: Generate RSA keypair
-    print("[1] Generating RSA 2048-bit keypair...")
+    log("[1] Generating RSA 2048-bit keypair...")
     private_key, public_key = generate_keypair()
-    print(f"    Private key: {private_key.key_size} bits")
-    print(f"    Public key: {public_key.public_numbers().n.bit_length()} bits")
-    print()
+    log(f"    Private key: {private_key.key_size} bits")
+    log(f"    Public key: {public_key.public_numbers().n.bit_length()} bits")
+    log("")
     
     # Step 2: Encode public key as JWK
-    print("[2] Building JWK from public key...")
+    log("[2] Building JWK from public key...")
     jwk_json, jwk_b64 = public_key_to_jwk(public_key)
-    print(f"    JWK JSON: {jwk_json}")
-    print()
+    log(f"    JWK JSON: {jwk_json}")
+    log("")
     
     # Step 3: Verify the JWK
-    print("[3] Verifying JWK...")
+    log("[3] Verifying JWK...")
     jwk_obj = json.loads(jwk_json)
     assert jwk_obj['kty'] == 'RSA', f"kty should be RSA, got {jwk_obj['kty']}"
     assert jwk_obj['e'] == 'AQAB', f"e should be AQAB, got {jwk_obj['e']}"
@@ -273,58 +282,58 @@ def main():
     n_bytes = base64.urlsafe_b64decode(n_padded)
     assert len(n_bytes) == 256, f"n should be 256 bytes for 2048-bit RSA, got {len(n_bytes)}"
     
-    print(f"    kty: {jwk_obj['kty']} OK")
-    print(f"    e: {jwk_obj['e']} OK")
-    print(f"    kid: {jwk_obj['kid']} OK")
-    print(f"    n: {len(n_raw)} chars, {len(n_bytes)} bytes OK")
-    print(f"    No padding in n: OK")
-    print(f"    No + or / in n: OK")
-    print(f"    base64url(JWK): {jwk_b64[:60]}...")
-    print()
+    log(f"    kty: {jwk_obj['kty']} OK")
+    log(f"    e: {jwk_obj['e']} OK")
+    log(f"    kid: {jwk_obj['kid']} OK")
+    log(f"    n: {len(n_raw)} chars, {len(n_bytes)} bytes OK")
+    log(f"    No padding in n: OK")
+    log(f"    No + or / in n: OK")
+    log(f"    base64url(JWK): {jwk_b64[:60]}...")
+    log("")
     
     # Step 4: Compute fingerprint
-    fingerprint = public_key_fingerprint(public_key)
-    print(f"[4] Fingerprint: {fingerprint}")
-    print()
+    fingerprint = public_key_fingerlog(public_key)
+    log(f"[4] Fingerprint: {fingerprint}")
+    log("")
     
     # Step 5: Build authorize URL
     redirect_uri = f"http://localhost:{BOOTSTRAP_PORT}"
-    print(f"[5] Building authorize URL...")
-    print(f"    Region: {args.region}")
-    print(f"    Redirect URI: {redirect_uri}")
+    log(f"[5] Building authorize URL...")
+    log(f"    Region: {args.region}")
+    log(f"    Redirect URI: {redirect_uri}")
     auth_url = build_authorize_url(args.region, jwk_b64, redirect_uri, args.tenancy_name)
-    print(f"    URL: {auth_url[:100]}...")
-    print()
+    log(f"    URL: {auth_url[:100]}...")
+    log("")
     
     # Step 6: Start local HTTP listener
-    print(f"[6] Starting local HTTP listener on port {BOOTSTRAP_PORT}...")
+    log(f"[6] Starting local HTTP listener on port {BOOTSTRAP_PORT}...")
     server = StoppableHTTPServer(('', BOOTSTRAP_PORT), CallbackHandler)
-    print(f"    Listener running")
-    print()
+    log(f"    Listener running")
+    log("")
     
     # Step 7: Open browser
-    print(f"[7] Opening browser to Oracle login...")
-    print(f"    Please complete login in the browser.")
-    print(f"    The harness will capture the callback automatically.")
-    print()
+    log(f"[7] Opening browser to Oracle login...")
+    log(f"    Please complete login in the browser.")
+    log(f"    The harness will capture the callback automatically.")
+    log("")
     
     try:
         webbrowser.open_new(auth_url)
     except Exception as e:
-        print(f"    Could not open browser: {e}")
-        print(f"    Open this URL manually: {auth_url}")
+        log(f"    Could not open browser: {e}")
+        log(f"    Open this URL manually: {auth_url}")
     
     # Step 8: Wait for callback
-    print(f"[8] Waiting for callback (timeout: 5 minutes)...")
-    print(f"    Every redirect will be logged below.")
-    print()
+    log(f"[8] Waiting for callback (timeout: 5 minutes)...")
+    log(f"    Every redirect will be logged below.")
+    log("")
     
     import threading
     def timeout():
         import time
         time.sleep(300)
         if CallbackHandler.captured_token is None:
-            print("\n  >>> TIMEOUT: No callback received within 5 minutes.")
+            log("\n  >>> TIMEOUT: No callback received within 5 minutes.")
             server.stop = True
     
     timer = threading.Thread(target=timeout, daemon=True)
@@ -333,14 +342,14 @@ def main():
     token = server.serve_forever()
     
     if token:
-        print()
-        print("=" * 60)
-        print("  AUTH SUCCESSFUL!")
-        print("=" * 60)
-        print()
+        log("")
+        log("=" * 60)
+        log("  AUTH SUCCESSFUL!")
+        log("=" * 60)
+        log("")
         
         # Decode the JWT
-        print("[9] Decoding security token (JWT)...")
+        log("[9] Decoding security token (JWT)...")
         try:
             from oci.auth.security_token_container import SecurityTokenContainer
             stc = SecurityTokenContainer(None, security_token=token)
@@ -349,18 +358,18 @@ def main():
             tenancy_ocid = jwt_data.get('tenant', 'unknown')
             exp = jwt_data.get('exp', 'unknown')
             
-            print(f"    User OCID: {user_ocid}")
-            print(f"    Tenancy OCID: {tenancy_ocid}")
-            print(f"    Expires: {exp}")
-            print()
+            log(f"    User OCID: {user_ocid}")
+            log(f"    Tenancy OCID: {tenancy_ocid}")
+            log(f"    Expires: {exp}")
+            log("")
         except Exception as e:
-            print(f"    JWT decode error: {e}")
-            print(f"    Token (first 200 chars): {token[:200]}...")
-            print()
+            log(f"    JWT decode error: {e}")
+            log(f"    Token (first 200 chars): {token[:200]}...")
+            log("")
         
         # Optional: Upload API key
         if args.upload_api_key:
-            print("[10] Uploading public key as API key...")
+            log("[10] Uploading public key as API key...")
             from oci.signer import Signer
             from oci import identity
             from cryptography.hazmat.primitives import serialization
@@ -381,7 +390,7 @@ def main():
                 if sub.is_home_region:
                     home_region = sub.region_name
                     break
-            print(f"    Home region: {home_region}")
+            log(f"    Home region: {home_region}")
             
             # Use home region client
             client = identity.IdentityClient({'region': home_region}, signer=signer)
@@ -397,33 +406,34 @@ def main():
             
             try:
                 result = client.upload_api_key(user_ocid, create_details)
-                print(f"    API key uploaded! Fingerprint: {fingerprint}")
-                print(f"    User OCID: {user_ocid}")
-                print(f"    Tenancy OCID: {tenancy_ocid}")
-                print(f"    Region: {home_region}")
-                print()
-                print("    You can now use API key signing for all OCI API calls.")
+                log(f"    API key uploaded! Fingerprint: {fingerprint}")
+                log(f"    User OCID: {user_ocid}")
+                log(f"    Tenancy OCID: {tenancy_ocid}")
+                log(f"    Region: {home_region}")
+                log("")
+                log("    You can now use API key signing for all OCI API calls.")
             except oci.exceptions.ServiceError as e:
                 if e.status == 409 and e.code == 'ApiKeyLimitExceeded':
-                    print(f"    API key limit exceeded. Existing keys:")
+                    log(f"    API key limit exceeded. Existing keys:")
                     keys = client.list_api_keys(user_ocid)
                     for k in keys.data:
-                        print(f"      {k.fingerprint} (created {k.time_created})")
+                        log(f"      {k.fingerprint} (created {k.time_created})")
                 else:
                     raise
         else:
-            print("[10] Skipping API key upload (use --upload-api-key to enable)")
-            print(f"     Token is valid for ~60 minutes.")
-            print(f"     Fingerprint: {fingerprint}")
+            log("[10] Skipping API key upload (use --upload-api-key to enable)")
+            log(f"     Token is valid for ~60 minutes.")
+            log(f"     Fingerprint: {fingerprint}")
     else:
-        print()
-        print("=" * 60)
-        print("  AUTH FAILED — no token received")
-        print("=" * 60)
+        log("")
+        log("=" * 60)
+        log("  AUTH FAILED â€” no token received")
+        log("=" * 60)
     
-    print()
-    print("Done.")
+    log("")
+    log("Done.")
 
 
 if __name__ == '__main__':
     main()
+
