@@ -1,19 +1,11 @@
 #!/usr/bin/env python3
 """
-OCI ZeroVPN Pipeline — one script, auth to WireGuard.
-
-Steps:
-1. Browser auth (generate keypair, Oracle OAuth2, capture token)
-2. Upload API key (MD5 fingerprint, permanent signing)
-3. Create network (VCN, subnet, IGW, route table, security list)
-4. Launch VM (Ubuntu 22.04 micro, public IP, SSH key)
-5. SSH + WireGuard (install, configure, generate peer config)
-6. Print client config
+OCI ZeroVPN Pipeline - one script, auth to WireGuard.
 
 Usage:
     D:\\Python310\\python.exe D:\\dev\\zero-vpn\\harness\\pipeline.py --region uk-london-1
 """
-import argparse, base64, hashlib, json, os, sys, tempfile, time, uuid, webbrowser
+import argparse, base64, hashlib, json, os, sys, time, uuid, webbrowser, subprocess
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlparse, parse_qs, urlencode
 from datetime import datetime
@@ -53,7 +45,6 @@ def b64url_uint(val):
     return b64url_strip(b)
 
 def build_jwk(public_key):
-    """Build JWK exactly as OCI CLI does (cli_util.to_jwk)."""
     n = b64url_uint(public_key.public_numbers().n).decode()
     e = b64url_uint(public_key.public_numbers().e).decode()
     jwk_json = json.dumps({"kty":"RSA","n":n,"e":e,"kid":"Ignored"})
@@ -61,7 +52,6 @@ def build_jwk(public_key):
     return jwk_json, jwk_b64
 
 def md5_fingerprint(public_key):
-    """OCI API key fingerprint = MD5 of DER public key (16 bytes, colon-separated)."""
     pem = public_key.public_bytes(Encoding.PEM, PublicFormat.SubjectPublicKeyInfo)
     stripped = pem.replace(b'-----BEGIN PUBLIC KEY-----', b'').replace(b'-----END PUBLIC KEY-----', b'').replace(b'\n', b'')
     der = base64.b64decode(stripped)
@@ -103,7 +93,7 @@ def browser_auth(region):
         'nonce':str(uuid.uuid4()),'scope':'openid','public_key':jwk_b64,
         'redirect_uri':'http://localhost:8181',
     })
-    log(f"  Opening browser...")
+    log("  Opening browser...")
     webbrowser.open_new(url)
 
     server = HTTPServer(('', 8181), TokenHandler)
@@ -124,7 +114,8 @@ def browser_auth(region):
     log(f"  User: {jwt['sub']}")
     log(f"  Tenancy: {jwt['tenant']}")
     log("  OK")
-    return {'token':token, 'priv':priv, 'pub':pub, 'fp':fp, 'user':jwt['sub'], 'tenancy':jwt['tenant'], 'region':region}
+    return {'token':token, 'priv':priv, 'pub':pub, 'fp':fp,
+            'user':jwt['sub'], 'tenancy':jwt['tenant'], 'region':region}
 
 # ── Upload API key ───────────────────────────────────────────
 
@@ -135,24 +126,24 @@ def upload_api_key(auth):
     signer = oci.auth.signers.SecurityTokenSigner(auth['token'], priv_obj)
     idc = IdentityClient({'region': auth['region']}, signer=signer)
 
-    # Home region
     home = auth['region']
     for s in idc.list_region_subscriptions(auth['tenancy']).data:
         if s.is_home_region: home = s.region_name; break
     auth['home'] = home
     log(f"  Home region: {home}")
 
-    # Upload
     idc = IdentityClient({'region': home}, signer=signer)
     pub_pem = auth['pub'].public_bytes(Encoding.PEM, PublicFormat.SubjectPublicKeyInfo).decode()
     try:
         idc.upload_api_key(auth['user'], id_models.CreateApiKeyDetails(key=pub_pem))
+        log("  Key uploaded")
     except oci.exceptions.ServiceError as e:
         if e.status != 409: raise
         log("  Key already exists")
     log(f"  Fingerprint: {auth['fp']}")
+    log("  Waiting for propagation...")
+    time.sleep(10)
 
-    # Write config file for API key auth
     cfg_path = os.path.join(DIR, "oci-config.txt")
     with open(cfg_path, 'w') as f:
         f.write(f"[DEFAULT]\nuser={auth['user']}\ntenancy={auth['tenancy']}\n")
@@ -162,8 +153,7 @@ def upload_api_key(auth):
     with open(os.path.join(DIR, "oci-key.pem"), 'wb') as f:
         f.write(priv_pem)
 
-    config = oci.config.from_file(cfg_path)
-    auth['config'] = config
+    auth['config'] = oci.config.from_file(cfg_path)
     log("  OK")
 
 # ── Create network + VM ──────────────────────────────────────
@@ -172,14 +162,10 @@ def create_vm(auth):
     log("[3/6] Network + VM")
     config = auth['config']
     cid = config['tenancy']
-    home = auth['home']
     net = VirtualNetworkClient(config)
     compute = ComputeClient(config)
 
-    # AD
     ad = IdentityClient(config).list_availability_domains(compartment_id=cid).data[0].name
-
-    # Image
     imgs = compute.list_images(compartment_id=cid, operating_system="Canonical Ubuntu",
         operating_system_version="22.04", shape="VM.Standard.E2.1.Micro",
         sort_by="TIMECREATED", sort_order="DESC")
@@ -189,13 +175,11 @@ def create_vm(auth):
             sort_by="TIMECREATED", sort_order="DESC")
     image_id = imgs.data[0].id
 
-    # VCN
     vcn = net.create_vcn(core_models.CreateVcnDetails(cidr_block="10.0.0.0/24",
         compartment_id=cid, display_name="zerovpn-vcn", dns_label="zerovpn"))
     vcn_id = vcn.data.id
     oci.wait_until(net, net.get_vcn(vcn_id), 'lifecycle_state', 'AVAILABLE')
 
-    # Security list
     sl = net.create_security_list(core_models.CreateSecurityListDetails(
         compartment_id=cid, vcn_id=vcn_id, display_name="zerovpn-sl",
         egress_security_rules=[core_models.EgressSecurityRule(destination="0.0.0.0/0", protocol="all", is_stateless=False)],
@@ -207,7 +191,6 @@ def create_vm(auth):
         ]))
     sl_id = sl.data.id
 
-    # Subnet
     dhcp_id = net.list_dhcp_options(compartment_id=cid, vcn_id=vcn_id).data[0].id
     subnet = net.create_subnet(core_models.CreateSubnetDetails(
         cidr_block="10.0.0.0/24", compartment_id=cid, display_name="zerovpn-subnet",
@@ -215,34 +198,28 @@ def create_vm(auth):
     subnet_id = subnet.data.id
     oci.wait_until(net, net.get_subnet(subnet_id), 'lifecycle_state', 'AVAILABLE')
 
-    # IGW
     igw = net.create_internet_gateway(core_models.CreateInternetGatewayDetails(
         compartment_id=cid, display_name="zerovpn-igw", is_enabled=True, vcn_id=vcn_id))
     igw_id = igw.data.id
     oci.wait_until(net, net.get_internet_gateway(igw_id), 'lifecycle_state', 'AVAILABLE')
 
-    # Route
     rt_id = net.get_vcn(vcn_id).data.default_route_table_id
     net.update_route_table(rt_id, core_models.UpdateRouteTableDetails(
         route_rules=[core_models.RouteRule(destination="0.0.0.0/0", destination_type="CIDR_BLOCK", network_entity_id=igw_id)]))
-
     log("  Network ready")
 
-    # Launch
     log("[4/6] Launching VM...")
     inst = compute.launch_instance(core_models.LaunchInstanceDetails(
         availability_domain=ad, compartment_id=cid, display_name="zerovpn-exit-01",
         shape="VM.Standard.E2.1.Micro", subnet_id=subnet_id,
         source_details=core_models.InstanceSourceViaImageDetails(image_id=image_id, boot_volume_size_in_gbs=50, source_type="image"),
         create_vnic_details=core_models.CreateVnicDetails(subnet_id=subnet_id, assign_public_ip=True),
-        metadata={'ssh_authorized_keys': SSH_PUB},
-    ))
+        metadata={'ssh_authorized_keys': SSH_PUB}))
     inst_id = inst.data.id
     log(f"  Instance: {inst_id}")
     oci.wait_until(compute, compute.get_instance(inst_id), 'lifecycle_state', 'RUNNING', max_wait_seconds=300)
     log("  RUNNING")
 
-    # Public IP
     log("[5/6] Getting public IP...")
     time.sleep(5)
     public_ip = None
@@ -262,68 +239,60 @@ def create_vm(auth):
 
 def setup_wireguard(auth):
     log("[6/6] SSH + WireGuard")
-    import subprocess
     opts = ["-o","StrictHostKeyChecking=no","-o","UserKnownHostsFile=/dev/null",
             "-o","ConnectTimeout=30","-i",SSH_KEY,f"ubuntu@{auth['public_ip']}"]
 
     # Wait for SSH
+    log("  Waiting for SSH...")
     for i in range(12):
         try:
             r = subprocess.run(["ssh"]+opts+["echo","ok"], capture_output=True, text=True, timeout=15)
             if r.returncode == 0: break
         except: pass
         time.sleep(10)
+    else:
+        log("  SSH not available"); return
+    log("  SSH connected!")
 
-    # Install
-    subprocess.run(["ssh"]+opts+[
-        "sudo apt-get update -y && sudo apt-get install -y wireguard wireguard-tools && "
-        "sudo sh -c 'umask 077; wg genkey > /etc/wireguard/server.key; wg pubkey < /etc/wireguard/server.key > /etc/wireguard/server.pub'"
-    ], capture_output=True, text=True, timeout=120)
+    # Install WireGuard
+    log("  Installing WireGuard...")
+    r = subprocess.run(["ssh"]+opts+[
+        "sudo apt-get update -y && sudo apt-get install -y wireguard wireguard-tools"
+    ], capture_output=True, text=True, timeout=180)
+    if r.returncode != 0:
+        log(f"  apt install failed: {r.stderr[-200:]}"); return
 
-    # Configure
-    setup = """bash -c '
-SERVER_KEY=*** cat /etc/wireguard/server.key)
-sudo bash -c "cat > /etc/wireguard/wg0.conf << EOF
-[Interface]
-PrivateKey = $SERVER_KEY
-Address = 10.66.66.1/24
-ListenPort = 51820
-PostUp = iptables -A FORWARD -i wg0 -j ACCEPT; iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
-PostDown = iptables -D FORWARD -i wg0 -j ACCEPT; iptables -t nat -D POSTROUTING -o eth0 -j MASQUERADE
-EOF"
-sudo chmod 600 /etc/wireguard/wg0.conf
-sudo sysctl -w net.ipv4.ip_forward=1
-echo net.ipv4.ip_forward=1 | sudo tee -a /etc/sysctl.conf
-sudo systemctl enable wg-quick@wg0
-sudo systemctl start wg-quick@wg0
-wg genkey | tee /tmp/peer.key | wg pubkey > /tmp/peer.pub
-PEER_PUB=*** /tmp/peer.pub)
-sudo wg set wg0 peer "$PEER_PUB" allowed-ips 10.66.66.2/32
-SERVER_PUB=$(sudo cat /etc/wireguard/server.pub)
-PEER_KEY=$(cat /tmp/peer.key)
-echo "PEER_KEY=$PEER_KEY"
-echo "SERVER_PUB=$SERVER_PUB"
-'
-""".strip()
-    r = subprocess.run(["ssh"]+opts+[setup], capture_output=True, text=True, timeout=60)
+    # Generate server keys
+    r = subprocess.run(["ssh"]+opts+[
+        "sudo sh -c \"umask 077; wg genkey > /etc/wireguard/server.key; wg pubkey < /etc/wireguard/server.key > /etc/wireguard/server.pub\""
+    ], capture_output=True, text=True, timeout=30)
+    if r.returncode != 0:
+        log(f"  keygen failed: {r.stderr[-200:]}"); return
+    log("  Keys generated")
+
+    # Configure via setup-wg.sh
+    log("  Configuring WireGuard...")
+    setup_script = os.path.join(DIR, "setup-wg.sh")
+    if not os.path.exists(setup_script):
+        log("  setup-wg.sh not found!"); return
+
+    subprocess.run(["scp","-o","StrictHostKeyChecking=no","-o","UserKnownHostsFile=/dev/null",
+        "-i",SSH_KEY, setup_script, f"ubuntu@{auth['public_ip']}:/tmp/setup-wg.sh"],
+        capture_output=True, text=True, timeout=15)
+    r = subprocess.run(["ssh"]+opts+["bash /tmp/setup-wg.sh"], capture_output=True, text=True, timeout=60)
+
     peer_key = server_pub = None
     for line in r.stdout.split('\n'):
-        if line.startswith('PEER_KEY='): peer_key = line.split('=',1)[1].strip()
-        elif line.startswith('SERVER_PUB='): server_pub = line.split('=',1)[1].strip()
+        if line.startswith('PEER_PRIVATE_KEY='): peer_key = line.split('=',1)[1].strip()
+        elif line.startswith('SERVER_PUBLIC_KEY='): server_pub = line.split('=',1)[1].strip()
 
     if not peer_key or not server_pub:
-        log("  FAILED: no keys"); log(f"  stdout: {r.stdout[-200:]}"); log(f"  stderr: {r.stderr[-200:]}"); return
+        log("  FAILED: no keys")
+        log(f"  stdout: {r.stdout[-300:]}")
+        log(f"  stderr: {r.stderr[-300:]}")
+        return
 
-    conf = f"""[Interface]
-PrivateKey = {peer_key}
-Address = 10.66.66.2/24
-DNS = 1.1.1.1
-
-[Peer]
-PublicKey = {server_pub}
-Endpoint = {auth['public_ip']}:51820
-AllowedIPs = 0.0.0.0/0
-PersistentKeepalive = 25"""
+    conf = f"[Interface]\nPrivateKey = {peer_key}\nAddress = 10.66.66.2/24\nDNS = 1.1.1.1\n\n[Peer]\nPublicKey = {server_pub}\nEndpoint = {auth['public_ip']}:51820\nAllowedIPs = 0.0.0.0/0\nPersistentKeepalive = 25\n"
     with open(os.path.join(DIR, "client.conf"), 'w') as f:
         f.write(conf)
     log("  WireGuard configured!")
