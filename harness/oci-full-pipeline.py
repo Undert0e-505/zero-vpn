@@ -1,10 +1,10 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """
-OCI Full Pipeline — end-to-end provisioning test on Windows.
+OCI Full Pipeline â€” end-to-end provisioning test on Windows.
 
 Runs the complete flow:
-1. Browser auth (harness auth → security token)
-2. Upload API key (security token → permanent API key signing)
+1. Browser auth (harness auth â†’ security token)
+2. Upload API key (security token â†’ permanent API key signing)
 3. Query tenancy (home region, availability domains, images)
 4. Create network (VCN, subnet, IGW, route table, security list)
 5. Launch instance (Ubuntu micro, public IP, SSH key)
@@ -37,9 +37,10 @@ from cryptography.hazmat.primitives import serialization
 
 import oci
 from oci.regions import REGIONS, REALMS, REGION_REALMS, REGIONS_SHORT_NAMES, is_region
-from oci import identity
-from oci import core
-from oci import network
+from oci.identity import IdentityClient
+from oci.core import VirtualNetworkClient, ComputeClient
+from oci.core import models as core_models
+from oci.identity import models as identity_models
 
 LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pipeline.log")
 
@@ -61,7 +62,7 @@ def generate_keypair():
     return private_key, private_key.public_key()
 
 def public_key_to_jwk(public_key):
-    """Exact CLI format: kty, n, e, kid — no alg/use, stripped padding."""
+    """Exact CLI format: kty, n, e, kid â€” no alg/use, stripped padding."""
     numbers = public_key.public_numbers()
     def bytes_from_int(val):
         remaining = val
@@ -145,7 +146,7 @@ class StoppableHTTPServer(HTTPServer):
         self.server_close()
 
 def do_browser_auth(region):
-    """Step 1: Browser auth → security token + user/tenancy OCIDs."""
+    """Step 1: Browser auth â†’ security token + user/tenancy OCIDs."""
     log("[1/10] Browser auth")
     log("  Generating RSA keypair...")
     private_key, public_key = generate_keypair()
@@ -170,7 +171,7 @@ def do_browser_auth(region):
     def timeout():
         time.sleep(300)
         if CallbackHandler.captured_token is None:
-            log("  TIMEOUT — no callback received")
+            log("  TIMEOUT â€” no callback received")
             server.stop = True
     threading.Thread(target=timeout, daemon=True).start()
     
@@ -220,7 +221,7 @@ def do_upload_api_key(auth):
     signer = oci.auth.signers.SecurityTokenSigner(auth['token'], priv_pem)
     
     # Find home region
-    client = identity.IdentityClient({'region': auth['region']}, signer=signer)
+    client = IdentityClient({'region': auth['region']}, signer=signer)
     subscriptions = client.list_region_subscriptions(auth['tenancy_ocid'])
     home_region = None
     for sub in subscriptions.data:
@@ -235,7 +236,7 @@ def do_upload_api_key(auth):
     log(f"  Home region: {home_region}")
     
     # Use home region client for API key upload
-    client = identity.IdentityClient({'region': home_region}, signer=signer)
+    client = IdentityClient({'region': home_region}, signer=signer)
     
     # Serialize public key to PEM
     pub_pem = auth['public_key'].public_bytes(
@@ -243,7 +244,7 @@ def do_upload_api_key(auth):
         format=serialization.PublicFormat.SubjectPublicKeyInfo
     ).decode('UTF-8')
     
-    create_details = identity.models.CreateApiKeyDetails()
+    create_details = identity_models.CreateApiKeyDetails()
     create_details.key = pub_pem
     
     try:
@@ -299,7 +300,7 @@ def query_tenancy(auth, signer):
     region = auth['home_region']
     compartment_id = auth['tenancy_ocid']  # root compartment
     
-    identity_client = identity.IdentityClient({'region': region}, signer=signer)
+    identity_client = IdentityClient({'region': region}, signer=signer)
     
     # Availability domains
     ads = identity_client.list_availability_domains(compartment_id=compartment_id)
@@ -307,7 +308,7 @@ def query_tenancy(auth, signer):
     log(f"  Availability domain: {ad_name}")
     
     # Find Ubuntu 22.04 image
-    compute_client = core.ComputeClient({'region': region}, signer=signer)
+    compute_client = ComputeClient({'region': region}, signer=signer)
     images = compute_client.list_images(
         compartment_id=compartment_id,
         operating_system="Canonical Ubuntu",
@@ -351,11 +352,11 @@ def create_network(auth, signer):
     region = auth['home_region']
     compartment_id = auth['tenancy_ocid']
     
-    net = network.VirtualNetworkClient({'region': region}, signer=signer)
+    net = VirtualNetworkClient({'region': region}, signer=signer)
     
     # VCN
     vcn = net.create_vcn(
-        create_vcn_details=network.models.CreateVcnDetails(
+        create_vcn_details=core_models.CreateVcnDetails(
             cidr_block="10.0.0.0/24",
             compartment_id=compartment_id,
             display_name="zerovpn-vcn",
@@ -369,12 +370,12 @@ def create_network(auth, signer):
     
     # Security list
     sl = net.create_security_list(
-        create_security_list_details=network.models.CreateSecurityListDetails(
+        create_security_list_details=core_models.CreateSecurityListDetails(
             compartment_id=compartment_id,
             vcn_id=vcn_id,
             display_name="zerovpn-sl",
             egress_security_rules=[
-                network.models.EgressSecurityRule(
+                core_models.EgressSecurityRule(
                     destination="0.0.0.0/0",
                     protocol="all",
                     is_stateless=False,
@@ -382,21 +383,21 @@ def create_network(auth, signer):
             ],
             ingress_security_rules=[
                 # SSH
-                network.models.IngressSecurityRule(
+                core_models.IngressSecurityRule(
                     source="0.0.0.0/0",
                     protocol="6",
                     is_stateless=False,
-                    tcp_options=network.models.TcpOptions(
-                        destination_port_range=network.models.PortRange(min=22, max=22)
+                    tcp_options=core_models.TcpOptions(
+                        destination_port_range=core_models.PortRange(min=22, max=22)
                     ),
                 ),
                 # WireGuard
-                network.models.IngressSecurityRule(
+                core_models.IngressSecurityRule(
                     source="0.0.0.0/0",
                     protocol="17",
                     is_stateless=False,
-                    udp_options=network.models.UdpOptions(
-                        destination_port_range=network.models.PortRange(min=51820, max=51820)
+                    udp_options=core_models.UdpOptions(
+                        destination_port_range=core_models.PortRange(min=51820, max=51820)
                     ),
                 ),
             ],
@@ -409,9 +410,9 @@ def create_network(auth, signer):
     dhcp_options = net.list_dhcp_options(compartment_id=compartment_id, vcn_id=vcn_id)
     dhcp_id = dhcp_options.data[0].id
     
-    # Subnet (regional — omit availability_domain)
+    # Subnet (regional â€” omit availability_domain)
     subnet = net.create_subnet(
-        create_subnet_details=network.models.CreateSubnetDetails(
+        create_subnet_details=core_models.CreateSubnetDetails(
             cidr_block="10.0.0.0/24",
             compartment_id=compartment_id,
             display_name="zerovpn-subnet",
@@ -426,7 +427,7 @@ def create_network(auth, signer):
     
     # Internet gateway
     igw = net.create_internet_gateway(
-        create_internet_gateway_details=network.models.CreateInternetGatewayDetails(
+        create_internet_gateway_details=core_models.CreateInternetGatewayDetails(
             compartment_id=compartment_id,
             display_name="zerovpn-igw",
             is_enabled=True,
@@ -442,9 +443,9 @@ def create_network(auth, signer):
     default_rt_id = vcn_data.default_route_table_id
     net.update_route_table(
         route_table_id=default_rt_id,
-        update_route_table_details=network.models.UpdateRouteTableDetails(
+        update_route_table_details=core_models.UpdateRouteTableDetails(
             route_rules=[
-                network.models.RouteRule(
+                core_models.RouteRule(
                     destination="0.0.0.0/0",
                     destination_type="CIDR_BLOCK",
                     network_entity_id=igw_id,
@@ -472,7 +473,7 @@ def launch_instance(auth, signer, tenancy, network_info):
     log("[6/10] Launching instance")
     region = auth['home_region']
     
-    compute = core.ComputeClient({'region': region}, signer=signer)
+    compute = ComputeClient({'region': region}, signer=signer)
     
     # Write SSH key to temp file
     import tempfile
@@ -482,7 +483,7 @@ def launch_instance(auth, signer, tenancy, network_info):
     
     try:
         instance = compute.launch_instance(
-            launch_instance_details=core.models.LaunchInstanceDetails(
+            launch_instance_details=core_models.LaunchInstanceDetails(
                 availability_domain=tenancy['ad_name'],
                 compartment_id=tenancy['compartment_id'],
                 display_name="zerovpn-exit-01",
@@ -518,7 +519,7 @@ def get_public_ip(auth, signer, instance_id):
     """Get the public IP of the instance."""
     log("[7/10] Getting public IP")
     region = auth['home_region']
-    compute = core.ComputeClient({'region': region}, signer=signer)
+    compute = ComputeClient({'region': region}, signer=signer)
     
     # Wait a moment for VNIC to settle
     time.sleep(5)
@@ -527,7 +528,7 @@ def get_public_ip(auth, signer, instance_id):
         vnics = compute.list_vnics(instance_id=instance_id)
         if vnics.data:
             vnic_id = vnics.data[0].vnic_id
-            net = network.VirtualNetworkClient({'region': region}, signer=signer)
+            net = VirtualNetworkClient({'region': region}, signer=signer)
             vnic = net.get_vnic(vnic_id).data
             if vnic.public_ip:
                 log(f"  Public IP: {vnic.public_ip}")
@@ -553,7 +554,7 @@ def ssh_install_wireguard(public_ip):
     
     if not os.path.exists(ssh_key):
         log(f"  SSH key not found at {ssh_key}")
-        log("  Skipping SSH step — VM is running, you can SSH manually")
+        log("  Skipping SSH step â€” VM is running, you can SSH manually")
         return False
     
     # Use ssh command
@@ -717,7 +718,7 @@ def verify_wireguard(auth, signer, public_ip):
     sock.settimeout(5)
     try:
         sock.sendto(b"\x00\x00\x00\x00", (public_ip, 51820))
-        log("  UDP probe sent to port 51820 (no response expected — WireGuard drops invalid packets)")
+        log("  UDP probe sent to port 51820 (no response expected â€” WireGuard drops invalid packets)")
         log("  Verification is implicit: if the SSH steps above worked, the server is up.")
         log("  Full tunnel verification requires a WireGuard client on this machine.")
     except Exception as e:
@@ -737,8 +738,8 @@ def teardown(auth, signer, network_info, instance_id):
     """Destroy all created resources."""
     log("[10/10] Teardown")
     region = auth['home_region']
-    compute = core.ComputeClient({'region': region}, signer=signer)
-    net = network.VirtualNetworkClient({'region': region}, signer=signer)
+    compute = ComputeClient({'region': region}, signer=signer)
+    net = VirtualNetworkClient({'region': region}, signer=signer)
     
     # Terminate instance
     if instance_id:
@@ -756,7 +757,7 @@ def teardown(auth, signer, network_info, instance_id):
         default_rt_id = vcn_data.default_route_table_id
         net.update_route_table(
             route_table_id=default_rt_id,
-            update_route_table_details=network.models.UpdateRouteTableDetails(
+            update_route_table_details=core_models.UpdateRouteTableDetails(
                 route_rules=[]
             )
         )
@@ -810,9 +811,9 @@ def main():
     log("")
     
     if args.teardown_only:
-        log("Teardown-only mode — need resource IDs")
+        log("Teardown-only mode â€” need resource IDs")
         # This would need saved state from a previous run
-        log("Not implemented yet — use --vcn-id and --instance-id")
+        log("Not implemented yet â€” use --vcn-id and --instance-id")
         return
     
     # Step 1: Browser auth
