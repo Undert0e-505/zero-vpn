@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """
 OCI Setup State Machine - Python reference implementation.
 
@@ -617,7 +617,7 @@ def main():
         log("An Oracle exit node already exists:")
         log(f"  Public IP: {state.get('public_ip', 'unknown')}")
         log(f"  Region: {state.get('home_region', 'unknown')}")
-        log()
+        log("")
         log("  Options:")
         log("    1. Use existing (no action needed)")
         log("    2. Destroy and recreate")
@@ -649,7 +649,7 @@ def main():
     if current in (State.PROVISION_FAILED, State.CLEANUP_REQUIRED):
         log(f"Previous provisioning failed at: {state.get('last_successful_phase', 'unknown')}")
         log(f"Error: {state.get('last_error', 'unknown')}")
-        log()
+        log("")
         log("  Options:")
         log("    1. Retry provisioning")
         log("    2. Cleanup partial resources")
@@ -692,7 +692,7 @@ def main():
     log("=" * 60)
     log("  ZeroVPN Oracle Setup")
     log("=" * 60)
-    log()
+    log("")
     log("  IMPORTANT before continuing:")
     log("  - Oracle signup or login may be required")
     log("  - Oracle may require card and 2FA")
@@ -706,7 +706,7 @@ def main():
         log("  WARNING: UK region (dev mode) - OK for testing, not for production exit")
     log("  - Home region cannot be changed later. Choose carefully during Oracle signup.")
     log("  - Setup takes 4-6 minutes once provisioning begins")
-    log()
+    log("")
     log("  Press Enter to continue (opens browser for Oracle login/signup)...")
     input()
 
@@ -714,7 +714,7 @@ def main():
     save_state(state)
 
     # -- AwaitingOracleBrowser -> AuthReceived --
-    log()
+    log("")
     log("[1/7] Browser auth")
     token, priv_pem, priv_obj, auth_info = do_browser_auth(state)
 
@@ -734,7 +734,7 @@ def main():
     save_state(state)
 
     # -- Preflight --
-    log()
+    log("")
     log("[2/7] Tenancy preflight")
     state["state"] = State.PREFLIGHT_RUNNING.value
     save_state(state)
@@ -752,12 +752,11 @@ def main():
     save_state(state)
 
     # -- Provisioning --
-    log()
+    log("")
     log("[3/7] Uploading API key...")
     do_upload_api_key(state, token, priv_obj)
     log("  API key uploaded")
-
-    log()
+    log("")
     log("Starting provisioning pipeline...")
     state["state"] = State.PROVISIONING.value
     save_state(state)
@@ -766,7 +765,7 @@ def main():
         events = do_provision(state, token, priv_obj)
         state["state"] = State.EXIT_READY.value
         save_state(state)
-        log()
+        log("")
         log("=" * 60)
         log("  EXIT READY!")
         log("=" * 60)
