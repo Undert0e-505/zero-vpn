@@ -5,6 +5,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Build
+import androidx.compose.material.icons.filled.Cloud
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.Hub
 import androidx.compose.material.icons.filled.Settings
@@ -37,6 +38,7 @@ sealed class Screen(val route: String, val label: String, val icon: ImageVector)
     data object NodeInvite : Screen("node_invite", "Nodes", Icons.Default.Hub)
     data object Diagnostics : Screen("diagnostics", "Diagnostics", Icons.Default.Build)
     data object Settings : Screen("settings", "Settings", Icons.Default.Settings)
+    data object OracleProvision : Screen("oracle_provision", "Provision", Icons.Default.Cloud)
 }
 
 private val screens = listOf(
@@ -112,7 +114,16 @@ fun NavGraph() {
                 HomeScreen(snackbarHostState = snackbarHostState)
             }
             composable(Screen.AddExit.route) {
-                AddExitScreen(snackbarHostState = snackbarHostState)
+                AddExitScreen(
+                    snackbarHostState = snackbarHostState,
+                    onNavigateToProvision = { navController.navigate(Screen.OracleProvision.route) },
+                )
+            }
+            composable(Screen.OracleProvision.route) {
+                ProvisioningScreen(
+                    snackbarHostState = snackbarHostState,
+                    onBack = { navController.popBackStack() },
+                )
             }
             composable(Screen.NodeInvite.route) {
                 NodeInviteScreen()

@@ -22,11 +22,6 @@
             </intent-filter>
         </activity>
 
-        <!-- OCI Bootstrap spike activity (WebView-based, no deep link needed) -->
-        <activity
-            android:name=".oci.OciBootstrapActivity"
-            android:exported="false"
-            android:theme="@style/Theme.ZeroVPN" />
     </application>
 
 </manifest>
