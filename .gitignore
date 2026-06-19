@@ -45,3 +45,5 @@ harness/oci-config.txt
 harness/auth-state.json
 harness/__pycache__/
 harness/*.log
+
+harness/setup-state.json
