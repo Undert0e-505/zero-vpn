@@ -451,13 +451,18 @@ def do_provision(state, token, priv_obj):
 
     # Phase 6: WireGuard
     emit(Phase.WIREGUARD, Status.RUNNING, "Installing WireGuard...")
-    subprocess.run(["ssh"] + opts + [
+    r = subprocess.run(["ssh"] + opts + [
         "sudo apt-get update -y && sudo apt-get install -y wireguard wireguard-tools"
     ], capture_output=True, text=True, timeout=180)
-    subprocess.run(["ssh"] + opts + [
+    if r.returncode != 0:
+        raise Exception(f"apt install failed: {r.stderr[-200:]}")
+
+    r = subprocess.run(["ssh"] + opts + [
         'sudo sh -c "umask 077; wg genkey > /etc/wireguard/server.key; '
         'wg pubkey < /etc/wireguard/server.key > /etc/wireguard/server.pub"'
     ], capture_output=True, text=True, timeout=30)
+    if r.returncode != 0:
+        raise Exception(f"keygen failed: {r.stderr[-200:]}")
 
     emit(Phase.WIREGUARD, Status.RUNNING, "Configuring WireGuard...")
     setup_script = os.path.join(DIR, "setup-wg.sh")
@@ -466,6 +471,9 @@ def do_provision(state, token, priv_obj):
                     "-i", SSH_KEY, setup_script,
                     f"ubuntu@{public_ip}:/tmp/setup-wg.sh"],
                    capture_output=True, text=True, timeout=15)
+    # Ensure LF line endings on the VM
+    subprocess.run(["ssh"] + opts + ["sed -i 's/\r$//' /tmp/setup-wg.sh"],
+                   capture_output=True, text=True, timeout=10)
     r = subprocess.run(["ssh"] + opts + ["bash /tmp/setup-wg.sh"],
                        capture_output=True, text=True, timeout=60)
 
@@ -477,7 +485,7 @@ def do_provision(state, token, priv_obj):
             server_pub = line.split('=', 1)[1].strip()
 
     if not peer_key or not server_pub:
-        raise Exception("WireGuard key extraction failed")
+        raise Exception(f"WireGuard key extraction failed. stdout={r.stdout[-200:]} stderr={r.stderr[-200:]}")
 
     # Save client config to secrets dir (not persisted in state)
     conf = (f"[Interface]\nPrivateKey = {peer_key}\n"
