@@ -20,18 +20,11 @@
             </intent-filter>
         </activity>
 
-        <!-- OCI Bootstrap spike activity -->
+        <!-- OCI Bootstrap spike activity (WebView-based, no deep link needed) -->
         <activity
             android:name=".oci.OciBootstrapActivity"
-            android:exported="true"
-            android:theme="@style/Theme.ZeroVPN">
-            <intent-filter>
-                <action android:name="android.intent.action.VIEW" />
-                <category android:name="android.intent.category.DEFAULT" />
-                <category android:name="android.intent.category.BROWSABLE" />
-                <data android:scheme="zerovpn" android:host="auth" android:pathPrefix="/callback" />
-            </intent-filter>
-        </activity>
+            android:exported="false"
+            android:theme="@style/Theme.ZeroVPN" />
     </application>
 
 </manifest>
