@@ -1,0 +1,39 @@
+[09:55:33] ============================================================
+[09:55:33]   OCI AUTH HARNESS
+[09:55:33] ============================================================
+[09:55:33] 
+[09:55:33] [1] Generating RSA 2048-bit keypair...
+[09:55:33]     Private key: 2048 bits
+[09:55:33]     Public key: 2048 bits
+[09:55:33] 
+[09:55:33] [2] Building JWK from public key...
+[09:55:33]     JWK JSON: {"kty": "RSA", "n": "5VBprq6Z6pLVedA0lVDS0cyXSp4OQ869pndvBS55pYFYNCjegBS4CdKlpk8cl0yLJgR8Vh2RzCddN6q259atxKGkOJQoh_tsNs_3N4QV0B8gQoUSQkqqgrH2gf0x2sSekQ-zC9RtK4soNfb285RKjGbQL7fuZYJLwcSMj8EG51XpLEVH1QMzWVehhfjuRFUk4_iLVUTp_5xfZiFZw6AsMaOgwFu9APt_sr7EFHzLr4xBmL1pMd8X7J7syr_STonaW0XLaYPZDCUNTqVxbEMRLBupXN0a6gUYKbBcNufpaPLX8opaAwJFKRohqR0TNGJgJppVoVoW36xNXXnHG5Fx5Q", "e": "AQAB", "kid": "Ignored"}
+[09:55:33] 
+[09:55:33] [3] Verifying JWK...
+[09:55:33]     kty: RSA OK
+[09:55:33]     e: AQAB OK
+[09:55:33]     kid: Ignored OK
+[09:55:33]     n: 342 chars, 256 bytes OK
+[09:55:33]     No padding in n: OK
+[09:55:33]     No + or / in n: OK
+[09:55:33]     base64url(JWK): eyJrdHkiOiAiUlNBIiwgIm4iOiAiNVZCcHJxNlo2cExWZWRBMGxWRFMwY3lY...
+[09:55:33] 
+[09:55:33] [4] Fingerprint: 88:b6:29:24:3e:3f:9e:3a:77:83:d6:4e:f9:6f:62:e4:8b:89:21:4e:da:a0:1e:c9:f4:7b:23:64:54:d6:28:de
+[09:55:33] 
+[09:55:33] [5] Building authorize URL...
+[09:55:33]     Region: uk-london-1
+[09:55:33]     Redirect URI: http://localhost:8181
+[09:55:33]     URL: https://login.uk-london-1.oraclecloud.com/v1/oauth2/authorize?action=login&client_id=iaas_console&re...
+[09:55:33] 
+[09:55:33] [6] Starting local HTTP listener on port 8181...
+[09:55:33]     Listener running
+[09:55:33] 
+[09:55:33] [7] Opening browser to Oracle login...
+[09:55:33]     Please complete login in the browser.
+[09:55:33]     The harness will capture the callback automatically.
+[09:55:33] 
+[09:55:33] [8] Waiting for callback (timeout: 5 minutes)...
+[09:55:33]     Every redirect will be logged below.
+[09:55:33] 
+[10:00:33] 
+  >>> TIMEOUT: No callback received within 5 minutes.

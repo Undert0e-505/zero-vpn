@@ -1,0 +1,11 @@
+{
+  "user_ocid": "REDACTED_OCID",
+  "tenancy_ocid": "REDACTED_OCID",
+  "fingerprint": "bb:11:39:f9:fd:cb:5d:d4:24:db:86:5b:bb:94:29:9c",
+  "region": "uk-london-1",
+  "home_region": "uk-london-1",
+  "image_id": "REDACTED_OCID",
+  "ad_name": "vwPG:UK-LONDON-1-AD-1",
+  "instance_id": "REDACTED_OCID",
+  "public_ip": "152.67.146.82"
+}
