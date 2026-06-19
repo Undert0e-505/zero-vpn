@@ -2,11 +2,14 @@ package com.zerovpn.app.oci
 
 import java.security.KeyPair
 import java.security.KeyPairGenerator
+import java.security.MessageDigest
+import java.security.PrivateKey
 import java.security.SecureRandom
 import java.security.Signature
 import java.security.interfaces.RSAPublicKey
 import java.util.Base64
 import java.util.UUID
+import org.json.JSONObject
 
 /**
  * OCI request signing utility.
@@ -23,8 +26,6 @@ object OciRequestSigner {
 
     /**
      * Generate an RSA 2048-bit keypair for OCI API signing.
-     * On Android, use KeyPairGenerator with "AndroidKeyStore" provider
-     * instead of this, but for the spike we use plain JCA.
      */
     fun generateKeyPair(): KeyPair {
         val kpg = KeyPairGenerator.getInstance("RSA")
@@ -42,25 +43,25 @@ object OciRequestSigner {
     }
 
     /**
-     * Compute the SHA-256 fingerprint of a public key (OCI format).
-     * OCI uses the colon-separated hex of the SHA-256 of the DER-encoded public key.
+     * Compute the MD5 fingerprint of a public key (OCI API key fingerprint format).
+     * MD5 of the DER-encoded public key, colon-separated hex (16 bytes).
      */
-    fun publicKeyFingerprint(publicKey: RSAPublicKey): String {
-        val digest = java.security.MessageDigest.getInstance("SHA-256")
-        val hash = digest.digest(publicKey.encoded)
-        return hash.joinToString(":") { "%02x".format(it) }
+    fun md5Fingerprint(publicKey: RSAPublicKey): String {
+        val der = publicKey.encoded
+        val md5 = MessageDigest.getInstance("MD5").digest(der)
+        return md5.joinToString(":") { "%02x".format(it) }
     }
 
-        /**
-     * Encode a public key as a JWK (JSON Web Key) for the OAuth2 bootstrap URL.
+    /**
+     * Encode an RSA public key as a JWK (JSON Web Key) for the OAuth2 bootstrap URL.
      * OCI expects the JWK in the `public_key` query parameter.
      *
-     * The JWK format for RSA:
-     * {"kty":"RSA","e":"<base64url e>","n":"<base64url n>","alg":"RS256","use":"sig"}
+     * Correct format (matching OCI CLI):
+     * {"kty":"RSA","n":"<base64url no padding>","e":"<base64url no padding>","kid":"Ignored"}
      *
-     * IMPORTANT: BigInteger.toByteArray() may include a leading 0x00 sign byte
-     * for positive numbers when the high bit is set. This must be stripped
-     * for JWK compliance — the modulus must be unsigned big-endian bytes.
+     * - NO alg field, NO use field
+     * - kid is literal "Ignored"
+     * - n and e are base64url WITHOUT padding (strip = characters)
      */
     fun publicKeyToJwk(publicKey: RSAPublicKey): String {
         // Strip leading 0x00 sign byte from modulus if present
@@ -70,7 +71,6 @@ object OciRequestSigner {
         } else {
             nBytes
         }
-        // Also strip from exponent (usually 65537 = 0x010001, no sign byte, but be safe)
         val eBytes = publicKey.publicExponent.toByteArray()
         val eStripped = if (eBytes.isNotEmpty() && eBytes[0] == 0x00.toByte()) {
             eBytes.copyOfRange(1, eBytes.size)
@@ -78,16 +78,16 @@ object OciRequestSigner {
             eBytes
         }
 
-        // OCI CLI uses base64.urlsafe_b64encode which INCLUDES padding
-        val encoder = Base64.getUrlEncoder() // WITH padding, matching Python CLI
+        // base64url WITHOUT padding for n and e
+        val encoder = Base64.getUrlEncoder().withoutPadding()
         val n = encoder.encodeToString(nStripped)
         val e = encoder.encodeToString(eStripped)
-        return """{"kty":"RSA","e":"$e","n":"$n","alg":"RS256","use":"sig"}"""
+        return """{"kty":"RSA","n":"$n","e":"$e","kid":"Ignored"}"""
     }
 
     /**
      * Base64url-encode a string (for the OAuth2 public_key parameter).
-     * Uses padding to match the OCI CLI's base64.urlsafe_b64encode behavior.
+     * The outer encoding uses padding (matching the OCI CLI's base64.urlsafe_b64encode).
      */
     fun base64UrlEncode(input: String): String {
         return Base64.getUrlEncoder().encodeToString(input.toByteArray())
@@ -95,13 +95,8 @@ object OciRequestSigner {
 
     /**
      * Sign a request string with RSA-SHA256.
-     *
-     * OCI signing algorithm:
-     * 1. Build the signing string from specific headers
-     * 2. Sign with RSA-SHA256
-     * 3. Base64-encode the signature
      */
-    fun sign(privateKey: java.security.PrivateKey, data: String): String {
+    fun sign(privateKey: PrivateKey, data: String): String {
         val signature = Signature.getInstance("SHA256withRSA")
         signature.initSign(privateKey)
         signature.update(data.toByteArray())
@@ -111,21 +106,27 @@ object OciRequestSigner {
     /**
      * Build the OCI Authorization header value for an API request.
      *
-     * Format: Signature version="1",keyId="<tenancy>/<user>/<fingerprint>",algorithm="rsa-sha256",headers="...",signature="<base64>"
+     * For security token auth: keyId = "ST-{tenancy}/{user}/{fingerprint}"
+     * For API key auth: keyId = "{tenancy}/{user}/{fingerprint}" (no ST- prefix)
+     *
+     * @param useSecurityToken true for security token auth, false for API key auth
      */
     fun buildAuthHeader(
         tenancyOcid: String,
         userOcid: String,
         fingerprint: String,
-        privateKey: java.security.PrivateKey,
+        privateKey: PrivateKey,
         method: String,
         path: String,
         host: String,
         headers: Map<String, String> = emptyMap(),
+        useSecurityToken: Boolean = true,
     ): String {
-        // OCI signing headers (minimal set)
+        val date = headers["date"] ?: java.time.format.DateTimeFormatter.RFC_1123_DATE_TIME
+            .format(java.time.ZonedDateTime.now(java.time.ZoneOffset.UTC))
+
         val signingHeaders = listOf(
-            "date" to (headers["date"] ?: java.time.format.DateTimeFormatter.RFC_1123_DATE_TIME.format(java.time.ZonedDateTime.now(java.time.ZoneOffset.UTC))),
+            "date" to date,
             "(request-target)" to "$method $path",
             "host" to host,
         )
@@ -134,17 +135,14 @@ object OciRequestSigner {
         val signature = sign(privateKey, signingString)
         val headerNames = signingHeaders.joinToString(",") { it.first }
 
-        val keyId = "ST-$tenancyOcid/$userOcid/$fingerprint"
+        val keyIdPrefix = if (useSecurityToken) "ST-" else ""
+        val keyId = "$keyIdPrefix$tenancyOcid/$userOcid/$fingerprint"
 
         return """Signature version="1",keyId="$keyId",algorithm="rsa-sha256",headers="$headerNames",signature="$signature""""
     }
 
     /**
      * Build the Oracle OAuth2 authorize URL for the bootstrap flow.
-     *
-     * This is the URL that opens in Chrome Custom Tab for the user to
-     * log in to Oracle. After login, Oracle redirects to redirectUri
-     * with the security token in the URL fragment.
      */
     fun buildAuthorizeUrl(
         region: String,
@@ -174,25 +172,9 @@ object OciRequestSigner {
     }
 
     /**
-     * Extract the security token from the OAuth2 redirect URL fragment.
-     *
-     * The redirect URL looks like:
-     *   zerovpn://auth/callback#security_token=<JWT>&id_token=<JWT>&...
-     *
-     * Returns the security_token value, or null if not found.
-     */
-    fun extractSecurityToken(redirectUrl: String): String? {
-        val fragment = redirectUrl.substringAfter("#", "")
-        val params = fragment.split("&").associate {
-            val (k, v) = it.split("=", limit = 2)
-            k to v
-        }
-        return params["security_token"]
-    }
-
-    /**
      * Decode a JWT and extract claims (without verification — for
      * extracting user/tenancy OCIDs from the security token).
+     * Uses org.json.JSONObject for proper JSON parsing.
      */
     fun decodeJwt(jwt: String): Map<String, Any?> {
         val parts = jwt.split(".")
@@ -201,12 +183,81 @@ object OciRequestSigner {
         // Add padding for base64url
         val padded = payload.padEnd((payload.length + 3) / 4 * 4, '=')
         val json = String(Base64.getUrlDecoder().decode(padded))
-        // Simple JSON parse — use org.json on Android
-        // For spike, return a map of the key claims
+        val jsonObj = JSONObject(json)
         return mapOf(
-            "sub" to Regex(""""sub"\s*:\s*"([^"]+)"""").find(json)?.groupValues?.get(1),
-            "tenant" to Regex(""""tenant"\s*:\s*"([^"]+)"""").find(json)?.groupValues?.get(1),
-            "exp" to Regex(""""exp"\s*:\s*(\d+)"""").find(json)?.groupValues?.get(1)?.toLong(),
+            "sub" to jsonObj.optString("sub"),
+            "tenant" to jsonObj.optString("tenant"),
+            "exp" to jsonObj.optLong("exp", 0L).takeIf { it > 0 },
         )
+    }
+
+    /**
+     * Map OCI region short names to full names.
+     */
+    private val regionShortNames = mapOf(
+        "uk-london-1" to "uk-london-1",
+        "us-ashburn-1" to "us-ashburn-1",
+        "us-phoenix-1" to "us-phoenix-1",
+        "eu-frankfurt-1" to "eu-frankfurt-1",
+        "ap-tokyo-1" to "ap-tokyo-1",
+        "ap-sydney-1" to "ap-sydney-1",
+        "ap-mumbai-1" to "ap-mumbai-1",
+        "ap-seoul-1" to "ap-seoul-1",
+        "ap-osaka-1" to "ap-osaka-1",
+        "ca-toronto-1" to "ca-toronto-1",
+        "sa-saopaulo-1" to "sa-saopaulo-1",
+        "me-jeddah-1" to "me-jeddah-1",
+        "me-dubai-1" to "me-dubai-1",
+        "eu-amsterdam-1" to "eu-amsterdam-1",
+        "eu-zurich-1" to "eu-zurich-1",
+        "eu-madrid-1" to "eu-madrid-1",
+        "eu-milan-1" to "eu-milan-1",
+        "eu-stockholm-1" to "eu-stockholm-1",
+        "eu-paris-1" to "eu-paris-1",
+        "uk-cardiff-1" to "uk-cardiff-1",
+        "ap-chuncheon-1" to "ap-chuncheon-1",
+        "ap-hyderabad-1" to "ap-hyderabad-1",
+        "ap-melbourne-1" to "ap-melbourne-1",
+        "il-jerusalem-1" to "il-jerusalem-1",
+        "mx-queretaro-1" to "mx-queretaro-1",
+        "sa-vinhedo-1" to "sa-vinhedo-1",
+        "af-johannesburg-1" to "af-johannesburg-1",
+    )
+
+    /**
+     * Map region to realm domain.
+     */
+    private val regionRealms = mapOf(
+        "uk-london-1" to "oc1",
+        "uk-cardiff-1" to "oc1",
+        "us-ashburn-1" to "oc1",
+        "us-phoenix-1" to "oc1",
+        "ca-toronto-1" to "oc1",
+        "eu-frankfurt-1" to "oc1",
+        "eu-amsterdam-1" to "oc1",
+        "eu-zurich-1" to "oc1",
+        "eu-madrid-1" to "oc1",
+        "eu-milan-1" to "oc1",
+        "eu-stockholm-1" to "oc1",
+        "eu-paris-1" to "oc1",
+        "ap-tokyo-1" to "oc1",
+        "ap-sydney-1" to "oc1",
+        "ap-mumbai-1" to "oc1",
+        "ap-seoul-1" to "oc1",
+        "ap-osaka-1" to "oc1",
+        "ap-chuncheon-1" to "oc1",
+        "ap-hyderabad-1" to "oc1",
+        "ap-melbourne-1" to "oc1",
+        "sa-saopaulo-1" to "oc1",
+        "sa-vinhedo-1" to "oc1",
+        "me-jeddah-1" to "oc1",
+        "me-dubai-1" to "oc1",
+        "il-jerusalem-1" to "oc1",
+        "mx-queretaro-1" to "oc1",
+        "af-johannesburg-1" to "oc1",
+    )
+
+    fun getRealmForRegion(region: String): String {
+        return regionRealms[region] ?: "oc1"
     }
 }

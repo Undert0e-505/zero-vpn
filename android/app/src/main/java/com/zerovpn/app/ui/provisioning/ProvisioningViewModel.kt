@@ -1,8 +1,10 @@
 package com.zerovpn.app.ui.provisioning
 
+import android.content.Context
+import android.content.SharedPreferences
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
-import kotlinx.coroutines.delay
+import com.zerovpn.app.oci.OciProvisioner
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -25,6 +27,46 @@ class ProvisioningViewModel : ViewModel() {
     private val _wireGuardPort = MutableStateFlow(51820)
     val wireGuardPort: StateFlow<Int> = _wireGuardPort.asStateFlow()
 
+    private val _isDevMode = MutableStateFlow(true)
+    val isDevMode: StateFlow<Boolean> = _isDevMode.asStateFlow()
+
+    private var provisioner: OciProvisioner? = null
+    private var authResult: OciProvisioner.AuthResult? = null
+    private var preflightResult: OciProvisioner.PreflightResult? = null
+    private var resourceIds: OciProvisioner.ResourceIds? = null
+    private var clientConfig: String? = null
+    private var homeRegion: String? = null
+
+    // State persistence
+    private lateinit var prefs: SharedPreferences
+
+    fun initPrefs(context: Context) {
+        prefs = context.getSharedPreferences("zerovpn_provisioning", Context.MODE_PRIVATE)
+        loadPersistedState()
+    }
+
+    private fun loadPersistedState() {
+        if (!::prefs.isInitialized) return
+        val stateStr = prefs.getString("state", null)
+        if (stateStr != null) {
+            _isDevMode.value = prefs.getBoolean("is_dev_mode", true)
+            homeRegion = prefs.getString("home_region", null)
+            // Don't restore Running state — if we were mid-provision, user needs to retry
+        }
+    }
+
+    private fun persistState() {
+        if (!::prefs.isInitialized) return
+        prefs.edit().apply {
+            putString("state", _state.value::class.simpleName)
+            putBoolean("is_dev_mode", _isDevMode.value)
+            homeRegion?.let { putString("home_region", it) }
+            _publicIp.value?.let { putString("public_ip", it) }
+            putInt("wireguard_port", _wireGuardPort.value)
+            // No secrets stored
+        }.apply()
+    }
+
     fun showPreStart() {
         _state.value = ProvisioningState.PreStart
     }
@@ -36,122 +78,199 @@ class ProvisioningViewModel : ViewModel() {
         _publicIp.value = null
     }
 
-    fun startProvisioning() {
+    fun startProvisioning(context: Context) {
         if (_state.value is ProvisioningState.Running) return
         _events.value = emptyList()
         _state.value = ProvisioningState.Running
         viewModelScope.launch {
-            simulatePipeline()
+            runProvisioning(context)
         }
     }
 
-    fun retry() {
+    fun retry(context: Context) {
         _events.value = emptyList()
         _currentPhase.value = null
         _publicIp.value = null
         _state.value = ProvisioningState.Running
         viewModelScope.launch {
-            simulatePipeline()
+            runProvisioning(context)
         }
     }
 
-    fun destroyNode() {
+    fun continueAfterUkWarning(context: Context) {
+        _state.value = ProvisioningState.Running
         viewModelScope.launch {
-            emit(Phase.DONE, Status.RUNNING, "Destroying node resources...")
-            delay(2000)
-            emit(Phase.DONE, Status.SUCCESS, "Node destroyed. Resources released.")
+            continueProvisioningAfterWarning(context)
+        }
+    }
+
+    fun destroyNode(context: Context) {
+        val currentRids = resourceIds ?: return
+        val currentAuth = authResult ?: return
+        val currentRegion = homeRegion ?: "uk-london-1"
+
+        _state.value = ProvisioningState.Destroying
+        viewModelScope.launch {
+            provisioner?.let { prov ->
+                emit(Phase.DONE, Status.RUNNING, "Destroying node resources...")
+                try {
+                    prov.destroy(currentRids, currentAuth, currentRegion)
+                    emit(Phase.DONE, Status.SUCCESS, "Node destroyed. Resources released.")
+                } catch (e: Exception) {
+                    emit(Phase.DONE, Status.WARNING, "Destroy partial: ${e.message}")
+                }
+            }
+            _state.value = ProvisioningState.Destroyed
+            _events.value = emptyList()
+            _currentPhase.value = null
+            _publicIp.value = null
+            resourceIds = null
+            persistState()
+        }
+    }
+
+    fun cleanup(context: Context) {
+        viewModelScope.launch {
+            val currentRids = resourceIds
+            val currentAuth = authResult
+            val currentRegion = homeRegion ?: "uk-london-1"
+
+            if (currentRids != null && currentAuth != null) {
+                emit(Phase.DONE, Status.RUNNING, "Cleaning up partial resources...")
+                try {
+                    provisioner?.destroy(currentRids, currentAuth, currentRegion)
+                    emit(Phase.DONE, Status.SUCCESS, "Cleanup complete.")
+                } catch (e: Exception) {
+                    emit(Phase.DONE, Status.WARNING, "Cleanup partial: ${e.message}")
+                }
+            }
             _state.value = ProvisioningState.Idle
             _events.value = emptyList()
             _currentPhase.value = null
             _publicIp.value = null
+            resourceIds = null
+            persistState()
         }
     }
 
-    fun cleanup() {
-        viewModelScope.launch {
-            emit(Phase.DONE, Status.RUNNING, "Cleaning up partial resources...")
-            delay(1500)
-            emit(Phase.DONE, Status.WARNING, "Cleanup attempted. Some resources may remain.")
-            _state.value = ProvisioningState.Idle
-            _events.value = emptyList()
-            _currentPhase.value = null
-            _publicIp.value = null
+    private suspend fun runProvisioning(context: Context) {
+        try {
+            provisioner = OciProvisioner(context, "uk-london-1", _isDevMode.value)
+
+            // Collect events from provisioner
+            val prov = provisioner!!
+            val eventJob = viewModelScope.launch {
+                prov.events.collect { event ->
+                    _events.value = _events.value + event
+                    if (event.phase != Phase.DONE) {
+                        _currentPhase.value = event.phase
+                    }
+                }
+            }
+
+            // Phase 1: Auth
+            _currentPhase.value = Phase.AUTH
+            authResult = prov.authenticate()
+
+            // Phase 2: Preflight
+            _currentPhase.value = Phase.API_KEY
+            preflightResult = prov.preflight(authResult!!)
+
+            if (!preflightResult!!.success) {
+                eventJob.cancel()
+                _state.value = ProvisioningState.Failure(
+                    failedPhase = Phase.API_KEY,
+                    lastSuccessPhase = Phase.AUTH,
+                    errorMessage = preflightResult!!.error,
+                )
+                persistState()
+                return
+            }
+
+            // UK region warning
+            if (preflightResult!!.isUkRegion && _isDevMode.value) {
+                eventJob.cancel()
+                homeRegion = preflightResult!!.homeRegion
+                _state.value = ProvisioningState.UkWarning(preflightResult!!.homeRegion)
+                persistState()
+                return
+            }
+
+            // Continue to provisioning
+            doProvision(context, prov)
+
+        } catch (e: Exception) {
+            val lastSuccess = when (_currentPhase.value) {
+                Phase.AUTH -> null
+                Phase.API_KEY -> Phase.AUTH
+                Phase.NETWORK -> Phase.API_KEY
+                Phase.VM_LAUNCH -> Phase.NETWORK
+                Phase.WAIT_SSH -> Phase.VM_LAUNCH
+                Phase.WIREGUARD -> Phase.WAIT_SSH
+                else -> null
+            }
+            _state.value = ProvisioningState.Failure(
+                failedPhase = _currentPhase.value ?: Phase.AUTH,
+                lastSuccessPhase = lastSuccess,
+                errorMessage = e.message,
+            )
+            persistState()
         }
     }
 
-    private suspend fun simulatePipeline() {
-        // Phase 1: Browser auth
-        _currentPhase.value = Phase.AUTH
-        emit(Phase.AUTH, Status.RUNNING, "Opening Oracle login...")
-        delay(2000)
-        emit(Phase.AUTH, Status.RUNNING, "Waiting for authentication...")
-        delay(3000)
-        emit(Phase.AUTH, Status.SUCCESS, "Authenticated")
-        delay(500)
+    private suspend fun continueProvisioningAfterWarning(context: Context) {
+        try {
+            val prov = provisioner ?: OciProvisioner(context, "uk-london-1", _isDevMode.value).also { provisioner = it }
+            val auth = authResult ?: return
 
-        // Phase 2: API key setup
-        _currentPhase.value = Phase.API_KEY
-        emit(Phase.API_KEY, Status.RUNNING, "Uploading API key...")
-        delay(1500)
-        emit(Phase.API_KEY, Status.RUNNING, "Waiting for propagation...")
-        delay(2000)
-        emit(Phase.API_KEY, Status.SUCCESS, "API key uploaded")
-        delay(500)
+            val eventJob = viewModelScope.launch {
+                prov.events.collect { event ->
+                    _events.value = _events.value + event
+                    if (event.phase != Phase.DONE) {
+                        _currentPhase.value = event.phase
+                    }
+                }
+            }
 
-        // Phase 3: Network creation
-        _currentPhase.value = Phase.NETWORK
-        emit(Phase.NETWORK, Status.RUNNING, "Creating VCN...")
-        delay(1500)
-        emit(Phase.NETWORK, Status.RUNNING, "Creating security list...")
-        delay(1000)
-        emit(Phase.NETWORK, Status.RUNNING, "Creating subnet...")
-        delay(1000)
-        emit(Phase.NETWORK, Status.RUNNING, "Creating internet gateway...")
-        delay(1000)
-        emit(Phase.NETWORK, Status.RUNNING, "Configuring route table...")
-        delay(800)
-        emit(Phase.NETWORK, Status.SUCCESS, "Network ready")
-        delay(500)
+            doProvision(context, prov)
+        } catch (e: Exception) {
+            _state.value = ProvisioningState.Failure(
+                failedPhase = _currentPhase.value ?: Phase.AUTH,
+                lastSuccessPhase = null,
+                errorMessage = e.message,
+            )
+            persistState()
+        }
+    }
 
-        // Phase 4: VM launch
-        _currentPhase.value = Phase.VM_LAUNCH
-        emit(Phase.VM_LAUNCH, Status.RUNNING, "Launching instance (VM.Standard.E2.1.Micro)...")
-        delay(3000)
-        emit(Phase.VM_LAUNCH, Status.RUNNING, "Waiting for instance to be running...")
-        delay(4000)
-        emit(Phase.VM_LAUNCH, Status.RUNNING, "Allocating public IP...")
-        delay(2000)
-        val simulatedIp = "141.147.106.118"
-        _publicIp.value = simulatedIp
-        emit(Phase.VM_LAUNCH, Status.SUCCESS, "Instance running, public IP: $simulatedIp")
-        delay(500)
+    private suspend fun doProvision(context: Context, prov: OciProvisioner) {
+        try {
+            val auth = authResult!!
+            val preflight = preflightResult!!
+            homeRegion = preflight.homeRegion
 
-        // Phase 5: SSH connection
-        _currentPhase.value = Phase.WAIT_SSH
-        emit(Phase.WAIT_SSH, Status.RUNNING, "Waiting for SSH (port 22)...")
-        delay(3000)
-        emit(Phase.WAIT_SSH, Status.RUNNING, "Attempting SSH connection...")
-        delay(2000)
-        emit(Phase.WAIT_SSH, Status.SUCCESS, "SSH connected")
-        delay(500)
+            val (rids, result) = prov.provision(auth, preflight)
+            resourceIds = rids
+            clientConfig = result.clientConfig
+            _publicIp.value = result.publicIp
+            _wireGuardPort.value = result.wireGuardPort
 
-        // Phase 6: WireGuard setup
-        _currentPhase.value = Phase.WIREGUARD
-        emit(Phase.WIREGUARD, Status.RUNNING, "Installing WireGuard...")
-        delay(2500)
-        emit(Phase.WIREGUARD, Status.RUNNING, "Generating server keys...")
-        delay(1500)
-        emit(Phase.WIREGUARD, Status.RUNNING, "Configuring WireGuard interface...")
-        delay(1000)
-        emit(Phase.WIREGUARD, Status.RUNNING, "Generating client config...")
-        delay(1000)
-        emit(Phase.WIREGUARD, Status.SUCCESS, "WireGuard configured")
-        delay(500)
-
-        // Phase 7: Done
-        _currentPhase.value = Phase.DONE
-        emit(Phase.DONE, Status.SUCCESS, "Exit created: $simulatedIp:${_wireGuardPort.value}")
-        _state.value = ProvisioningState.Success(simulatedIp, _wireGuardPort.value)
+            _currentPhase.value = Phase.DONE
+            _state.value = ProvisioningState.Success(
+                publicIp = result.publicIp,
+                wireGuardPort = result.wireGuardPort,
+                region = homeRegion ?: "uk-london-1",
+                isDevMode = _isDevMode.value,
+            )
+            persistState()
+        } catch (e: Exception) {
+            _state.value = ProvisioningState.Failure(
+                failedPhase = _currentPhase.value ?: Phase.AUTH,
+                lastSuccessPhase = null,
+                errorMessage = e.message,
+            )
+            persistState()
+        }
     }
 
     private fun emit(phase: Phase, status: Status, message: String) {
