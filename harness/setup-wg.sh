@@ -5,14 +5,14 @@ set -e
 SERVER_KEY=$(sudo cat /etc/wireguard/server.key)
 
 # Write wg0.conf
-sudo bash -c "cat > /etc/wireguard/wg0.conf << 'WGEOF'
+sudo bash -c "cat > /etc/wireguard/wg0.conf << EOF
 [Interface]
 PrivateKey = $SERVER_KEY
 Address = 10.66.66.1/24
 ListenPort = 51820
 PostUp = iptables -A FORWARD -i wg0 -j ACCEPT; iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
 PostDown = iptables -D FORWARD -i wg0 -j ACCEPT; iptables -t nat -D POSTROUTING -o eth0 -j MASQUERADE
-WGEOF"
+EOF"
 sudo chmod 600 /etc/wireguard/wg0.conf
 
 # Enable IP forwarding
