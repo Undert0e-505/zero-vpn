@@ -1,4 +1,4 @@
-package com.zerovpn.app.oci
+﻿package com.zerovpn.app.oci
 
 import android.content.Context
 import android.net.Uri
@@ -27,9 +27,9 @@ import java.util.UUID
 import java.util.concurrent.TimeUnit
 
 /**
- * Real OCI provisioner — ports the Python state_machine.py to Kotlin.
+ * Real OCI provisioner â€” ports the Python state_machine.py to Kotlin.
  *
- * Flow: browser auth → preflight → API key upload → network → VM → SSH/WireGuard → done
+ * Flow: browser auth â†’ preflight â†’ API key upload â†’ network â†’ VM â†’ SSH/WireGuard â†’ done
  *
  * All secrets (private keys, tokens, client configs) are kept in memory only.
  * No secrets are written to disk, SharedPreferences, or logs.
@@ -50,20 +50,20 @@ class OciProvisioner(
 
     private val jsonMedia = "application/json".toMediaType()
 
-    // Region→realm mapping
+    // Regionâ†’realm mapping
     private val realms = mapOf(
-        "uk-london-1" to "oc1",
-        "uk-cardiff-1" to "oc1",
-        "us-ashburn-1" to "oc1",
-        "us-phoenix-1" to "oc1",
-        "eu-frankfurt-1" to "oc1",
-        "eu-amsterdam-1" to "oc1",
-        "ap-tokyo-1" to "oc1",
-        "ap-sydney-1" to "oc1",
-        "ap-mumbai-1" to "oc1",
-        "ap-seoul-1" to "oc1",
-        "ca-toronto-1" to "oc1",
-        "sa-saopaulo-1" to "oc1",
+        "uk-london-1" to "oraclecloud.com",
+        "uk-cardiff-1" to "oraclecloud.com",
+        "us-ashburn-1" to "oraclecloud.com",
+        "us-phoenix-1" to "oraclecloud.com",
+        "eu-frankfurt-1" to "oraclecloud.com",
+        "eu-amsterdam-1" to "oraclecloud.com",
+        "ap-tokyo-1" to "oraclecloud.com",
+        "ap-sydney-1" to "oraclecloud.com",
+        "ap-mumbai-1" to "oraclecloud.com",
+        "ap-seoul-1" to "oraclecloud.com",
+        "ca-toronto-1" to "oraclecloud.com",
+        "sa-saopaulo-1" to "oraclecloud.com",
         "me-jeddah-1" to "oc1",
         "me-dubai-1" to "oc1",
         "il-jerusalem-1" to "oc1",
@@ -123,7 +123,7 @@ class OciProvisioner(
         emit(Phase.AUTH, Status.RUNNING, "Building OAuth URL...")
         val jwk = OciRequestSigner.publicKeyToJwk(publicKey)
         val jwkB64 = OciRequestSigner.base64UrlEncode(jwk)
-        val realm = realms[region] ?: "oc1"
+        val realm = realms[region] ?: "oraclecloud.com"
         val redirectUri = "http://localhost:8181"
         val authorizeUrl = OciRequestSigner.buildAuthorizeUrl(
             region = region,
@@ -219,10 +219,7 @@ class OciProvisioner(
         val path = "/20160918/tenancies/${auth.tenancyOcid}/regionSubscriptions"
         val url = "https://$idHost$path"
 
-        val request = Request.Builder()
-            .url(url)
-            .header("date", currentDateRfc1123())
-            .header("Authorization", OciRequestSigner.buildAuthHeader(
+        val (authHeader, dateStr, _) = OciRequestSigner.buildAuthHeader(
                 tenancyOcid = auth.tenancyOcid,
                 userOcid = auth.userOcid,
                 fingerprint = auth.fingerprint,
@@ -230,19 +227,58 @@ class OciProvisioner(
                 method = "GET",
                 path = path,
                 host = idHost,
-                useSecurityToken = true,
-            ))
+                useSecurityToken = true, securityToken = auth.securityToken, )
+        val request = Request.Builder()
+            .url(url)
+            .header("date", dateStr)
+            .header("Authorization", authHeader)
             .get()
             .build()
 
-        val response = httpClient.newCall(request).execute()
-        if (!response.isSuccessful) {
-            emit(Phase.API_KEY, Status.ERROR, "Preflight failed: ${response.code}")
-            return PreflightResult(false, region, false, "Region list failed: ${response.code}")
+        // Log the request details for debugging (redact token, truncate)
+        val authHdrDebug = request.header("Authorization") ?: ""
+        // Show just the structure, not the full token
+        val authPreview = authHdrDebug.take(80) + "...[REDACTED]..." + authHdrDebug.takeLast(30)
+        emit(Phase.API_KEY, Status.RUNNING, "GET regionSubscriptions")
+        emit(Phase.API_KEY, Status.RUNNING, "Auth: $authPreview")
+        emit(Phase.API_KEY, Status.RUNNING, "About to execute HTTP request...")
+
+        // Read body inside IO block to avoid NetworkOnMainThreadException
+        data class HttpResp(val code: Int, val body: String, val isSuccessful: Boolean)
+        val httpResp = try {
+            kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                try {
+                    val resp = httpClient.newCall(request).execute()
+                    val body = resp.body?.string() ?: ""
+                    emit(Phase.API_KEY, Status.RUNNING, "HTTP response received: ${resp.code}")
+                    HttpResp(resp.code, body, resp.isSuccessful)
+                } catch (e: Exception) {
+                    emit(Phase.API_KEY, Status.ERROR, "HTTP failed: ${e.javaClass.simpleName}: ${e.message}")
+                    emit(Phase.API_KEY, Status.ERROR, "Cause: ${e.cause?.javaClass?.simpleName}: ${e.cause?.message}")
+                    null
+                }
+            }
+        } catch (e: Exception) {
+            emit(Phase.API_KEY, Status.ERROR, "Coroutine failed: ${e.javaClass.simpleName}: ${e.message}")
+            return PreflightResult(false, region, false, "Request failed: ${e.javaClass.simpleName}")
+        }
+        if (httpResp == null) {
+            emit(Phase.API_KEY, Status.ERROR, "No response from server")
+            return PreflightResult(false, region, false, "Request failed")
+        }
+        if (!httpResp.isSuccessful) {
+            emit(Phase.API_KEY, Status.ERROR, "HTTP ${httpResp.code}")
+            emit(Phase.API_KEY, Status.ERROR, "Response: ${httpResp.body.take(300)}")
+            return PreflightResult(false, region, false, "Region list failed: ${httpResp.code}")
         }
 
-        val body = response.body?.string() ?: "[]"
-        val subscriptions = JSONArray(body)
+        val subscriptions = try {
+            JSONArray(if (httpResp.body.isBlank()) "[]" else httpResp.body)
+        } catch (e: Exception) {
+            emit(Phase.API_KEY, Status.ERROR, "Parse failed: ${e.message}")
+            emit(Phase.API_KEY, Status.ERROR, "Body: ${httpResp.body.take(300)}")
+            return PreflightResult(false, region, false, "Response parse failed")
+        }
         var homeRegion = region
         for (i in 0 until subscriptions.length()) {
             val sub = subscriptions.getJSONObject(i)
@@ -270,10 +306,7 @@ class OciProvisioner(
         // Check API key count (max 3)
         val keyPath = "/20160918/users/${auth.userOcid}/apiKeys"
         val keyUrl = "https://$idHost$keyPath"
-        val keyReq = Request.Builder()
-            .url(keyUrl)
-            .header("date", currentDateRfc1123())
-            .header("Authorization", OciRequestSigner.buildAuthHeader(
+        val (keyAuthHeader, keyDateStr, _) = OciRequestSigner.buildAuthHeader(
                 tenancyOcid = auth.tenancyOcid,
                 userOcid = auth.userOcid,
                 fingerprint = auth.fingerprint,
@@ -281,25 +314,34 @@ class OciProvisioner(
                 method = "GET",
                 path = keyPath,
                 host = idHost,
-                useSecurityToken = true,
-            ))
+                useSecurityToken = true, securityToken = auth.securityToken, )
+        val keyReq = Request.Builder()
+            .url(keyUrl)
+            .header("date", keyDateStr)
+            .header("Authorization", keyAuthHeader)
             .get()
             .build()
 
         try {
-            val keyResp = httpClient.newCall(keyReq).execute()
-            if (keyResp.isSuccessful) {
-                val keyBody = keyResp.body?.string() ?: "[]"
-                val keys = JSONArray(keyBody)
+            val keyResult = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                val resp = httpClient.newCall(keyReq).execute()
+                val body = resp.body?.string() ?: "[]"
+                Triple(resp.code, body, resp.isSuccessful)
+            }
+            if (keyResult.third) {
+                val keys = JSONArray(keyResult.second)
+                emit(Phase.API_KEY, Status.RUNNING, "API keys on account: ${keys.length()}/3")
                 if (keys.length() >= 3) {
                     val error = "API key limit reached (${keys.length()}/3). " +
                         "Delete an existing API key in the Oracle console."
                     emit(Phase.API_KEY, Status.ERROR, error)
                     return PreflightResult(false, homeRegion, isUk, error)
                 }
+            } else {
+                emit(Phase.API_KEY, Status.WARNING, "API key check: HTTP ${keyResult.first}")
             }
         } catch (e: Exception) {
-            emit(Phase.API_KEY, Status.WARNING, "API key check skipped")
+            emit(Phase.API_KEY, Status.WARNING, "API key check failed: ${e.javaClass.simpleName}: ${e.message}")
         }
 
         emit(Phase.API_KEY, Status.SUCCESS, "Preflight passed")
@@ -318,11 +360,16 @@ class OciProvisioner(
         val pubPem = OciRequestSigner.publicKeyToPem(publicKey)
         val jsonBody = JSONObject().put("key", pubPem).toString()
 
-        val request = Request.Builder()
-            .url(url)
-            .header("date", currentDateRfc1123())
-            .header("Content-Type", "application/json")
-            .header("Authorization", OciRequestSigner.buildAuthHeader(
+        // Compute body headers — must match what OkHttp actually sends
+        val bodyBytes = jsonBody.toByteArray(Charsets.UTF_8)
+        val contentSha256 = java.util.Base64.getEncoder().encodeToString(
+            java.security.MessageDigest.getInstance("SHA-256").digest(bodyBytes)
+        )
+        // Don't set content-length manually — OkHttp computes it from the request body
+        // The signing string must use the same value OkHttp will send
+        val contentLength = bodyBytes.size.toString()
+
+        val (authHeader, dateStr, signingStr) = OciRequestSigner.buildAuthHeader(
                 tenancyOcid = auth.tenancyOcid,
                 userOcid = auth.userOcid,
                 fingerprint = auth.fingerprint,
@@ -330,16 +377,34 @@ class OciProvisioner(
                 method = "POST",
                 path = path,
                 host = idHost,
-                useSecurityToken = true,
-            ))
+                useSecurityToken = true, securityToken = auth.securityToken,
+                body = jsonBody, )
+
+        // DEBUG: Show signing string and auth header on screen
+        emit(Phase.API_KEY, Status.RUNNING, "POST signing string:")
+        signingStr.split("\n").forEachIndexed { i, line ->
+            emit(Phase.API_KEY, Status.RUNNING, " [$i] $line")
+        }
+        emit(Phase.API_KEY, Status.RUNNING, "Auth header: ${authHeader.take(120)}...")
+
+        val request = Request.Builder()
+            .url(url)
+            .header("date", dateStr)
+            .header("Content-Type", "application/json")
+            .header("x-content-sha256", contentSha256)
+            .header("Authorization", authHeader)
             .post(jsonBody.toRequestBody(jsonMedia))
             .build()
 
-        val response = httpClient.newCall(request).execute()
-        // 409 = already exists, that's fine
-        if (!response.isSuccessful && response.code != 409) {
-            val respBody = response.body?.string() ?: ""
-            throw Exception("API key upload failed: ${response.code} $respBody")
+        data class HttpResp(val code: Int, val body: String, val isSuccessful: Boolean)
+        val httpResp = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            val resp = httpClient.newCall(request).execute()
+            val body = resp.body?.string() ?: ""
+            HttpResp(resp.code, body, resp.isSuccessful)
+        }
+        emit(Phase.API_KEY, Status.RUNNING, "Upload response: HTTP ${httpResp.code}")
+        if (!httpResp.isSuccessful && httpResp.code != 409) {
+            throw Exception("API key upload failed: ${httpResp.code} ${httpResp.body.take(200)}")
         }
 
         emit(Phase.API_KEY, Status.RUNNING, "Waiting for propagation...")
@@ -364,7 +429,7 @@ class OciProvisioner(
             .toString()
         val vcnResp = ociPost(auth, iaasHost, "/20160918/vcns", vcnBody)
         rids.vcnId = vcnResp.getString("id")
-        kotlinx.coroutines.delay(2000)
+        waitForState(auth, iaasHost, "/20160918/vcns/${rids.vcnId}", "AVAILABLE")
 
         // Create security list
         emit(Phase.NETWORK, Status.RUNNING, "Creating security list...")
@@ -416,7 +481,7 @@ class OciProvisioner(
             .toString()
         val subnetResp = ociPost(auth, iaasHost, "/20160918/subnets", subnetBody)
         rids.subnetId = subnetResp.getString("id")
-        kotlinx.coroutines.delay(2000)
+        waitForState(auth, iaasHost, "/20160918/subnets/${rids.subnetId}", "AVAILABLE")
 
         // Create IGW
         emit(Phase.NETWORK, Status.RUNNING, "Creating internet gateway...")
@@ -428,7 +493,7 @@ class OciProvisioner(
             .toString()
         val igwResp = ociPost(auth, iaasHost, "/20160918/internetGateways", igwBody)
         rids.igwId = igwResp.getString("id")
-        kotlinx.coroutines.delay(2000)
+        waitForState(auth, iaasHost, "/20160918/internetGateways/${rids.igwId}", "AVAILABLE")
 
         // Update route table
         emit(Phase.NETWORK, Status.RUNNING, "Configuring route table...")
@@ -654,7 +719,12 @@ class OciProvisioner(
         val homeRegion = preflight.homeRegion
 
         // Upload API key
-        uploadApiKey(auth, homeRegion)
+        try {
+            uploadApiKey(auth, homeRegion)
+        } catch (e: Exception) {
+            emit(Phase.API_KEY, Status.ERROR, "Upload failed: ${e.javaClass.simpleName}: ${e.message}")
+            throw e
+        }
 
         // Generate SSH keypair for VM access
         val sshKeyPair = generateEd25519KeyPair()
@@ -720,7 +790,7 @@ class OciProvisioner(
             emit(Phase.DONE, Status.RUNNING, "Deleting subnet...")
             try {
                 ociDelete(auth, iaasHost, "/20160918/subnets/${rids.subnetId}")
-                kotlinx.coroutines.delay(3000)
+                waitForState(auth, iaasHost, "/20160918/subnets/${rids.subnetId}", "TERMINATED", maxAttempts = 15)
             } catch (e: Exception) { }
         }
 
@@ -742,12 +812,13 @@ class OciProvisioner(
 
     // --- OCI HTTP helpers ---
 
-    private fun ociPost(auth: AuthResult, host: String, path: String, body: String): JSONObject {
-        val req = Request.Builder()
-            .url("https://$host$path")
-            .header("date", currentDateRfc1123())
-            .header("Content-Type", "application/json")
-            .header("Authorization", OciRequestSigner.buildAuthHeader(
+    private suspend fun ociPost(auth: AuthResult, host: String, path: String, body: String): JSONObject {
+        return kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            val bodyBytes = body.toByteArray(Charsets.UTF_8)
+            val contentSha256 = java.util.Base64.getEncoder().encodeToString(
+                java.security.MessageDigest.getInstance("SHA-256").digest(bodyBytes)
+            )
+            val (authHeader, dateStr, _) = OciRequestSigner.buildAuthHeader(
                 tenancyOcid = auth.tenancyOcid,
                 userOcid = auth.userOcid,
                 fingerprint = auth.fingerprint,
@@ -755,86 +826,120 @@ class OciProvisioner(
                 method = "POST",
                 path = path,
                 host = host,
-                useSecurityToken = true,
-            ))
+                useSecurityToken = true, securityToken = auth.securityToken,
+                body = body, )
+            val req = Request.Builder()
+            .url("https://$host$path")
+            .header("date", dateStr)
+            .header("Content-Type", "application/json")
+            .header("x-content-sha256", contentSha256)
+            .header("Authorization", authHeader)
             .post(body.toRequestBody(jsonMedia))
             .build()
-        val resp = httpClient.newCall(req).execute()
-        val respBody = resp.body?.string() ?: ""
-        if (!resp.isSuccessful) {
-            throw Exception("POST $path failed: ${resp.code} $respBody")
-        }
-        return JSONObject(respBody)
-    }
-
-    private fun ociGet(auth: AuthResult, host: String, path: String): JSONObject {
-        val req = Request.Builder()
-            .url("https://$host$path")
-            .header("date", currentDateRfc1123())
-            .header("Authorization", OciRequestSigner.buildAuthHeader(
-                tenancyOcid = auth.tenancyOcid,
-                userOcid = auth.userOcid,
-                fingerprint = auth.fingerprint,
-                privateKey = auth.privateKey,
-                method = "GET",
-                path = path,
-                host = host,
-                useSecurityToken = true,
-            ))
-            .get()
-            .build()
-        val resp = httpClient.newCall(req).execute()
-        val respBody = resp.body?.string() ?: ""
-        if (!resp.isSuccessful) {
-            throw Exception("GET $path failed: ${resp.code} $respBody")
-        }
-        return JSONObject(respBody)
-    }
-
-    private fun ociPut(auth: AuthResult, host: String, path: String, body: String) {
-        val req = Request.Builder()
-            .url("https://$host$path")
-            .header("date", currentDateRfc1123())
-            .header("Content-Type", "application/json")
-            .header("Authorization", OciRequestSigner.buildAuthHeader(
-                tenancyOcid = auth.tenancyOcid,
-                userOcid = auth.userOcid,
-                fingerprint = auth.fingerprint,
-                privateKey = auth.privateKey,
-                method = "PUT",
-                path = path,
-                host = host,
-                useSecurityToken = true,
-            ))
-            .put(body.toRequestBody(jsonMedia))
-            .build()
-        val resp = httpClient.newCall(req).execute()
-        if (!resp.isSuccessful) {
+            val resp = httpClient.newCall(req).execute()
             val respBody = resp.body?.string() ?: ""
-            throw Exception("PUT $path failed: ${resp.code} $respBody")
+            if (!resp.isSuccessful) {
+                throw Exception("POST $path failed: ${resp.code} $respBody")
+            }
+            JSONObject(respBody)
         }
     }
 
-    private fun ociDelete(auth: AuthResult, host: String, path: String) {
-        val req = Request.Builder()
-            .url("https://$host$path")
-            .header("date", currentDateRfc1123())
-            .header("Authorization", OciRequestSigner.buildAuthHeader(
-                tenancyOcid = auth.tenancyOcid,
-                userOcid = auth.userOcid,
-                fingerprint = auth.fingerprint,
-                privateKey = auth.privateKey,
-                method = "DELETE",
-                path = path,
-                host = host,
-                useSecurityToken = true,
-            ))
-            .delete()
-            .build()
-        val resp = httpClient.newCall(req).execute()
-        // 404 = already gone, that's fine
-        if (!resp.isSuccessful && resp.code != 404) {
-            // Non-fatal during destroy
+    private suspend fun ociGet(auth: AuthResult, host: String, path: String): JSONObject {
+        return kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            val (authHeader, dateStr, _) = OciRequestSigner.buildAuthHeader(
+                    tenancyOcid = auth.tenancyOcid,
+                    userOcid = auth.userOcid,
+                    fingerprint = auth.fingerprint,
+                    privateKey = auth.privateKey,
+                    method = "GET",
+                    path = path,
+                    host = host,
+                    useSecurityToken = true, securityToken = auth.securityToken, )
+            val req = Request.Builder()
+                .url("https://$host$path")
+                .header("date", dateStr)
+                .header("Authorization", authHeader)
+                .get()
+                .build()
+            val resp = httpClient.newCall(req).execute()
+            val respBody = resp.body?.string() ?: ""
+            if (!resp.isSuccessful) {
+                throw Exception("GET $path failed: ${resp.code} $respBody")
+            }
+            JSONObject(respBody)
+        }
+    }
+
+    private suspend fun ociPut(auth: AuthResult, host: String, path: String, body: String) {
+        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            val bodyBytes = body.toByteArray(Charsets.UTF_8)
+            val contentSha256 = java.util.Base64.getEncoder().encodeToString(
+                java.security.MessageDigest.getInstance("SHA-256").digest(bodyBytes)
+            )
+            val (authHeader, dateStr, _) = OciRequestSigner.buildAuthHeader(
+                    tenancyOcid = auth.tenancyOcid,
+                    userOcid = auth.userOcid,
+                    fingerprint = auth.fingerprint,
+                    privateKey = auth.privateKey,
+                    method = "PUT",
+                    path = path,
+                    host = host,
+                    useSecurityToken = true, securityToken = auth.securityToken,
+                    body = body, )
+            val req = Request.Builder()
+                .url("https://$host$path")
+                .header("date", dateStr)
+                .header("Content-Type", "application/json")
+                .header("x-content-sha256", contentSha256)
+                .header("Authorization", authHeader)
+                .put(body.toRequestBody(jsonMedia))
+                .build()
+            val resp = httpClient.newCall(req).execute()
+            if (!resp.isSuccessful) {
+                val respBody = resp.body?.string() ?: ""
+                throw Exception("PUT $path failed: ${resp.code} $respBody")
+            }
+        }
+    }
+
+    private suspend fun ociDelete(auth: AuthResult, host: String, path: String) {
+        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            val (authHeader, dateStr, _) = OciRequestSigner.buildAuthHeader(
+                    tenancyOcid = auth.tenancyOcid,
+                    userOcid = auth.userOcid,
+                    fingerprint = auth.fingerprint,
+                    privateKey = auth.privateKey,
+                    method = "DELETE",
+                    path = path,
+                    host = host,
+                    useSecurityToken = true, securityToken = auth.securityToken, )
+            val req = Request.Builder()
+                .url("https://$host$path")
+                .header("date", dateStr)
+                .header("Authorization", authHeader)
+                .delete()
+                .build()
+            val resp = httpClient.newCall(req).execute()
+            if (!resp.isSuccessful && resp.code != 404) {
+                // Non-fatal during destroy
+            }
+        }
+    }
+
+    // --- Wait for resource state ---
+
+    private suspend fun waitForState(auth: AuthResult, host: String, path: String, targetState: String, maxAttempts: Int = 30) {
+        for (i in 1..maxAttempts) {
+            kotlinx.coroutines.delay(2000)
+            try {
+                val resp = ociGet(auth, host, path)
+                val state = resp.optString("lifecycleState", "")
+                if (state == targetState) return
+                if (state in listOf("TERMINATED", "FAILED", "FAULTY")) return
+            } catch (e: Exception) {
+                // Resource may not be queryable yet
+            }
         }
     }
 
@@ -949,3 +1054,10 @@ sudo wg show
 """.trimIndent()
     }
 }
+
+
+
+
+
+
+

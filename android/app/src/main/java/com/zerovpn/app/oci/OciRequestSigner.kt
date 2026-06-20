@@ -1,4 +1,4 @@
-package com.zerovpn.app.oci
+﻿package com.zerovpn.app.oci
 
 import java.security.KeyPair
 import java.security.KeyPairGenerator
@@ -18,7 +18,7 @@ import org.json.JSONObject
  * with the user's private key. The signature is sent in the
  * `Authorization` header as `Signature ...`.
  *
- * This is a minimal implementation — no OCI SDK dependency needed.
+ * This is a minimal implementation â€” no OCI SDK dependency needed.
  *
  * Reference: https://docs.oracle.com/en-us/iaas/Content/API/Concepts/signingrequests.htm
  */
@@ -121,24 +121,56 @@ object OciRequestSigner {
         host: String,
         headers: Map<String, String> = emptyMap(),
         useSecurityToken: Boolean = true,
-    ): String {
+        securityToken: String? = null,
+        body: String? = null,
+    ): Triple<String, String, String> {
+        // Returns (authHeader, dateUsed) so caller can set the same date on the request
         val date = headers["date"] ?: java.time.format.DateTimeFormatter.RFC_1123_DATE_TIME
             .format(java.time.ZonedDateTime.now(java.time.ZoneOffset.UTC))
 
-        val signingHeaders = listOf(
-            "date" to date,
-            "(request-target)" to "$method $path",
-            "host" to host,
-        )
+        // For POST/PUT/PATCH, OCI requires body headers to be signed too
+        val isBodyRequest = method.lowercase() in listOf("post", "put", "patch")
+        val contentType = "application/json"
+        val bodyBytes = body?.toByteArray(Charsets.UTF_8) ?: ByteArray(0)
+        val contentLength = bodyBytes.size.toString()
+        val contentSha256 = if (isBodyRequest) {
+            java.util.Base64.getEncoder().encodeToString(
+                java.security.MessageDigest.getInstance("SHA-256").digest(bodyBytes)
+            )
+        } else ""
+
+        val signingHeaders = if (isBodyRequest) {
+            listOf(
+                "date" to date,
+                "(request-target)" to "${method.lowercase()} $path",
+                "host" to host,
+                "content-length" to contentLength,
+                "content-type" to contentType,
+                "x-content-sha256" to contentSha256,
+            )
+        } else {
+            listOf(
+                "date" to date,
+                "(request-target)" to "${method.lowercase()} $path",
+                "host" to host,
+            )
+        }
 
         val signingString = signingHeaders.joinToString("\n") { (k, v) -> "$k: $v" }
         val signature = sign(privateKey, signingString)
-        val headerNames = signingHeaders.joinToString(",") { it.first }
+        val headerNames = signingHeaders.joinToString(" ") { it.first }
 
-        val keyIdPrefix = if (useSecurityToken) "ST-" else ""
-        val keyId = "$keyIdPrefix$tenancyOcid/$userOcid/$fingerprint"
+        // For security token auth: keyId = ST{token} (entire token embedded)
+        // For API key auth: keyId = {tenancy}/{user}/{fingerprint}
+        val keyId = if (useSecurityToken && securityToken != null) {
+            "ST$" + securityToken
+        } else {
+            "$tenancyOcid/$userOcid/$fingerprint"
+        }
 
-        return """Signature version="1",keyId="$keyId",algorithm="rsa-sha256",headers="$headerNames",signature="$signature""""
+        // OCI expects this exact format order: algorithm, headers, keyId, signature, version
+        val authHeader = """Signature algorithm="rsa-sha256",headers="$headerNames",keyId="$keyId",signature="$signature",version="1""""
+        return Triple(authHeader, date, signingString)
     }
 
     /**
@@ -172,7 +204,7 @@ object OciRequestSigner {
     }
 
     /**
-     * Decode a JWT and extract claims (without verification — for
+     * Decode a JWT and extract claims (without verification â€” for
      * extracting user/tenancy OCIDs from the security token).
      * Uses org.json.JSONObject for proper JSON parsing.
      */
@@ -228,36 +260,37 @@ object OciRequestSigner {
      * Map region to realm domain.
      */
     private val regionRealms = mapOf(
-        "uk-london-1" to "oc1",
-        "uk-cardiff-1" to "oc1",
-        "us-ashburn-1" to "oc1",
-        "us-phoenix-1" to "oc1",
-        "ca-toronto-1" to "oc1",
-        "eu-frankfurt-1" to "oc1",
-        "eu-amsterdam-1" to "oc1",
-        "eu-zurich-1" to "oc1",
-        "eu-madrid-1" to "oc1",
-        "eu-milan-1" to "oc1",
-        "eu-stockholm-1" to "oc1",
-        "eu-paris-1" to "oc1",
-        "ap-tokyo-1" to "oc1",
-        "ap-sydney-1" to "oc1",
-        "ap-mumbai-1" to "oc1",
-        "ap-seoul-1" to "oc1",
-        "ap-osaka-1" to "oc1",
-        "ap-chuncheon-1" to "oc1",
-        "ap-hyderabad-1" to "oc1",
-        "ap-melbourne-1" to "oc1",
-        "sa-saopaulo-1" to "oc1",
-        "sa-vinhedo-1" to "oc1",
-        "me-jeddah-1" to "oc1",
-        "me-dubai-1" to "oc1",
-        "il-jerusalem-1" to "oc1",
-        "mx-queretaro-1" to "oc1",
-        "af-johannesburg-1" to "oc1",
+        "uk-london-1" to "oraclecloud.com",
+        "uk-cardiff-1" to "oraclecloud.com",
+        "us-ashburn-1" to "oraclecloud.com",
+        "us-phoenix-1" to "oraclecloud.com",
+        "ca-toronto-1" to "oraclecloud.com",
+        "eu-frankfurt-1" to "oraclecloud.com",
+        "eu-amsterdam-1" to "oraclecloud.com",
+        "eu-zurich-1" to "oraclecloud.com",
+        "eu-madrid-1" to "oraclecloud.com",
+        "eu-milan-1" to "oraclecloud.com",
+        "eu-stockholm-1" to "oraclecloud.com",
+        "eu-paris-1" to "oraclecloud.com",
+        "ap-tokyo-1" to "oraclecloud.com",
+        "ap-sydney-1" to "oraclecloud.com",
+        "ap-mumbai-1" to "oraclecloud.com",
+        "ap-seoul-1" to "oraclecloud.com",
+        "ap-osaka-1" to "oraclecloud.com",
+        "ap-chuncheon-1" to "oraclecloud.com",
+        "ap-hyderabad-1" to "oraclecloud.com",
+        "ap-melbourne-1" to "oraclecloud.com",
+        "sa-saopaulo-1" to "oraclecloud.com",
+        "sa-vinhedo-1" to "oraclecloud.com",
+        "me-jeddah-1" to "oraclecloud.com",
+        "me-dubai-1" to "oraclecloud.com",
+        "il-jerusalem-1" to "oraclecloud.com",
+        "mx-queretaro-1" to "oraclecloud.com",
+        "af-johannesburg-1" to "oraclecloud.com",
     )
 
     fun getRealmForRegion(region: String): String {
-        return regionRealms[region] ?: "oc1"
+        return regionRealms[region] ?: "oraclecloud.com"
     }
 }
+
