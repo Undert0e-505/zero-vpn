@@ -48,6 +48,17 @@ android {
         compose = true
         buildConfig = true
     }
+
+    packaging {
+        resources {
+            excludes += "/META-INF/{AL2.0,LGPL2.1,DEPENDENCIES,LICENSE,LICENSE.txt,NOTICE,NOTICE.txt,*.kotlin_module,/*.properties}"
+            excludes += "/META-INF/INDEX.LIST"
+            excludes += "/META-INF/io.netty.versions.properties"
+            excludes += "/META-INF/versions/**"
+            excludes += "/META-INF/maven/**"
+            excludes += "/THIRD_PARTY_LICENSES.txt"
+        }
+    }
 }
 
 dependencies {
