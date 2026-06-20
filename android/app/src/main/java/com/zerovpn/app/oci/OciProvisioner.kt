@@ -15,6 +15,7 @@ import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import okio.Buffer
 import org.json.JSONArray
 import org.json.JSONObject
 import com.zerovpn.app.ui.provisioning.Phase
@@ -46,6 +47,59 @@ class OciProvisioner(
         .connectTimeout(30, TimeUnit.SECONDS)
         .readTimeout(60, TimeUnit.SECONDS)
         .writeTimeout(30, TimeUnit.SECONDS)
+        .addNetworkInterceptor { chain ->
+            val request = chain.request()
+            val response = chain.proceed(request)
+            // WIRE TAP: log exact request headers + body for POST requests
+            if (request.method == "POST" || request.method == "PUT") {
+                try {
+                    val reqHeaders = request.headers
+                    val headerDump = StringBuilder()
+                    headerDump.append("[WIRE TAP] ${request.method} ${request.url}\n")
+                    headerDump.append("[WIRE TAP] Request headers (${reqHeaders.size} keys):\n")
+                    for (name in reqHeaders.names()) {
+                        val value = reqHeaders.get(name) ?: ""
+                        val display = if (name.lowercase() == "authorization") value.take(150) + "...[REDACTED]" else value
+                        headerDump.append("[WIRE TAP]   $name: $display\n")
+                    }
+                    // Try to read body
+                    val bodyCopy = request.body
+                    if (bodyCopy != null) {
+                        val buffer = Buffer()
+                        bodyCopy.writeTo(buffer)
+                        val bodyStr = buffer.readUtf8()
+                        val bodyBytes = bodyStr.toByteArray(Charsets.UTF_8)
+                        val sha256 = java.security.MessageDigest.getInstance("SHA-256").digest(bodyBytes)
+                        val sha256b64 = java.util.Base64.getEncoder().encodeToString(sha256)
+                        headerDump.append("[WIRE TAP] Request body: ${bodyBytes.size} bytes, SHA256=$sha256b64\n")
+                        headerDump.append("[WIRE TAP] Body preview: ${bodyStr.take(200)}\n")
+                    }
+                    headerDump.append("[WIRE TAP] Response: ${response.code}\n")
+                    headerDump.append("[WIRE TAP] ---")
+                    // Emit each line as a provisioning event
+                    headerDump.toString().split("\n").forEach { line ->
+                        kotlinx.coroutines.runBlocking {
+                            _events.emit(ProvisioningEvent(
+                                timestamp = System.currentTimeMillis(),
+                                phase = Phase.API_KEY,
+                                status = Status.RUNNING,
+                                message = line,
+                            ))
+                        }
+                    }
+                } catch (e: Exception) {
+                    kotlinx.coroutines.runBlocking {
+                        _events.emit(ProvisioningEvent(
+                            timestamp = System.currentTimeMillis(),
+                            phase = Phase.API_KEY,
+                            status = Status.RUNNING,
+                            message = "[WIRE TAP] Error: ${e.message}",
+                        ))
+                    }
+                }
+            }
+            response
+        }
         .build()
 
     private val jsonMedia = "application/json".toMediaType()
@@ -215,7 +269,7 @@ class OciProvisioner(
         emit(Phase.API_KEY, Status.RUNNING, "Checking home region...")
 
         // List region subscriptions to find home region
-        val idHost = "identity.$region.oraclecloud.com"
+        val idHost = "identity.$region.oci.oraclecloud.com"
         val path = "/20160918/tenancies/${auth.tenancyOcid}/regionSubscriptions"
         val url = "https://$idHost$path"
 
@@ -352,7 +406,7 @@ class OciProvisioner(
 
     private suspend fun uploadApiKey(auth: AuthResult, homeRegion: String) {
         emit(Phase.API_KEY, Status.RUNNING, "Uploading API key...")
-        val idHost = "identity.$homeRegion.oraclecloud.com"
+        val idHost = "identity.$homeRegion.oci.oraclecloud.com"
         val path = "/20160918/users/${auth.userOcid}/apiKeys"
         val url = "https://$idHost$path"
 
@@ -393,7 +447,7 @@ class OciProvisioner(
             .header("Content-Type", "application/json")
             .header("x-content-sha256", contentSha256)
             .header("Authorization", authHeader)
-            .post(jsonBody.toRequestBody(jsonMedia))
+            .post(bodyBytes.toRequestBody(jsonMedia))
             .build()
 
         data class HttpResp(val code: Int, val body: String, val isSuccessful: Boolean)
@@ -465,11 +519,8 @@ class OciProvisioner(
         val slResp = ociPost(auth, iaasHost, "/20160918/securityLists", slBody)
         rids.slId = slResp.getString("id")
 
-        // Create subnet
+        // Create subnet (use VCN default DHCP options — no need to fetch them)
         emit(Phase.NETWORK, Status.RUNNING, "Creating subnet...")
-        val dhcpPath = "/20160918/dhcpOptions?compartmentId=$cid&vcnId=${rids.vcnId}"
-        val dhcpResp = ociGet(auth, iaasHost, dhcpPath)
-        val dhcpId = dhcpResp.getJSONArray("items").getJSONObject(0).getString("id")
 
         val subnetBody = JSONObject()
             .put("cidrBlock", "10.0.0.0/24")
@@ -477,7 +528,6 @@ class OciProvisioner(
             .put("displayName", "zerovpn-subnet")
             .put("vcnId", rids.vcnId)
             .put("securityListIds", JSONArray().put(rids.slId))
-            .put("dhcpOptionsId", dhcpId)
             .toString()
         val subnetResp = ociPost(auth, iaasHost, "/20160918/subnets", subnetBody)
         rids.subnetId = subnetResp.getString("id")
@@ -517,33 +567,33 @@ class OciProvisioner(
     private suspend fun launchVm(auth: AuthResult, homeRegion: String, rids: ResourceIds,
                                   sshPublicKey: String): String {
         val cid = auth.tenancyOcid
-        val idHost = "identity.$homeRegion.oraclecloud.com"
+        val idHost = "identity.$homeRegion.oci.oraclecloud.com"
         val iaasHost = "iaas.$homeRegion.oraclecloud.com"
 
-        // Get availability domain
+        // Get availability domain (returns a JSON array, not an object with "items")
         emit(Phase.VM_LAUNCH, Status.RUNNING, "Finding availability domain...")
-        val adResp = ociGet(auth, idHost, "/20160918/availabilityDomains?compartmentId=$cid")
-        val adName = adResp.getJSONArray("items").getJSONObject(0).getString("name")
+        val adResp = ociGetArray(auth, idHost, "/20160918/availabilityDomains?compartmentId=$cid")
+        val adName = adResp.getJSONObject(0).getString("name")
 
         // Find Ubuntu image
         emit(Phase.VM_LAUNCH, Status.RUNNING, "Finding Ubuntu 22.04 image...")
         val imgPath = "/20160918/images?compartmentId=${URLEncoder.encode(cid, "UTF-8")}" +
             "&operatingSystem=Canonical+Ubuntu&operatingSystemVersion=22.04" +
             "&shape=VM.Standard.E2.1.Micro&sortBy=TIMECREATED&sortOrder=DESC"
-        val imgResp = ociGet(auth, iaasHost, imgPath)
+        val imgResp = ociGetArray(auth, iaasHost, imgPath)
         var imageId: String
-        if (imgResp.getJSONArray("items").length() > 0) {
-            imageId = imgResp.getJSONArray("items").getJSONObject(0).getString("id")
+        if (imgResp.length() > 0) {
+            imageId = imgResp.getJSONObject(0).getString("id")
         } else {
             emit(Phase.VM_LAUNCH, Status.RUNNING, "Trying Ubuntu 24.04...")
             val imgPath24 = "/20160918/images?compartmentId=${URLEncoder.encode(cid, "UTF-8")}" +
                 "&operatingSystem=Canonical+Ubuntu&operatingSystemVersion=24.04" +
                 "&shape=VM.Standard.E2.1.Micro&sortBy=TIMECREATED&sortOrder=DESC"
-            val imgResp24 = ociGet(auth, iaasHost, imgPath24)
-            if (imgResp24.getJSONArray("items").length() == 0) {
+            val imgResp24 = ociGetArray(auth, iaasHost, imgPath24)
+            if (imgResp24.length() == 0) {
                 throw Exception("No Ubuntu image found for VM.Standard.E2.1.Micro")
             }
-            imageId = imgResp24.getJSONArray("items").getJSONObject(0).getString("id")
+            imageId = imgResp24.getJSONObject(0).getString("id")
         }
 
         // Launch instance
@@ -591,10 +641,9 @@ class OciProvisioner(
         for (i in 1..10) {
             val vnicPath = "/20160918/vnicAttachments?compartmentId=${URLEncoder.encode(cid, "UTF-8")}" +
                 "&instanceId=$instanceId"
-            val vnicResp = ociGet(auth, iaasHost, vnicPath)
-            val items = vnicResp.getJSONArray("items")
-            if (items.length() > 0) {
-                val vnicId = items.getJSONObject(0).getString("vnicId")
+            val vnicResp = ociGetArray(auth, iaasHost, vnicPath)
+            if (vnicResp.length() > 0) {
+                val vnicId = vnicResp.getJSONObject(0).getString("vnicId")
                 val vnicGet = ociGet(auth, iaasHost, "/20160918/vnics/$vnicId")
                 publicIp = vnicGet.optString("publicIp", null)
                 if (publicIp != null) break
@@ -619,7 +668,7 @@ class OciProvisioner(
     ): ProvisionResult {
         val port = 51820
 
-        // Phase 5: Wait for SSH
+        // Phase 5: Wait for SSH (OCI reports RUNNING before cloud-init/sshd are ready)
         emit(Phase.WAIT_SSH, Status.RUNNING, "Waiting for SSH...")
         val jsch = JSch()
         val keyTempFile = java.io.File(context.cacheDir, "ssh_key_${System.currentTimeMillis()}")
@@ -628,28 +677,43 @@ class OciProvisioner(
         jsch.addIdentity(keyTempFile.absolutePath)
 
         var session: Session? = null
-        for (i in 1..12) {
+        val sshTimeoutMs = 10 * 60 * 1000L
+        val sshStart = System.currentTimeMillis()
+        var sshAttempt = 0
+        var sshLastError: Exception? = null
+        while (System.currentTimeMillis() - sshStart < sshTimeoutMs) {
+            sshAttempt++
             try {
-                session = jsch.getSession("ubuntu", publicIp, 22)
-                session.setConfig("StrictHostKeyChecking", "no")
-                session.setConfig("UserKnownHostsFile", "/dev/null")
-                session.timeout = 30000
-                session.connect(30000)
+                emit(Phase.WAIT_SSH, Status.RUNNING, "SSH attempt $sshAttempt to ubuntu@$publicIp...")
+                kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                    session = jsch.getSession("ubuntu", publicIp, 22)
+                    session.setConfig("StrictHostKeyChecking", "no")
+                    session.setConfig("UserKnownHostsFile", "/dev/null")
+                    session.setConfig("PreferredAuthentications", "publickey")
+                    session.timeout = 15000
+                    session.connect(15000)
+                }
                 break
             } catch (e: Exception) {
+                sshLastError = e
                 session?.disconnect()
+                session = null
+                emit(Phase.WAIT_SSH, Status.RUNNING, "SSH not ready: ${e.javaClass.simpleName}: ${e.message}")
                 kotlinx.coroutines.delay(10_000)
             }
         }
         if (session == null || !session.isConnected) {
-            throw Exception("SSH connection failed")
+            keyTempFile.delete()
+            throw Exception("SSH did not become ready after ${sshTimeoutMs / 1000}s. Last error: ${sshLastError?.javaClass?.simpleName}: ${sshLastError?.message}")
         }
         emit(Phase.WAIT_SSH, Status.SUCCESS, "SSH connected")
 
         // Phase 6: WireGuard
         emit(Phase.WIREGUARD, Status.RUNNING, "Installing WireGuard...")
-        val installResult = sshExec(session,
-            "sudo apt-get update -y; sudo apt-get install -y wireguard wireguard-tools; which wg || exit 1")
+        val installResult = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            sshExec(session,
+                "sudo apt-get update -y; sudo apt-get install -y wireguard wireguard-tools; which wg || exit 1")
+        }
         if (installResult.first != 0) {
             session.disconnect()
             keyTempFile.delete()
@@ -659,7 +723,9 @@ class OciProvisioner(
         emit(Phase.WIREGUARD, Status.RUNNING, "Generating server keys...")
         val keygenCmd = "sudo sh -c \"umask 077; wg genkey > /etc/wireguard/server.key; " +
             "wg pubkey < /etc/wireguard/server.key > /etc/wireguard/server.pub\""
-        val keygenResult = sshExec(session, keygenCmd)
+        val keygenResult = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            sshExec(session, keygenCmd)
+        }
         if (keygenResult.first != 0) {
             session.disconnect()
             keyTempFile.delete()
@@ -669,7 +735,9 @@ class OciProvisioner(
         emit(Phase.WIREGUARD, Status.RUNNING, "Configuring WireGuard...")
         // Write setup script to VM via cat heredoc
         val writeCmd = "cat > /tmp/setup-wg.sh << 'ENDOFSCRIPT'\n" + SETUP_WG_SCRIPT + "\nENDOFSCRIPT"
-        val writeResult = sshExec(session, writeCmd)
+        val writeResult = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            sshExec(session, writeCmd)
+        }
         if (writeResult.first != 0) {
             session.disconnect()
             keyTempFile.delete()
@@ -677,8 +745,12 @@ class OciProvisioner(
         }
 
         // Fix line endings and run
-        sshExec(session, "sed -i 's/\\r\$//' /tmp/setup-wg.sh")
-        val runResult = sshExec(session, "bash /tmp/setup-wg.sh")
+        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            sshExec(session, "sed -i 's/\\r\$//' /tmp/setup-wg.sh")
+        }
+        val runResult = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            sshExec(session, "bash /tmp/setup-wg.sh")
+        }
         if (runResult.first != 0) {
             session.disconnect()
             keyTempFile.delete()
@@ -727,7 +799,13 @@ class OciProvisioner(
         }
 
         // Generate SSH keypair for VM access
-        val sshKeyPair = generateEd25519KeyPair()
+        emit(Phase.NETWORK, Status.RUNNING, "Generating VM SSH keypair...")
+        val sshKeyPair = try {
+            generateSshKeyPair()
+        } catch (e: Exception) {
+            emit(Phase.NETWORK, Status.ERROR, "SSH key generation failed: ${e.javaClass.simpleName}: ${e.message}")
+            throw e
+        }
         val sshPublicKey = sshKeyPair.first
         val sshPrivateKey = sshKeyPair.second
 
@@ -834,7 +912,7 @@ class OciProvisioner(
             .header("Content-Type", "application/json")
             .header("x-content-sha256", contentSha256)
             .header("Authorization", authHeader)
-            .post(body.toRequestBody(jsonMedia))
+            .post(body.toByteArray(Charsets.UTF_8).toRequestBody(jsonMedia))
             .build()
             val resp = httpClient.newCall(req).execute()
             val respBody = resp.body?.string() ?: ""
@@ -842,6 +920,32 @@ class OciProvisioner(
                 throw Exception("POST $path failed: ${resp.code} $respBody")
             }
             JSONObject(respBody)
+        }
+    }
+
+    private suspend fun ociGetArray(auth: AuthResult, host: String, path: String): JSONArray {
+        return kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            val (authHeader, dateStr, _) = OciRequestSigner.buildAuthHeader(
+                    tenancyOcid = auth.tenancyOcid,
+                    userOcid = auth.userOcid,
+                    fingerprint = auth.fingerprint,
+                    privateKey = auth.privateKey,
+                    method = "GET",
+                    path = path,
+                    host = host,
+                    useSecurityToken = true, securityToken = auth.securityToken, )
+            val req = Request.Builder()
+                .url("https://$host$path")
+                .header("date", dateStr)
+                .header("Authorization", authHeader)
+                .get()
+                .build()
+            val resp = httpClient.newCall(req).execute()
+            val respBody = resp.body?.string() ?: ""
+            if (!resp.isSuccessful) {
+                throw Exception("GET $path failed: ${resp.code} $respBody")
+            }
+            JSONArray(respBody)
         }
     }
 
@@ -893,7 +997,7 @@ class OciProvisioner(
                 .header("Content-Type", "application/json")
                 .header("x-content-sha256", contentSha256)
                 .header("Authorization", authHeader)
-                .put(body.toRequestBody(jsonMedia))
+                .put(body.toByteArray(Charsets.UTF_8).toRequestBody(jsonMedia))
                 .build()
             val resp = httpClient.newCall(req).execute()
             if (!resp.isSuccessful) {
@@ -983,9 +1087,9 @@ class OciProvisioner(
 
     // --- Ed25519 SSH key generation ---
 
-    private fun generateEd25519KeyPair(): Pair<String, String> {
+    private fun generateSshKeyPair(): Pair<String, String> {
         val jsch = JSch()
-        val kp = com.jcraft.jsch.KeyPair.genKeyPair(jsch, com.jcraft.jsch.KeyPair.ED25519)
+        val kp = com.jcraft.jsch.KeyPair.genKeyPair(jsch, com.jcraft.jsch.KeyPair.RSA)
         val baos = java.io.ByteArrayOutputStream()
         kp.writePrivateKey(baos)
         val privateKey = baos.toString()
