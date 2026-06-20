@@ -51,6 +51,18 @@ class ProvisioningViewModel : ViewModel() {
         if (stateStr != null) {
             _isDevMode.value = prefs.getBoolean("is_dev_mode", true)
             homeRegion = prefs.getString("home_region", null)
+            val savedIp = prefs.getString("public_ip", null)
+            val savedPort = prefs.getInt("wireguard_port", 51820)
+            if (savedIp != null && stateStr == "Success") {
+                _publicIp.value = savedIp
+                _wireGuardPort.value = savedPort
+                _state.value = ProvisioningState.Success(
+                    publicIp = savedIp,
+                    wireGuardPort = savedPort,
+                    region = homeRegion ?: "uk-london-1",
+                    isDevMode = _isDevMode.value,
+                )
+            }
             // Don't restore Running state — if we were mid-provision, user needs to retry
         }
     }
@@ -112,12 +124,22 @@ class ProvisioningViewModel : ViewModel() {
     }
 
     fun destroyNode(context: Context) {
-        val currentRids = resourceIds ?: return
-        val currentAuth = authResult ?: return
-        val currentRegion = homeRegion ?: "uk-london-1"
-
         _state.value = ProvisioningState.Destroying
         viewModelScope.launch {
+            val currentRids = resourceIds
+            val currentAuth = authResult
+            val currentRegion = homeRegion ?: "uk-london-1"
+
+            if (currentRids == null || currentAuth == null) {
+                // Session was lost (app restart). Need to re-authenticate to destroy.
+                _state.value = ProvisioningState.Failure(
+                    failedPhase = Phase.DONE,
+                    lastSuccessPhase = null,
+                    errorMessage = "Authentication session lost. Re-provision to destroy the existing node, or delete resources manually in the Oracle Console.",
+                )
+                return@launch
+            }
+
             provisioner?.let { prov ->
                 emit(Phase.DONE, Status.RUNNING, "Destroying node resources...")
                 try {
@@ -132,6 +154,10 @@ class ProvisioningViewModel : ViewModel() {
             _currentPhase.value = null
             _publicIp.value = null
             resourceIds = null
+            // Clear persisted state
+            if (::prefs.isInitialized) {
+                prefs.edit().clear().apply()
+            }
             persistState()
         }
     }
