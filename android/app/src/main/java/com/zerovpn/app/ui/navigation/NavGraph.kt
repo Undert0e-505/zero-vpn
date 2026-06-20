@@ -20,6 +20,11 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.unit.dp
@@ -132,7 +137,17 @@ fun NavGraph() {
                 DiagnosticsScreen()
             }
             composable(Screen.Settings.route) {
-                SettingsScreen()
+                // Dev mode is persisted in SharedPreferences (same key as ProvisioningViewModel uses)
+                val context = androidx.compose.ui.platform.LocalContext.current
+                val prefs = remember { context.getSharedPreferences("zerovpn_provisioning", android.content.Context.MODE_PRIVATE) }
+                var devMode by remember { mutableStateOf(prefs.getBoolean("is_dev_mode", true)) }
+                SettingsScreen(
+                    isDevMode = devMode,
+                    onDevModeChange = { newValue ->
+                        devMode = newValue
+                        prefs.edit().putBoolean("is_dev_mode", newValue).apply()
+                    },
+                )
             }
         }
     }

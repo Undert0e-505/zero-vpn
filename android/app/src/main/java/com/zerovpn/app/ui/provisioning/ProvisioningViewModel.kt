@@ -80,6 +80,10 @@ class ProvisioningViewModel : ViewModel() {
 
     fun startProvisioning(context: Context) {
         if (_state.value is ProvisioningState.Running) return
+        // Read the latest dev mode setting from SharedPreferences
+        if (::prefs.isInitialized) {
+            _isDevMode.value = prefs.getBoolean("is_dev_mode", true)
+        }
         _events.value = emptyList()
         _state.value = ProvisioningState.Running
         viewModelScope.launch {
@@ -88,6 +92,9 @@ class ProvisioningViewModel : ViewModel() {
     }
 
     fun retry(context: Context) {
+        if (::prefs.isInitialized) {
+            _isDevMode.value = prefs.getBoolean("is_dev_mode", true)
+        }
         _events.value = emptyList()
         _currentPhase.value = null
         _publicIp.value = null
