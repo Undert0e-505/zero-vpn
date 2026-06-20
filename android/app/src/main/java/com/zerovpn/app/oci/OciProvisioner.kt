@@ -1,4 +1,4 @@
-﻿package com.zerovpn.app.oci
+package com.zerovpn.app.oci
 
 import android.content.Context
 import android.net.Uri
@@ -28,9 +28,9 @@ import java.util.UUID
 import java.util.concurrent.TimeUnit
 
 /**
- * Real OCI provisioner â€” ports the Python state_machine.py to Kotlin.
+ * Real OCI provisioner — ports the Python state_machine.py to Kotlin.
  *
- * Flow: browser auth â†’ preflight â†’ API key upload â†’ network â†’ VM â†’ SSH/WireGuard â†’ done
+ * Flow: browser auth → preflight → API key upload → network → VM → SSH/WireGuard → done
  *
  * All secrets (private keys, tokens, client configs) are kept in memory only.
  * No secrets are written to disk, SharedPreferences, or logs.
@@ -106,7 +106,7 @@ class OciProvisioner(
 
     private val jsonMedia = "application/json".toMediaType()
 
-    // Regionâ†’realm mapping
+    // Region→realm mapping
     private val realms = mapOf(
         "uk-london-1" to "oraclecloud.com",
         "uk-cardiff-1" to "oraclecloud.com",
@@ -291,7 +291,7 @@ class OciProvisioner(
             .get()
             .build()
 
-        // Log the request details for debugging (redact token, truncate) — dev mode only
+        // Log the request details for debugging (redact token, truncate) � dev mode only
         if (isDevMode) {
             val authHdrDebug = request.header("Authorization") ?: ""
             // Show just the structure, not the full token
@@ -420,12 +420,12 @@ class OciProvisioner(
         val pubPem = OciRequestSigner.publicKeyToPem(publicKey)
         val jsonBody = JSONObject().put("key", pubPem).toString()
 
-        // Compute body headers — must match what OkHttp actually sends
+        // Compute body headers � must match what OkHttp actually sends
         val bodyBytes = jsonBody.toByteArray(Charsets.UTF_8)
         val contentSha256 = java.util.Base64.getEncoder().encodeToString(
             java.security.MessageDigest.getInstance("SHA-256").digest(bodyBytes)
         )
-        // Don't set content-length manually — OkHttp computes it from the request body
+        // Don't set content-length manually � OkHttp computes it from the request body
         // The signing string must use the same value OkHttp will send
         val contentLength = bodyBytes.size.toString()
 
@@ -527,7 +527,7 @@ class OciProvisioner(
         val slResp = ociPost(auth, iaasHost, "/20160918/securityLists", slBody)
         rids.slId = slResp.getString("id")
 
-        // Create subnet (use VCN default DHCP options — no need to fetch them)
+        // Create subnet (use VCN default DHCP options � no need to fetch them)
         emit(Phase.NETWORK, Status.RUNNING, "Creating subnet...")
 
         val subnetBody = JSONObject()
@@ -837,6 +837,7 @@ class OciProvisioner(
     suspend fun destroy(rids: ResourceIds, auth: AuthResult, homeRegion: String): Boolean {
         val cid = auth.tenancyOcid
         val iaasHost = "iaas.$homeRegion.oraclecloud.com"
+        val idHost = "identity.$homeRegion.oci.oraclecloud.com"
 
         // Terminate instance
         if (rids.instanceId != null) {
@@ -891,6 +892,20 @@ class OciProvisioner(
             emit(Phase.DONE, Status.RUNNING, "Deleting VCN...")
             try { ociDelete(auth, iaasHost, "/20160918/vcns/${rids.vcnId}") } catch (e: Exception) { }
         }
+
+        // Delete API key
+        emit(Phase.DONE, Status.RUNNING, "Deleting API key...")
+        try {
+            val keyPath = "/20160918/users/${auth.userOcid}/apiKeys"
+            val keysResp = ociGetArray(auth, idHost, keyPath)
+            for (i in 0 until keysResp.length()) {
+                val key = keysResp.getJSONObject(i)
+                if (key.optString("fingerprint") == auth.fingerprint) {
+                    ociDelete(auth, idHost, "$keyPath/${key.getString("id")}")
+                    break
+                }
+            }
+        } catch (e: Exception) { }
 
         emit(Phase.DONE, Status.SUCCESS, "Resources destroyed")
         return true
