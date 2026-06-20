@@ -40,6 +40,8 @@ class OciProvisioner(
     private val region: String,
     private val isDevMode: Boolean = true,
 ) {
+    // When isDevMode is false, wire tap and signing string debug output are suppressed.
+    // Only user-facing progress messages are emitted.
     private val _events = MutableSharedFlow<ProvisioningEvent>(replay = 64, extraBufferCapacity = 64)
     val events: SharedFlow<ProvisioningEvent> = _events.asSharedFlow()
 
@@ -50,8 +52,8 @@ class OciProvisioner(
         .addNetworkInterceptor { chain ->
             val request = chain.request()
             val response = chain.proceed(request)
-            // WIRE TAP: log exact request headers + body for POST requests
-            if (request.method == "POST" || request.method == "PUT") {
+            // WIRE TAP: log exact request headers + body for POST requests (dev mode only)
+            if (isDevMode && (request.method == "POST" || request.method == "PUT")) {
                 try {
                     val reqHeaders = request.headers
                     val headerDump = StringBuilder()
@@ -289,13 +291,17 @@ class OciProvisioner(
             .get()
             .build()
 
-        // Log the request details for debugging (redact token, truncate)
-        val authHdrDebug = request.header("Authorization") ?: ""
-        // Show just the structure, not the full token
-        val authPreview = authHdrDebug.take(80) + "...[REDACTED]..." + authHdrDebug.takeLast(30)
-        emit(Phase.API_KEY, Status.RUNNING, "GET regionSubscriptions")
-        emit(Phase.API_KEY, Status.RUNNING, "Auth: $authPreview")
-        emit(Phase.API_KEY, Status.RUNNING, "About to execute HTTP request...")
+        // Log the request details for debugging (redact token, truncate) — dev mode only
+        if (isDevMode) {
+            val authHdrDebug = request.header("Authorization") ?: ""
+            // Show just the structure, not the full token
+            val authPreview = authHdrDebug.take(80) + "...[REDACTED]..." + authHdrDebug.takeLast(30)
+            emit(Phase.API_KEY, Status.RUNNING, "GET regionSubscriptions")
+            emit(Phase.API_KEY, Status.RUNNING, "Auth: $authPreview")
+            emit(Phase.API_KEY, Status.RUNNING, "About to execute HTTP request...")
+        } else {
+            emit(Phase.API_KEY, Status.RUNNING, "Checking home region...")
+        }
 
         // Read body inside IO block to avoid NetworkOnMainThreadException
         data class HttpResp(val code: Int, val body: String, val isSuccessful: Boolean)
@@ -304,7 +310,7 @@ class OciProvisioner(
                 try {
                     val resp = httpClient.newCall(request).execute()
                     val body = resp.body?.string() ?: ""
-                    emit(Phase.API_KEY, Status.RUNNING, "HTTP response received: ${resp.code}")
+                    if (isDevMode) emit(Phase.API_KEY, Status.RUNNING, "HTTP response received: ${resp.code}")
                     HttpResp(resp.code, body, resp.isSuccessful)
                 } catch (e: Exception) {
                     emit(Phase.API_KEY, Status.ERROR, "HTTP failed: ${e.javaClass.simpleName}: ${e.message}")
@@ -434,12 +440,14 @@ class OciProvisioner(
                 useSecurityToken = true, securityToken = auth.securityToken,
                 body = jsonBody, )
 
-        // DEBUG: Show signing string and auth header on screen
-        emit(Phase.API_KEY, Status.RUNNING, "POST signing string:")
-        signingStr.split("\n").forEachIndexed { i, line ->
-            emit(Phase.API_KEY, Status.RUNNING, " [$i] $line")
+        // DEBUG: Show signing string and auth header on screen (dev mode only)
+        if (isDevMode) {
+            emit(Phase.API_KEY, Status.RUNNING, "POST signing string:")
+            signingStr.split("\n").forEachIndexed { i, line ->
+                emit(Phase.API_KEY, Status.RUNNING, " [$i] $line")
+            }
+            emit(Phase.API_KEY, Status.RUNNING, "Auth header: ${authHeader.take(120)}...")
         }
-        emit(Phase.API_KEY, Status.RUNNING, "Auth header: ${authHeader.take(120)}...")
 
         val request = Request.Builder()
             .url(url)
