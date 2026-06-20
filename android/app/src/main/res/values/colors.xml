@@ -7,4 +7,5 @@
     <color name="accent_color">#4FC3F7</color>
     <color name="border_color">#2A2A2A</color>
     <color name="danger_color">#EF5350</color>
+    <color name="ic_launcher_background">#040B16</color>
 </resources>
