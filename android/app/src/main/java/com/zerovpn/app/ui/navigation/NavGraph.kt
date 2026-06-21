@@ -18,17 +18,18 @@ import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.remember
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
+import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.navigation.NavDestination.Companion.hierarchy
 import androidx.navigation.NavGraph.Companion.findStartDestination
 import androidx.navigation.compose.NavHost
@@ -67,9 +68,32 @@ fun NavGraph() {
     val vpnViewModel: VpnViewModel = viewModel()
     val scope = androidx.compose.runtime.rememberCoroutineScope()
     val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
+    val configuredExits by provisioningViewModel.configuredExits.collectAsState()
+    val selectedExitId by provisioningViewModel.selectedExitId.collectAsState()
 
     val navBackStackEntry by navController.currentBackStackEntryAsState()
     val currentDestination = navBackStackEntry?.destination
+
+    LaunchedEffect(Unit) {
+        provisioningViewModel.initPrefs(context)
+    }
+
+    LaunchedEffect(configuredExits, selectedExitId) {
+        vpnViewModel.reconcile(configuredExits, selectedExitId)
+    }
+
+    DisposableEffect(lifecycleOwner, configuredExits, selectedExitId) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                vpnViewModel.reconcile(configuredExits, selectedExitId)
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+        }
+    }
     val navigateToTopLevel: (Screen) -> Unit = { screen ->
         if (screen == Screen.AddExit) {
             provisioningViewModel.prepareNewProvisioningFlow()
@@ -176,14 +200,11 @@ fun NavGraph() {
                 )
             }
             composable(Screen.Settings.route) {
-                // Dev mode is persisted in SharedPreferences (same key as ProvisioningViewModel uses)
-                val prefs = remember { context.getSharedPreferences("zerovpn_provisioning", android.content.Context.MODE_PRIVATE) }
-                var devMode by remember { mutableStateOf(prefs.getBoolean("is_dev_mode", true)) }
+                val devMode by provisioningViewModel.isDevMode.collectAsState()
                 SettingsScreen(
                     isDevMode = devMode,
                     onDevModeChange = { newValue ->
-                        devMode = newValue
-                        prefs.edit().putBoolean("is_dev_mode", newValue).apply()
+                        provisioningViewModel.setDevMode(newValue)
                     },
                 )
             }

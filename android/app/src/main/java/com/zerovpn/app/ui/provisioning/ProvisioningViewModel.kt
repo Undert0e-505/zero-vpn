@@ -75,9 +75,9 @@ class ProvisioningViewModel : ViewModel() {
 
     private fun loadPersistedState() {
         if (!::prefs.isInitialized) return
+        _isDevMode.value = prefs.getBoolean("is_dev_mode", true)
         val stateStr = prefs.getString("state", null)
         if (stateStr != null) {
-            _isDevMode.value = prefs.getBoolean("is_dev_mode", true)
             homeRegion = prefs.getString("home_region", null)
             apiKeyUserOcid = prefs.getString("api_key_user_ocid", null)
             apiKeyTenancyOcid = prefs.getString("api_key_tenancy_ocid", null)
@@ -226,6 +226,11 @@ class ProvisioningViewModel : ViewModel() {
 
     fun selectExit(exitId: String?) {
         _selectedExitId.value = exitId?.takeIf { id -> _configuredExits.value.any { it.id == id } }
+        persistState()
+    }
+
+    fun setDevMode(enabled: Boolean) {
+        _isDevMode.value = enabled
         persistState()
     }
 

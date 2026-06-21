@@ -5,6 +5,7 @@ sealed class VpnConnectionState {
     data class PermissionRequired(val exitId: String) : VpnConnectionState()
     data class Connecting(val exitId: String) : VpnConnectionState()
     data class Connected(val exitId: String) : VpnConnectionState()
+    data class ActiveUnknown(val tunnelName: String) : VpnConnectionState()
     data class Disconnecting(val exitId: String?) : VpnConnectionState()
     data class Failed(val message: String) : VpnConnectionState()
 }
