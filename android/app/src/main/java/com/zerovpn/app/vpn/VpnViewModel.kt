@@ -96,6 +96,13 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
     fun connect(exit: ConfiguredExit) {
         viewModelScope.launch {
             try {
+                val currentState = state.value
+                if (
+                    currentState is VpnConnectionState.Connected && currentState.exitId != exit.id ||
+                    currentState is VpnConnectionState.ActiveUnknown
+                ) {
+                    controller.disconnect()
+                }
                 controller.connect(exit)
                 refreshUserDiagnosticsInternal(force = true)
             } catch (e: Exception) {

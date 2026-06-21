@@ -6,13 +6,17 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.SnackbarHostState
@@ -33,10 +37,10 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.zerovpn.app.ui.components.StatusCard
-import com.zerovpn.app.ui.provisioning.ProvisioningState
 import com.zerovpn.app.ui.provisioning.ProvisioningViewModel
 import com.zerovpn.app.ui.theme.*
 import com.zerovpn.app.vpn.ConfiguredExit
+import com.zerovpn.app.vpn.ExitLifecycleState
 import com.zerovpn.app.vpn.VpnConnectionState
 import com.zerovpn.app.vpn.VpnViewModel
 import kotlinx.coroutines.launch
@@ -53,9 +57,7 @@ fun HomeScreen(
     val logTag = "ZeroVPN/Home"
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
-    val state by viewModel.state.collectAsState()
-    val publicIp by viewModel.publicIp.collectAsState()
-    val wireGuardPort by viewModel.wireGuardPort.collectAsState()
+    val scrollState = rememberScrollState()
     val exits by viewModel.configuredExits.collectAsState()
     val selectedExitId by viewModel.selectedExitId.collectAsState()
     val vpnState by vpnViewModel.state.collectAsState()
@@ -65,10 +67,10 @@ fun HomeScreen(
     viewModel.initPrefs(context)
 
     var showDestroyDialog by remember { mutableStateOf(false) }
+    var destroyTarget by remember { mutableStateOf<ConfiguredExit?>(null) }
     var pendingPermissionExit by remember { mutableStateOf<ConfiguredExit?>(null) }
 
-    val hasExit = state is ProvisioningState.Success
-    val successState = state as? ProvisioningState.Success
+    val hasExit = exits.isNotEmpty()
     val activeExitId = when (val currentState = vpnState) {
         is VpnConnectionState.Connected -> currentState.exitId
         is VpnConnectionState.ActiveUnknown -> vpnDiagnostics.activeExitId
@@ -78,7 +80,6 @@ fun HomeScreen(
         vpnState is VpnConnectionState.ActiveUnknown
     val selectedExit = exits.firstOrNull { it.id == selectedExitId }
         ?: exits.singleOrNull()
-    val selectedExitIsActive = selectedExit?.id == activeExitId
     val buttonBusy = vpnState is VpnConnectionState.Connecting ||
         vpnState is VpnConnectionState.Disconnecting ||
         vpnState is VpnConnectionState.PermissionRequired
@@ -110,10 +111,10 @@ fun HomeScreen(
     if (showDestroyDialog) {
         AlertDialog(
             onDismissRequest = { showDestroyDialog = false },
-            title = { Text("Destroy Exit Node?", color = TextPrimary) },
+            title = { Text("Destroy ${destroyTarget?.name ?: "Exit"}?", color = TextPrimary) },
             text = {
                 Text(
-                    "This will terminate the Oracle VM, delete the API key, and remove all network resources. This cannot be undone.",
+                    "This will terminate only this Oracle VM, delete its API key, and remove its network resources. Other exits are preserved.",
                     color = TextDim,
                     fontSize = 14.sp,
                 )
@@ -122,13 +123,14 @@ fun HomeScreen(
                 TextButton(onClick = {
                     showDestroyDialog = false
                     scope.launch {
-                        val destroyExitId = selectedExit?.id ?: exits.singleOrNull()?.id
+                        val destroyExitId = destroyTarget?.id
                         val disconnected = vpnViewModel.disconnectIfActive(destroyExitId)
                         if (!disconnected) {
                             snackbarHostState.showSnackbar("Disconnect failed. Node was not destroyed.")
                             return@launch
                         }
-                        viewModel.destroyNode(context)
+                        viewModel.destroyNode(context, destroyExitId)
+                        destroyTarget = null
                         onDestroyStarted()
                     }
                 }) {
@@ -147,6 +149,7 @@ fun HomeScreen(
         modifier = modifier
             .fillMaxSize()
             .background(Bg)
+            .verticalScroll(scrollState)
             .padding(horizontal = 16.dp)
             .padding(top = 4.dp, bottom = 40.dp),
     ) {
@@ -169,7 +172,7 @@ fun HomeScreen(
                 VpnConnectionState.Disconnected -> if (hasExit) "Ready" else "Disconnected"
             },
             modeLabel = if (hasExit) {
-                selectedExit?.let { "${it.name} - WireGuard" } ?: "Select an exit"
+                selectedExit?.let { "${it.name} - WireGuard" } ?: "Select an exit below"
             } else if (vpnState is VpnConnectionState.ActiveUnknown) {
                 "Active tunnel - exit metadata unavailable"
             } else {
@@ -248,87 +251,51 @@ fun HomeScreen(
             modifier = Modifier.padding(top = 12.dp, bottom = 6.dp),
         )
 
-        if (hasExit && successState != null) {
-            // Show the configured exit with destroy button
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .background(Surface, RoundedCornerShape(8.dp))
-                    .border(
-                        1.dp,
-                        if (selectedExitIsActive) Accent else Border,
-                        RoundedCornerShape(8.dp),
-                    )
-                    .padding(16.dp),
+        if (hasExit) {
+            exits.sortedBy { it.createdAt }.forEach { exit ->
+                ExitCard(
+                    exit = exit,
+                    selected = exit.id == selectedExit?.id,
+                    active = exit.id == activeExitId,
+                    busy = buttonBusy || exit.lifecycleState == ExitLifecycleState.DESTROYING,
+                    onSelect = { viewModel.selectExit(exit.id) },
+                    onConnect = {
+                        scope.launch {
+                            viewModel.selectExit(exit.id)
+                            connectExit(
+                                exit = exit,
+                                vpnViewModel = vpnViewModel,
+                                snackbarHostState = snackbarHostState,
+                                permissionLauncher = { permissionIntent ->
+                                    pendingPermissionExit = exit
+                                    vpnViewModel.markPermissionRequired(exit.id)
+                                    permissionLauncher.launch(permissionIntent)
+                                },
+                            )
+                        }
+                    },
+                    onDisconnect = { vpnViewModel.disconnect() },
+                    onDestroy = {
+                        destroyTarget = exit
+                        showDestroyDialog = true
+                    },
+                )
+                Spacer(modifier = Modifier.height(10.dp))
+            }
+
+            OutlinedButton(
+                onClick = onAddExit,
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(8.dp),
             ) {
-                if (exits.size > 1) {
-                    Text(
-                        text = "Select an exit",
-                        fontSize = 13.sp,
-                        fontWeight = FontWeight.SemiBold,
-                        color = TextPrimary,
-                    )
-                    Spacer(modifier = Modifier.height(8.dp))
-                    exits.forEach { exit ->
-                        ExitSelectorRow(
-                            exit = exit,
-                            selected = exit.id == selectedExit?.id,
-                            active = exit.id == activeExitId,
-                            onClick = { viewModel.selectExit(exit.id) },
-                        )
-                        Spacer(modifier = Modifier.height(8.dp))
-                    }
-                }
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Column(modifier = Modifier.weight(1f)) {
-                        Text(
-                            text = "Oracle Cloud Exit",
-                            fontSize = 16.sp,
-                            fontWeight = FontWeight.SemiBold,
-                            color = if (selectedExitIsActive) Accent else TextPrimary,
-                        )
-                        Spacer(modifier = Modifier.height(4.dp))
-                        Text(
-                            text = "$publicIp:${wireGuardPort}/udp",
-                            fontSize = 13.sp,
-                            color = TextDim,
-                        )
-                        Spacer(modifier = Modifier.height(2.dp))
-                        Text(
-                            text = when {
-                                selectedExitIsActive -> "${successState.region} - connected"
-                                selectedExit != null -> "${successState.region} - selected"
-                                else -> "${successState.region} - config unavailable"
-                            },
-                            fontSize = 12.sp,
-                            color = TextDim,
-                        )
-                    }
-                }
-                Spacer(modifier = Modifier.height(12.dp))
-                OutlinedButton(
-                    onClick = { showDestroyDialog = true },
-                    modifier = Modifier.fillMaxWidth(),
-                    shape = RoundedCornerShape(8.dp),
-                    border = androidx.compose.foundation.BorderStroke(1.dp, Danger.copy(alpha = 0.5f)),
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.Delete,
-                        contentDescription = null,
-                        tint = Danger,
-                        modifier = Modifier.size(16.dp),
-                    )
-                    Spacer(modifier = Modifier.width(8.dp))
-                    Text(
-                        text = "Destroy Node",
-                        fontSize = 14.sp,
-                        fontWeight = FontWeight.Medium,
-                        color = Danger,
-                    )
-                }
+                Icon(
+                    imageVector = Icons.Default.Add,
+                    contentDescription = null,
+                    tint = Accent,
+                    modifier = Modifier.size(16.dp),
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                Text("Add Exit", fontSize = 14.sp, fontWeight = FontWeight.Medium, color = Accent)
             }
         } else {
             // Empty exit list
@@ -375,19 +342,20 @@ fun HomeScreen(
 }
 
 @Composable
-private fun ExitSelectorRow(
+private fun ExitCard(
     exit: ConfiguredExit,
     selected: Boolean,
     active: Boolean,
-    onClick: () -> Unit,
+    busy: Boolean,
+    onSelect: () -> Unit,
+    onConnect: () -> Unit,
+    onDisconnect: () -> Unit,
+    onDestroy: () -> Unit,
 ) {
-    Row(
+    Column(
         modifier = Modifier
             .fillMaxWidth()
-            .background(
-                if (selected) Surface.copy(alpha = 0.7f) else Bg,
-                RoundedCornerShape(8.dp),
-            )
+            .background(Surface, RoundedCornerShape(8.dp))
             .border(
                 1.dp,
                 when {
@@ -397,33 +365,108 @@ private fun ExitSelectorRow(
                 },
                 RoundedCornerShape(8.dp),
             )
-            .clickable(onClick = onClick)
-            .padding(12.dp),
-        verticalAlignment = Alignment.CenterVertically,
+            .clickable(onClick = onSelect)
+            .padding(16.dp),
     ) {
-        Column(modifier = Modifier.weight(1f)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = exit.name,
+                    fontSize = 16.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = if (active) Accent else TextPrimary,
+                )
+                Spacer(modifier = Modifier.height(4.dp))
+                Text(
+                    text = "${exit.publicIp}:${exit.wireGuardPort}/udp",
+                    fontSize = 13.sp,
+                    color = TextDim,
+                )
+                Spacer(modifier = Modifier.height(2.dp))
+                Text(
+                    text = "${exit.region} - ${exitStatusText(exit, active, selected)}",
+                    fontSize = 12.sp,
+                    color = TextDim,
+                )
+                exit.lastError?.let {
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(text = it, fontSize = 12.sp, color = Danger)
+                }
+            }
             Text(
-                text = exit.name,
-                fontSize = 14.sp,
-                fontWeight = FontWeight.SemiBold,
-                color = if (active) Accent else TextPrimary,
-            )
-            Spacer(modifier = Modifier.height(2.dp))
-            Text(
-                text = "${exit.publicIp}:${exit.wireGuardPort}/udp",
+                text = if (active) "Connected" else if (selected) "Selected" else "",
                 fontSize = 12.sp,
-                color = TextDim,
+                fontWeight = FontWeight.Medium,
+                color = if (active) Accent else TextDim,
             )
         }
-        Text(
-            text = when {
-                active -> "Connected"
-                selected -> "Selected"
-                else -> "Available"
-            },
-            fontSize = 12.sp,
-            fontWeight = FontWeight.Medium,
-            color = if (active) Accent else TextDim,
-        )
+        Spacer(modifier = Modifier.height(12.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
+            Button(
+                onClick = if (active) onDisconnect else onConnect,
+                enabled = !busy && exit.lifecycleState == ExitLifecycleState.READY,
+                modifier = Modifier.weight(1f).height(44.dp),
+                shape = RoundedCornerShape(8.dp),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = if (active) Danger else Accent,
+                    contentColor = Bg,
+                    disabledContainerColor = Border,
+                    disabledContentColor = TextDim,
+                ),
+            ) {
+                Text(if (active) "Disconnect" else "Connect", fontSize = 13.sp, fontWeight = FontWeight.Bold)
+            }
+            OutlinedButton(
+                onClick = onDestroy,
+                enabled = !busy,
+                modifier = Modifier.weight(1f).height(44.dp),
+                shape = RoundedCornerShape(8.dp),
+                border = androidx.compose.foundation.BorderStroke(1.dp, Danger.copy(alpha = 0.5f)),
+            ) {
+                Icon(
+                    imageVector = Icons.Default.Delete,
+                    contentDescription = null,
+                    tint = Danger,
+                    modifier = Modifier.size(16.dp),
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                Text("Destroy", fontSize = 13.sp, fontWeight = FontWeight.Medium, color = Danger)
+            }
+        }
+    }
+}
+
+private fun exitStatusText(exit: ConfiguredExit, active: Boolean, selected: Boolean): String = when {
+    active -> "Connected"
+    exit.lifecycleState == ExitLifecycleState.PROVISIONING -> "Provisioning"
+    exit.lifecycleState == ExitLifecycleState.DESTROYING -> "Destroying"
+    exit.lifecycleState == ExitLifecycleState.FAILED -> "Failed"
+    selected -> "Ready, selected"
+    else -> "Ready"
+}
+
+private suspend fun connectExit(
+    exit: ConfiguredExit,
+    vpnViewModel: VpnViewModel,
+    snackbarHostState: SnackbarHostState,
+    permissionLauncher: (android.content.Intent) -> Unit,
+) {
+    if (exit.wireGuardConfig.isBlank()) {
+        val message = "WireGuard config is empty for ${exit.name}. Re-provision the exit to enable VPN connection."
+        vpnViewModel.fail(message)
+        snackbarHostState.showSnackbar(message)
+        return
+    }
+    val disconnected = vpnViewModel.disconnectIfActive(exit.id)
+    if (!disconnected) {
+        snackbarHostState.showSnackbar("Could not disconnect the current exit")
+        return
+    }
+    vpnViewModel.prepareDiagnostics(exit)
+    val permissionIntent = vpnViewModel.prepareVpn()
+    if (permissionIntent != null) {
+        permissionLauncher(permissionIntent)
+    } else {
+        vpnViewModel.connect(exit)
     }
 }
