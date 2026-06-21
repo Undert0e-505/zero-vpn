@@ -27,6 +27,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.navigation.NavDestination.Companion.hierarchy
 import androidx.navigation.NavGraph.Companion.findStartDestination
@@ -38,6 +39,8 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import com.zerovpn.app.ui.provisioning.ProvisioningViewModel
 import com.zerovpn.app.ui.screens.*
 import com.zerovpn.app.ui.theme.*
+import com.zerovpn.app.vpn.VpnViewModel
+import kotlinx.coroutines.launch
 
 sealed class Screen(val route: String, val label: String, val icon: ImageVector) {
     data object Home : Screen("home", "Home", Icons.Default.Home)
@@ -61,9 +64,24 @@ fun NavGraph() {
     val navController = rememberNavController()
     val snackbarHostState = remember { SnackbarHostState() }
     val provisioningViewModel: ProvisioningViewModel = viewModel()
+    val vpnViewModel: VpnViewModel = viewModel()
+    val scope = androidx.compose.runtime.rememberCoroutineScope()
+    val context = LocalContext.current
 
     val navBackStackEntry by navController.currentBackStackEntryAsState()
     val currentDestination = navBackStackEntry?.destination
+    val navigateToTopLevel: (Screen) -> Unit = { screen ->
+        if (screen == Screen.AddExit) {
+            provisioningViewModel.prepareNewProvisioningFlow()
+        }
+        navController.navigate(screen.route) {
+            popUpTo(navController.graph.findStartDestination().id) {
+                saveState = true
+            }
+            launchSingleTop = true
+            restoreState = true
+        }
+    }
 
     Scaffold(
         modifier = Modifier.background(Bg),
@@ -91,13 +109,7 @@ fun NavGraph() {
                         },
                         selected = selected,
                         onClick = {
-                            navController.navigate(screen.route) {
-                                popUpTo(navController.graph.findStartDestination().id) {
-                                    saveState = true
-                                }
-                                launchSingleTop = true
-                                restoreState = true
-                            }
+                            navigateToTopLevel(screen)
                         },
                         colors = NavigationBarItemDefaults.colors(
                             indicatorColor = Surface,
@@ -122,13 +134,18 @@ fun NavGraph() {
                 HomeScreen(
                     snackbarHostState = snackbarHostState,
                     viewModel = provisioningViewModel,
+                    vpnViewModel = vpnViewModel,
                     onDestroyStarted = { navController.navigate(Screen.OracleProvision.route) },
+                    onAddExit = { navigateToTopLevel(Screen.AddExit) },
                 )
             }
             composable(Screen.AddExit.route) {
                 AddExitScreen(
                     snackbarHostState = snackbarHostState,
-                    onNavigateToProvision = { navController.navigate(Screen.OracleProvision.route) },
+                    onNavigateToProvision = {
+                        provisioningViewModel.prepareNewProvisioningFlow()
+                        navController.navigate(Screen.OracleProvision.route)
+                    },
                 )
             }
             composable(Screen.OracleProvision.route) {
@@ -136,17 +153,30 @@ fun NavGraph() {
                     snackbarHostState = snackbarHostState,
                     onBack = { navController.popBackStack() },
                     viewModel = provisioningViewModel,
+                    onDestroy = {
+                        scope.launch {
+                            val exitId = provisioningViewModel.selectedExitId.value
+                            val disconnected = vpnViewModel.disconnectIfActive(exitId)
+                            if (!disconnected) {
+                                snackbarHostState.showSnackbar("Disconnect failed. Node was not destroyed.")
+                                return@launch
+                            }
+                            provisioningViewModel.destroyNode(context)
+                        }
+                    },
                 )
             }
             composable(Screen.NodeInvite.route) {
                 NodeInviteScreen()
             }
             composable(Screen.Diagnostics.route) {
-                DiagnosticsScreen()
+                DiagnosticsScreen(
+                    provisioningViewModel = provisioningViewModel,
+                    vpnViewModel = vpnViewModel,
+                )
             }
             composable(Screen.Settings.route) {
                 // Dev mode is persisted in SharedPreferences (same key as ProvisioningViewModel uses)
-                val context = androidx.compose.ui.platform.LocalContext.current
                 val prefs = remember { context.getSharedPreferences("zerovpn_provisioning", android.content.Context.MODE_PRIVATE) }
                 var devMode by remember { mutableStateOf(prefs.getBoolean("is_dev_mode", true)) }
                 SettingsScreen(

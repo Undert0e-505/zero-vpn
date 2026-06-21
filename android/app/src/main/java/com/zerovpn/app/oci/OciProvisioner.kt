@@ -7,6 +7,7 @@ import fi.iki.elonen.NanoHTTPD
 import com.jcraft.jsch.ChannelExec
 import com.jcraft.jsch.JSch
 import com.jcraft.jsch.Session
+import com.wireguard.crypto.KeyPair
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -145,6 +146,16 @@ class OciProvisioner(
         val publicIp: String,
         val wireGuardPort: Int,
         val clientConfig: String,
+        val clientPublicKey: String,
+        val serverPublicKey: String,
+        val serverPeerPublicKey: String,
+        val sshUsername: String,
+        val sshPrivateKey: String,
+    )
+
+    private data class WireGuardClientKeys(
+        val privateKey: String,
+        val publicKey: String,
     )
 
     data class ResourceIds(
@@ -681,6 +692,7 @@ class OciProvisioner(
         homeRegion: String,
         publicIp: String,
         sshPrivateKey: String,
+        clientKeys: WireGuardClientKeys,
     ): ProvisionResult {
         val port = 51820
 
@@ -765,7 +777,7 @@ class OciProvisioner(
             sshExec(session, "sed -i 's/\\r\$//' /tmp/setup-wg.sh")
         }
         val runResult = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-            sshExec(session, "bash /tmp/setup-wg.sh")
+            sshExec(session, "CLIENT_PUBLIC_KEY='${clientKeys.publicKey}' bash /tmp/setup-wg.sh")
         }
         if (runResult.first != 0) {
             session.disconnect()
@@ -774,31 +786,43 @@ class OciProvisioner(
         }
 
         val stdout = runResult.second
-        var peerKey: String? = null
         var serverPub: String? = null
+        var serverPeerPub: String? = null
         for (line in stdout.split("\n")) {
-            if (line.startsWith("PEER_PRIVATE_KEY=")) {
-                peerKey = line.substringAfter("=").trim()
-            } else if (line.startsWith("SERVER_PUBLIC_KEY=")) {
+            if (line.startsWith("SERVER_PUBLIC_KEY=")) {
                 serverPub = line.substringAfter("=").trim()
+            } else if (line.startsWith("SERVER_PEER_PUBLIC_KEY=")) {
+                serverPeerPub = line.substringAfter("=").trim()
             }
         }
 
         session.disconnect()
         keyTempFile.delete()
 
-        if (peerKey == null || serverPub == null) {
+        if (serverPub == null || serverPeerPub == null) {
             throw Exception("WireGuard key extraction failed")
         }
+        if (serverPeerPub != clientKeys.publicKey) {
+            throw Exception("WireGuard peer key mismatch: server installed a different client public key")
+        }
 
-        val clientConfig = "[Interface]\nPrivateKey = $peerKey\n" +
-            "Address = 10.66.66.2/24\nDNS = 1.1.1.1\n\n" +
+        val clientConfig = "[Interface]\nPrivateKey = ${clientKeys.privateKey}\n" +
+            "Address = 10.66.66.2/32\nDNS = 1.1.1.1\n\n" +
             "[Peer]\nPublicKey = $serverPub\n" +
             "Endpoint = $publicIp:$port\n" +
             "AllowedIPs = 0.0.0.0/0\nPersistentKeepalive = 25\n"
 
         emit(Phase.WIREGUARD, Status.SUCCESS, "WireGuard configured")
-        return ProvisionResult(publicIp, port, clientConfig)
+        return ProvisionResult(
+            publicIp = publicIp,
+            wireGuardPort = port,
+            clientConfig = clientConfig,
+            clientPublicKey = clientKeys.publicKey,
+            serverPublicKey = serverPub,
+            serverPeerPublicKey = serverPeerPub,
+            sshUsername = "ubuntu",
+            sshPrivateKey = sshPrivateKey,
+        )
     }
 
     // --- Full provisioning pipeline ---
@@ -824,6 +848,7 @@ class OciProvisioner(
         }
         val sshPublicKey = sshKeyPair.first
         val sshPrivateKey = sshKeyPair.second
+        val wireGuardClientKeys = generateWireGuardClientKeys()
 
         // Create network
         val rids = createNetwork(auth, homeRegion)
@@ -832,7 +857,7 @@ class OciProvisioner(
         val publicIp = launchVm(auth, homeRegion, rids, sshPublicKey)
 
         // Setup WireGuard via SSH
-        val provisionResult = setupWireGuard(auth, homeRegion, publicIp, sshPrivateKey)
+        val provisionResult = setupWireGuard(auth, homeRegion, publicIp, sshPrivateKey, wireGuardClientKeys)
 
         // Done
         emit(Phase.DONE, Status.SUCCESS, "Exit created: ${provisionResult.publicIp}:${provisionResult.wireGuardPort}")
@@ -1190,6 +1215,14 @@ class OciProvisioner(
         return publicKeyLine to privateKey
     }
 
+    private fun generateWireGuardClientKeys(): WireGuardClientKeys {
+        val keyPair = KeyPair()
+        return WireGuardClientKeys(
+            privateKey = keyPair.privateKey.toBase64(),
+            publicKey = keyPair.publicKey.toBase64(),
+        )
+    }
+
     // --- Date helper ---
 
     private fun currentDateRfc1123(): String {
@@ -1207,6 +1240,18 @@ class OciProvisioner(
 #!/bin/bash
 set -e
 
+if [ -z "${'$'}CLIENT_PUBLIC_KEY" ]; then
+  echo "ERROR: CLIENT_PUBLIC_KEY is required" >&2
+  exit 1
+fi
+
+PUBLIC_IF=${'$'}(ip route show default | awk '{print ${'$'}5; exit}')
+if [ -z "${'$'}PUBLIC_IF" ]; then
+  echo "ERROR: Could not detect default route interface" >&2
+  exit 1
+fi
+echo "PUBLIC_INTERFACE=${'$'}PUBLIC_IF"
+
 # Get server private key
 SERVER_KEY=${'$'}(sudo cat /etc/wireguard/server.key)
 
@@ -1216,36 +1261,32 @@ sudo bash -c "cat > /etc/wireguard/wg0.conf << EOF
 PrivateKey = ${'$'}SERVER_KEY
 Address = 10.66.66.1/24
 ListenPort = 51820
-PostUp = iptables -A FORWARD -i wg0 -j ACCEPT; iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
-PostDown = iptables -D FORWARD -i wg0 -j ACCEPT; iptables -t nat -D POSTROUTING -o eth0 -j MASQUERADE
+PostUp = iptables -D INPUT -p udp --dport 51820 -j ACCEPT 2>/dev/null || true; iptables -D FORWARD -i wg0 -o ${'$'}PUBLIC_IF -j ACCEPT 2>/dev/null || true; iptables -D FORWARD -i ${'$'}PUBLIC_IF -o wg0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true; iptables -t nat -D POSTROUTING -s 10.66.66.0/24 -o ${'$'}PUBLIC_IF -j MASQUERADE 2>/dev/null || true; iptables -I INPUT 1 -p udp --dport 51820 -j ACCEPT; iptables -I FORWARD 1 -i wg0 -o ${'$'}PUBLIC_IF -j ACCEPT; iptables -I FORWARD 2 -i ${'$'}PUBLIC_IF -o wg0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT; iptables -t nat -A POSTROUTING -s 10.66.66.0/24 -o ${'$'}PUBLIC_IF -j MASQUERADE
+PostDown = iptables -D INPUT -p udp --dport 51820 -j ACCEPT 2>/dev/null || true; iptables -D FORWARD -i wg0 -o ${'$'}PUBLIC_IF -j ACCEPT 2>/dev/null || true; iptables -D FORWARD -i ${'$'}PUBLIC_IF -o wg0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true; iptables -t nat -D POSTROUTING -s 10.66.66.0/24 -o ${'$'}PUBLIC_IF -j MASQUERADE 2>/dev/null || true
+
+[Peer]
+PublicKey = ${'$'}CLIENT_PUBLIC_KEY
+AllowedIPs = 10.66.66.2/32
 EOF"
 sudo chmod 600 /etc/wireguard/wg0.conf
 
 # Enable IP forwarding
 sudo sysctl -w net.ipv4.ip_forward=1
-echo 'net.ipv4.ip_forward=1' | sudo tee -a /etc/sysctl.conf
+echo 'net.ipv4.ip_forward=1' | sudo tee /etc/sysctl.d/99-zerovpn-forward.conf
+sudo sysctl --system
 
-# Start WireGuard
+# Start WireGuard from the persisted config, including the peer.
 sudo systemctl enable wg-quick@wg0
-sudo systemctl start wg-quick@wg0
-
-# Generate peer keypair
-wg genkey | tee /tmp/peer.key | wg pubkey > /tmp/peer.pub
-PEER_KEY=${'$'}(cat /tmp/peer.key)
-PEER_PUB=${'$'}(cat /tmp/peer.pub)
-
-# Add peer to server
-sudo wg set wg0 peer "${'$'}PEER_PUB" allowed-ips 10.66.66.2/32
+sudo systemctl restart wg-quick@wg0
 
 # Get server public key
 SERVER_PUB=${'$'}(sudo cat /etc/wireguard/server.pub)
 
 # Output
-echo "PEER_PRIVATE_KEY=${'$'}PEER_KEY"
 echo "SERVER_PUBLIC_KEY=${'$'}SERVER_PUB"
+echo "SERVER_PEER_PUBLIC_KEY=${'$'}CLIENT_PUBLIC_KEY"
 echo "---"
 sudo wg show
 """.trimIndent()
     }
 }
-

@@ -270,6 +270,17 @@ sudo sh -c "umask 077; wg genkey > /etc/wireguard/server.key; wg pubkey < /etc/w
 #!/bin/bash
 set -e
 
+if [ -z "$CLIENT_PUBLIC_KEY" ]; then
+  echo "ERROR: CLIENT_PUBLIC_KEY is required" >&2
+  exit 1
+fi
+
+PUBLIC_IF=$(ip route show default | awk '{print $5; exit}')
+if [ -z "$PUBLIC_IF" ]; then
+  echo "ERROR: Could not detect default route interface" >&2
+  exit 1
+fi
+
 SERVER_KEY=$(sudo cat /etc/wireguard/server.key)
 
 # Write wg0.conf
@@ -278,44 +289,44 @@ sudo bash -c "cat > /etc/wireguard/wg0.conf << EOF
 PrivateKey = $SERVER_KEY
 Address = 10.66.66.1/24
 ListenPort = 51820
-PostUp = iptables -A FORWARD -i wg0 -j ACCEPT; iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
-PostDown = iptables -D FORWARD -i wg0 -j ACCEPT; iptables -t nat -D POSTROUTING -o eth0 -j MASQUERADE
+PostUp = iptables -D INPUT -p udp --dport 51820 -j ACCEPT 2>/dev/null || true; iptables -D FORWARD -i wg0 -o $PUBLIC_IF -j ACCEPT 2>/dev/null || true; iptables -D FORWARD -i $PUBLIC_IF -o wg0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true; iptables -t nat -D POSTROUTING -s 10.66.66.0/24 -o $PUBLIC_IF -j MASQUERADE 2>/dev/null || true; iptables -I INPUT 1 -p udp --dport 51820 -j ACCEPT; iptables -I FORWARD 1 -i wg0 -o $PUBLIC_IF -j ACCEPT; iptables -I FORWARD 2 -i $PUBLIC_IF -o wg0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT; iptables -t nat -A POSTROUTING -s 10.66.66.0/24 -o $PUBLIC_IF -j MASQUERADE
+PostDown = iptables -D INPUT -p udp --dport 51820 -j ACCEPT 2>/dev/null || true; iptables -D FORWARD -i wg0 -o $PUBLIC_IF -j ACCEPT 2>/dev/null || true; iptables -D FORWARD -i $PUBLIC_IF -o wg0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true; iptables -t nat -D POSTROUTING -s 10.66.66.0/24 -o $PUBLIC_IF -j MASQUERADE 2>/dev/null || true
+
+[Peer]
+PublicKey = $CLIENT_PUBLIC_KEY
+AllowedIPs = 10.66.66.2/32
 EOF"
 sudo chmod 600 /etc/wireguard/wg0.conf
 
 # Enable IP forwarding
 sudo sysctl -w net.ipv4.ip_forward=1
-echo 'net.ipv4.ip_forward=1' | sudo tee -a /etc/sysctl.conf
+echo 'net.ipv4.ip_forward=1' | sudo tee /etc/sysctl.d/99-zerovpn-forward.conf
+sudo sysctl --system
 
-# Start WireGuard
+# Start WireGuard from the persisted config, including the peer.
 sudo systemctl enable wg-quick@wg0
-sudo systemctl start wg-quick@wg0
-
-# Generate peer keypair
-wg genkey | tee /tmp/peer.key | wg pubkey > /tmp/peer.pub
-PEER_KEY=$(cat /tmp/peer.key)
-PEER_PUB=$(cat /tmp/peer.pub)
-
-# Add peer to server
-sudo wg set wg0 peer "$PEER_PUB" allowed-ips 10.66.66.2/32
+sudo systemctl restart wg-quick@wg0
 
 # Get server public key
 SERVER_PUB=$(sudo cat /etc/wireguard/server.pub)
 
 # Output (parsed by the app)
-echo "PEER_PRIVATE_KEY=$PEER_KEY"
 echo "SERVER_PUBLIC_KEY=$SERVER_PUB"
+echo "SERVER_PEER_PUBLIC_KEY=$CLIENT_PUBLIC_KEY"
 echo "---"
 sudo wg show
 ```
 
 The script is written to the VM via `cat > /tmp/setup-wg.sh << 'ENDOFSCRIPT'`, 
 line endings fixed with `sed -i 's/\r$//'`, then executed with 
-`bash /tmp/setup-wg.sh`.
+`CLIENT_PUBLIC_KEY='<client-public-key>' bash /tmp/setup-wg.sh`.
 
-**Output parsing:** The app reads stdout for:
-- `PEER_PRIVATE_KEY=...` → client's WireGuard private key
-- `SERVER_PUBLIC_KEY=...` → server's WireGuard public key
+**Output parsing:** The app reads `SERVER_PUBLIC_KEY=...` and
+`SERVER_PEER_PUBLIC_KEY=...` from setup output. The older
+`PEER_PRIVATE_KEY=...` server-generated client key path is obsolete; the
+Android app generates the client WireGuard keypair once per node and
+sends only the client public key to the VM. The matching client private
+key stays in the Android config passed to GoBackend.
 
 ### Phase 7: Client Config + Done
 
@@ -323,7 +334,7 @@ line endings fixed with `sed -i 's/\r$//'`, then executed with
 ```ini
 [Interface]
 PrivateKey = {peer_private_key}
-Address = 10.66.66.2/24
+Address = 10.66.66.2/32
 DNS = 1.1.1.1
 
 [Peer]

@@ -80,5 +80,6 @@ dependencies {
     implementation(libs.nanohttpd)
     implementation(libs.jsch)
     implementation(libs.androidx.browser)
+    implementation(libs.wireguard.tunnel)
     debugImplementation(libs.androidx.compose.ui.tooling)
 }

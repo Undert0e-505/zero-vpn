@@ -28,6 +28,7 @@ fun StatusCard(
     onButtonClick: () -> Unit,
     modifier: Modifier = Modifier,
     connected: Boolean = false,
+    buttonEnabled: Boolean = true,
 ) {
     Column(
         modifier = modifier
@@ -63,12 +64,15 @@ fun StatusCard(
         Spacer(modifier = Modifier.height(24.dp))
         Button(
             onClick = onButtonClick,
+            enabled = buttonEnabled,
             modifier = Modifier
                 .fillMaxWidth()
                 .height(48.dp),
             colors = ButtonDefaults.buttonColors(
                 containerColor = if (connected) Danger else Accent,
                 contentColor = Bg,
+                disabledContainerColor = Border,
+                disabledContentColor = TextDim,
             ),
             shape = RoundedCornerShape(8.dp),
         ) {

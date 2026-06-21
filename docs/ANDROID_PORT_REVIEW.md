@@ -109,11 +109,23 @@ The Codex Android port is **structurally faithful** to the Python state machine 
 | apt install | `;` not `&&`, verify with `which wg` | same | ✅ |
 | Keygen | `umask 077; wg genkey; wg pubkey` | same | ✅ |
 | setup-wg.sh | scp + `sed -i 's/\r$//'` + bash | cat heredoc + `sed -i 's/\r$//'` + bash | ✅ |
-| Key extraction | parse `PEER_PRIVATE_KEY=` / `SERVER_PUBLIC_KEY=` | same | ✅ |
+| Key extraction | older harness parsed `PEER_PRIVATE_KEY=` / `SERVER_PUBLIC_KEY=` | Android generates the client WG key locally and parses `SERVER_PUBLIC_KEY=` / `SERVER_PEER_PUBLIC_KEY=` | adapted |
 | Client config | saved to `secrets/client.conf` | returned as `ProvisionResult.clientConfig` | ✅ (adapted) |
 | SSH key temp file | N/A | written to `cacheDir`, deleted after | ✅ |
 
-**SSH/WireGuard is correct** (adapted for Android — generates its own SSH key instead of using the project key).
+**SSH/WireGuard is structurally adapted** for Android, but the live
+debug session proved setup correctness also depends on persisted peers
+and guest firewall rule ordering.
+
+Correction after live debugging: the old `PEER_PRIVATE_KEY=` extraction
+path is obsolete for Android. Android generates the client WireGuard
+keypair locally, sends only the client public key to the VM, and parses
+`SERVER_PUBLIC_KEY=` / `SERVER_PEER_PUBLIC_KEY=` from setup output.
+
+Android also needs more than successful SSH: it must preserve the
+Android-generated client keypair, persist the server peer in `wg0.conf`,
+and insert guest firewall rules before Oracle Ubuntu reject rules. See
+`docs/OCI_VM_SETUP.md` for the 2026-06-21 debug lessons.
 
 ### 9. Destroy (destroy() vs do_destroy())
 
