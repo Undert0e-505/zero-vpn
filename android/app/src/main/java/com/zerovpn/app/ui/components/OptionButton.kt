@@ -24,13 +24,21 @@ fun OptionButton(
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
     enabled: Boolean = true,
+    statusLabel: String? = null,
+    onDisabledClick: (() -> Unit)? = null,
 ) {
     Row(
         modifier = modifier
             .fillMaxWidth()
             .background(Surface, RoundedCornerShape(8.dp))
             .border(1.dp, Border, RoundedCornerShape(8.dp))
-            .clickable(enabled = enabled) { onClick() }
+            .clickable(enabled = enabled || onDisabledClick != null) {
+                if (enabled) {
+                    onClick()
+                } else {
+                    onDisabledClick?.invoke()
+                }
+            }
             .padding(horizontal = 16.dp, vertical = 14.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
@@ -48,5 +56,16 @@ fun OptionButton(
             color = if (enabled) TextPrimary else TextDim,
         )
         Spacer(modifier = Modifier.weight(1f))
+        statusLabel?.let {
+            Text(
+                text = it,
+                modifier = Modifier
+                    .background(Border.copy(alpha = 0.35f), RoundedCornerShape(6.dp))
+                    .padding(horizontal = 8.dp, vertical = 4.dp),
+                fontSize = 12.sp,
+                fontWeight = FontWeight.Medium,
+                color = TextDim,
+            )
+        }
     }
 }

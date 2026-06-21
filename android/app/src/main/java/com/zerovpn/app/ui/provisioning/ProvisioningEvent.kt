@@ -24,6 +24,18 @@ enum class Phase(val number: Int, val label: String) {
 
 enum class Status { RUNNING, SUCCESS, WARNING, ERROR }
 
+enum class OracleOnboardingState {
+    NotStarted,
+    SignupLaunched,
+    WaitingForAccountSetup,
+    ReadyToAuthenticate,
+    AuthLaunched,
+    WaitingForAuthReturn,
+    AuthReturned,
+    AuthFailed,
+    ReadyToProvision,
+}
+
 /**
  * Top-level state for the provisioning flow.
  */
