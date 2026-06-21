@@ -36,13 +36,19 @@ class ProvisioningViewModel : ViewModel() {
     private var resourceIds: OciProvisioner.ResourceIds? = null
     private var clientConfig: String? = null
     private var homeRegion: String? = null
+    private var apiKeyUserOcid: String? = null
+    private var apiKeyTenancyOcid: String? = null
+    private var apiKeyFingerprint: String? = null
 
     // State persistence
     private lateinit var prefs: SharedPreferences
+    private var prefsLoaded = false
 
     fun initPrefs(context: Context) {
+        if (prefsLoaded) return
         prefs = context.getSharedPreferences("zerovpn_provisioning", Context.MODE_PRIVATE)
         loadPersistedState()
+        prefsLoaded = true
     }
 
     private fun loadPersistedState() {
@@ -51,8 +57,12 @@ class ProvisioningViewModel : ViewModel() {
         if (stateStr != null) {
             _isDevMode.value = prefs.getBoolean("is_dev_mode", true)
             homeRegion = prefs.getString("home_region", null)
+            apiKeyUserOcid = prefs.getString("api_key_user_ocid", null)
+            apiKeyTenancyOcid = prefs.getString("api_key_tenancy_ocid", null)
+            apiKeyFingerprint = prefs.getString("api_key_fingerprint", null)
             val savedIp = prefs.getString("public_ip", null)
             val savedPort = prefs.getInt("wireguard_port", 51820)
+            resourceIds = loadResourceIds()
             if (savedIp != null && stateStr == "Success") {
                 _publicIp.value = savedIp
                 _wireGuardPort.value = savedPort
@@ -73,10 +83,42 @@ class ProvisioningViewModel : ViewModel() {
             putString("state", _state.value::class.simpleName)
             putBoolean("is_dev_mode", _isDevMode.value)
             homeRegion?.let { putString("home_region", it) }
+            apiKeyUserOcid?.let { putString("api_key_user_ocid", it) }
+            apiKeyTenancyOcid?.let { putString("api_key_tenancy_ocid", it) }
+            apiKeyFingerprint?.let { putString("api_key_fingerprint", it) }
             _publicIp.value?.let { putString("public_ip", it) }
             putInt("wireguard_port", _wireGuardPort.value)
+            resourceIds?.let { rids ->
+                rids.vcnId?.let { putString("resource_vcn_id", it) }
+                rids.slId?.let { putString("resource_sl_id", it) }
+                rids.subnetId?.let { putString("resource_subnet_id", it) }
+                rids.igwId?.let { putString("resource_igw_id", it) }
+                rids.instanceId?.let { putString("resource_instance_id", it) }
+            }
             // No secrets stored
         }.apply()
+    }
+
+    private fun loadResourceIds(): OciProvisioner.ResourceIds? {
+        if (!::prefs.isInitialized) return null
+        val rids = OciProvisioner.ResourceIds(
+            vcnId = prefs.getString("resource_vcn_id", null),
+            slId = prefs.getString("resource_sl_id", null),
+            subnetId = prefs.getString("resource_subnet_id", null),
+            igwId = prefs.getString("resource_igw_id", null),
+            instanceId = prefs.getString("resource_instance_id", null),
+        )
+        return if (
+            rids.vcnId == null &&
+            rids.slId == null &&
+            rids.subnetId == null &&
+            rids.igwId == null &&
+            rids.instanceId == null
+        ) {
+            null
+        } else {
+            rids
+        }
     }
 
     fun showPreStart() {
@@ -126,39 +168,66 @@ class ProvisioningViewModel : ViewModel() {
     fun destroyNode(context: Context) {
         _state.value = ProvisioningState.Destroying
         viewModelScope.launch {
-            val currentRids = resourceIds
-            val currentAuth = authResult
+            val currentRids = resourceIds ?: loadResourceIds()
             val currentRegion = homeRegion ?: "uk-london-1"
 
-            if (currentRids == null || currentAuth == null) {
-                // Session was lost (app restart). Need to re-authenticate to destroy.
+            if (currentRids == null) {
                 _state.value = ProvisioningState.Failure(
                     failedPhase = Phase.DONE,
                     lastSuccessPhase = null,
-                    errorMessage = "Authentication session lost. Re-provision to destroy the existing node, or delete resources manually in the Oracle Console.",
+                    errorMessage = "Local resource IDs are missing. Delete the node resources manually in the Oracle Console.",
                 )
                 return@launch
             }
 
-            provisioner?.let { prov ->
-                emit(Phase.DONE, Status.RUNNING, "Destroying node resources...")
-                try {
-                    prov.destroy(currentRids, currentAuth, currentRegion)
-                    emit(Phase.DONE, Status.SUCCESS, "Node destroyed. Resources released.")
-                } catch (e: Exception) {
-                    emit(Phase.DONE, Status.WARNING, "Destroy partial: ${e.message}")
+            val prov = provisioner ?: OciProvisioner(context, currentRegion, _isDevMode.value).also { provisioner = it }
+            val eventJob = viewModelScope.launch {
+                prov.events.collect { event ->
+                    _events.value = _events.value + event
+                    if (event.phase != Phase.DONE) {
+                        _currentPhase.value = event.phase
+                    }
                 }
             }
-            _state.value = ProvisioningState.Destroyed
-            _events.value = emptyList()
-            _currentPhase.value = null
-            _publicIp.value = null
-            resourceIds = null
-            // Clear persisted state
-            if (::prefs.isInitialized) {
-                prefs.edit().clear().apply()
+
+            try {
+                val currentAuth = authResult ?: run {
+                    _currentPhase.value = Phase.AUTH
+                    emit(Phase.AUTH, Status.RUNNING, "Authentication required before destroy...")
+                    prov.authenticate().also { authResult = it }
+                }
+
+                emit(Phase.DONE, Status.RUNNING, "Destroying node resources...")
+                prov.destroy(
+                    rids = currentRids,
+                    auth = currentAuth,
+                    homeRegion = currentRegion,
+                    apiKeyUserOcid = apiKeyUserOcid,
+                    apiKeyFingerprint = apiKeyFingerprint,
+                )
+                emit(Phase.DONE, Status.SUCCESS, "Node destroyed. Resources released.")
+                _state.value = ProvisioningState.Destroyed
+                _events.value = emptyList()
+                _currentPhase.value = null
+                _publicIp.value = null
+                resourceIds = null
+                clientConfig = null
+                authResult = null
+                apiKeyUserOcid = null
+                apiKeyTenancyOcid = null
+                apiKeyFingerprint = null
+                if (::prefs.isInitialized) {
+                    prefs.edit().clear().apply()
+                }
+            } catch (e: Exception) {
+                _state.value = ProvisioningState.Failure(
+                    failedPhase = _currentPhase.value ?: Phase.DONE,
+                    lastSuccessPhase = null,
+                    errorMessage = e.message,
+                )
+            } finally {
+                eventJob.cancel()
             }
-            persistState()
         }
     }
 
@@ -171,7 +240,13 @@ class ProvisioningViewModel : ViewModel() {
             if (currentRids != null && currentAuth != null) {
                 emit(Phase.DONE, Status.RUNNING, "Cleaning up partial resources...")
                 try {
-                    provisioner?.destroy(currentRids, currentAuth, currentRegion)
+                    provisioner?.destroy(
+                        rids = currentRids,
+                        auth = currentAuth,
+                        homeRegion = currentRegion,
+                        apiKeyUserOcid = apiKeyUserOcid,
+                        apiKeyFingerprint = apiKeyFingerprint,
+                    )
                     emit(Phase.DONE, Status.SUCCESS, "Cleanup complete.")
                 } catch (e: Exception) {
                     emit(Phase.DONE, Status.WARNING, "Cleanup partial: ${e.message}")
@@ -281,6 +356,10 @@ class ProvisioningViewModel : ViewModel() {
             val auth = authResult!!
             val preflight = preflightResult!!
             homeRegion = preflight.homeRegion
+            apiKeyUserOcid = auth.userOcid
+            apiKeyTenancyOcid = auth.tenancyOcid
+            apiKeyFingerprint = auth.fingerprint
+            persistState()
 
             val (rids, result) = prov.provision(auth, preflight)
             resourceIds = rids

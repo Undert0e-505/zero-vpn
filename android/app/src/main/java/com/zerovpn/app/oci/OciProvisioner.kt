@@ -23,8 +23,6 @@ import com.zerovpn.app.ui.provisioning.ProvisioningEvent
 import com.zerovpn.app.ui.provisioning.Status
 import java.net.URLEncoder
 import java.security.interfaces.RSAPublicKey
-import java.util.Base64
-import java.util.UUID
 import java.util.concurrent.TimeUnit
 
 /**
@@ -291,7 +289,7 @@ class OciProvisioner(
             .get()
             .build()
 
-        // Log the request details for debugging (redact token, truncate) — dev mode only
+        // Log the request details for debugging (redact token, truncate) ï¿½ dev mode only
         if (isDevMode) {
             val authHdrDebug = request.header("Authorization") ?: ""
             // Show just the structure, not the full token
@@ -410,7 +408,7 @@ class OciProvisioner(
 
     // --- Phase 3: API Key Upload ---
 
-    private suspend fun uploadApiKey(auth: AuthResult, homeRegion: String) {
+    private suspend fun uploadApiKey(auth: AuthResult, homeRegion: String): String {
         emit(Phase.API_KEY, Status.RUNNING, "Uploading API key...")
         val idHost = "identity.$homeRegion.oci.oraclecloud.com"
         val path = "/20160918/users/${auth.userOcid}/apiKeys"
@@ -420,12 +418,12 @@ class OciProvisioner(
         val pubPem = OciRequestSigner.publicKeyToPem(publicKey)
         val jsonBody = JSONObject().put("key", pubPem).toString()
 
-        // Compute body headers — must match what OkHttp actually sends
+        // Compute body headers ï¿½ must match what OkHttp actually sends
         val bodyBytes = jsonBody.toByteArray(Charsets.UTF_8)
         val contentSha256 = java.util.Base64.getEncoder().encodeToString(
             java.security.MessageDigest.getInstance("SHA-256").digest(bodyBytes)
         )
-        // Don't set content-length manually — OkHttp computes it from the request body
+        // Don't set content-length manually ï¿½ OkHttp computes it from the request body
         // The signing string must use the same value OkHttp will send
         val contentLength = bodyBytes.size.toString()
 
@@ -469,9 +467,19 @@ class OciProvisioner(
             throw Exception("API key upload failed: ${httpResp.code} ${httpResp.body.take(200)}")
         }
 
+        val uploadedFingerprint = try {
+            if (httpResp.body.isBlank()) auth.fingerprint else JSONObject(httpResp.body).optString("fingerprint", auth.fingerprint)
+        } catch (e: Exception) {
+            auth.fingerprint
+        }
+        if (uploadedFingerprint != auth.fingerprint) {
+            emit(Phase.API_KEY, Status.WARNING, "Uploaded API key fingerprint differs from local fingerprint; using OCI response")
+        }
+
         emit(Phase.API_KEY, Status.RUNNING, "Waiting for propagation...")
         kotlinx.coroutines.delay(5000)
-        emit(Phase.API_KEY, Status.SUCCESS, "API key uploaded")
+        emit(Phase.API_KEY, Status.SUCCESS, "API key uploaded: $uploadedFingerprint")
+        return uploadedFingerprint
     }
 
     // --- Phase 4: Network Creation ---
@@ -527,7 +535,7 @@ class OciProvisioner(
         val slResp = ociPost(auth, iaasHost, "/20160918/securityLists", slBody)
         rids.slId = slResp.getString("id")
 
-        // Create subnet (use VCN default DHCP options — no need to fetch them)
+        // Create subnet (use VCN default DHCP options ï¿½ no need to fetch them)
         emit(Phase.NETWORK, Status.RUNNING, "Creating subnet...")
 
         val subnetBody = JSONObject()
@@ -653,7 +661,7 @@ class OciProvisioner(
             if (vnicResp.length() > 0) {
                 val vnicId = vnicResp.getJSONObject(0).getString("vnicId")
                 val vnicGet = ociGet(auth, iaasHost, "/20160918/vnics/$vnicId")
-                publicIp = vnicGet.optString("publicIp", null)
+                publicIp = vnicGet.optString("publicIp", "").takeIf { it.isNotBlank() }
                 if (publicIp != null) break
             }
             kotlinx.coroutines.delay(10_000)
@@ -834,8 +842,13 @@ class OciProvisioner(
 
     // --- Destroy ---
 
-    suspend fun destroy(rids: ResourceIds, auth: AuthResult, homeRegion: String): Boolean {
-        val cid = auth.tenancyOcid
+    suspend fun destroy(
+        rids: ResourceIds,
+        auth: AuthResult,
+        homeRegion: String,
+        apiKeyUserOcid: String?,
+        apiKeyFingerprint: String?,
+    ): Boolean {
         val iaasHost = "iaas.$homeRegion.oraclecloud.com"
         val idHost = "identity.$homeRegion.oci.oraclecloud.com"
 
@@ -893,23 +906,75 @@ class OciProvisioner(
             try { ociDelete(auth, iaasHost, "/20160918/vcns/${rids.vcnId}") } catch (e: Exception) { }
         }
 
-        // Delete API key
-        emit(Phase.DONE, Status.RUNNING, "Deleting API key...")
-        try {
-            val keyPath = "/20160918/users/${auth.userOcid}/apiKeys"
-            val keysResp = ociGetArray(auth, idHost, keyPath)
-            for (i in 0 until keysResp.length()) {
-                val key = keysResp.getJSONObject(i)
-                if (key.optString("fingerprint") == auth.fingerprint) {
-                    ociDelete(auth, idHost, "$keyPath/${key.getString("id")}")
-                    break
-                }
-            }
-        } catch (e: Exception) { }
+        deleteApiSigningKey(
+            auth = auth,
+            idHost = idHost,
+            apiKeyUserOcid = apiKeyUserOcid,
+            apiKeyFingerprint = apiKeyFingerprint,
+        )
 
         emit(Phase.DONE, Status.SUCCESS, "Resources destroyed")
         return true
     }
+
+    private suspend fun deleteApiSigningKey(
+        auth: AuthResult,
+        idHost: String,
+        apiKeyUserOcid: String?,
+        apiKeyFingerprint: String?,
+    ) {
+        emit(Phase.DONE, Status.RUNNING, "Deleting API signing key...")
+
+        if (apiKeyUserOcid.isNullOrBlank()) {
+            emit(Phase.DONE, Status.ERROR, "API signing key deletion skipped: missing user OCID")
+            throw Exception("API signing key deletion skipped: missing user OCID")
+        }
+        if (apiKeyFingerprint.isNullOrBlank()) {
+            emit(Phase.DONE, Status.ERROR, "API signing key deletion skipped: missing fingerprint")
+            throw Exception("API signing key deletion skipped: missing fingerprint")
+        }
+        if (apiKeyUserOcid != auth.userOcid) {
+            val message = "API signing key deletion skipped: authenticated user does not match saved key owner"
+            emit(Phase.DONE, Status.ERROR, message)
+            throw Exception(message)
+        }
+
+        val keyPath = "/20160918/users/$apiKeyUserOcid/apiKeys"
+        val keysBefore = ociGetArray(auth, idHost, keyPath)
+        var found = false
+        for (i in 0 until keysBefore.length()) {
+            val key = keysBefore.getJSONObject(i)
+            if (key.optString("fingerprint") == apiKeyFingerprint) {
+                found = true
+                break
+            }
+        }
+        if (!found) {
+            emit(Phase.DONE, Status.SUCCESS, "API signing key already absent")
+            return
+        }
+
+        val deletePath = "$keyPath/$apiKeyFingerprint"
+        val deleteResult = ociDelete(auth, idHost, deletePath)
+        if (deleteResult.code == 404) {
+            emit(Phase.DONE, Status.SUCCESS, "API signing key already absent")
+            return
+        }
+        emit(Phase.DONE, Status.RUNNING, "API signing key delete returned HTTP ${deleteResult.code}")
+
+        val keysAfter = ociGetArray(auth, idHost, keyPath)
+        for (i in 0 until keysAfter.length()) {
+            val key = keysAfter.getJSONObject(i)
+            if (key.optString("fingerprint") == apiKeyFingerprint) {
+                val message = "API signing key deletion unverified: key still listed after delete"
+                emit(Phase.DONE, Status.ERROR, message)
+                throw Exception(message)
+            }
+        }
+        emit(Phase.DONE, Status.SUCCESS, "API signing key deleted and verified absent")
+    }
+
+    private data class DeleteResult(val code: Int, val body: String)
 
     // --- OCI HTTP helpers ---
 
@@ -1030,8 +1095,8 @@ class OciProvisioner(
         }
     }
 
-    private suspend fun ociDelete(auth: AuthResult, host: String, path: String) {
-        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+    private suspend fun ociDelete(auth: AuthResult, host: String, path: String): DeleteResult {
+        return kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
             val (authHeader, dateStr, _) = OciRequestSigner.buildAuthHeader(
                     tenancyOcid = auth.tenancyOcid,
                     userOcid = auth.userOcid,
@@ -1048,9 +1113,11 @@ class OciProvisioner(
                 .delete()
                 .build()
             val resp = httpClient.newCall(req).execute()
+            val respBody = resp.body?.string() ?: ""
             if (!resp.isSuccessful && resp.code != 404) {
-                // Non-fatal during destroy
+                throw Exception("DELETE $path failed: ${resp.code} $respBody")
             }
+            DeleteResult(resp.code, respBody)
         }
     }
 
@@ -1181,10 +1248,4 @@ sudo wg show
 """.trimIndent()
     }
 }
-
-
-
-
-
-
 
