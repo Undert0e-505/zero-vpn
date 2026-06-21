@@ -28,10 +28,17 @@ Thumbs.db
 # Secrets — never commit these
 *.key
 *.pem
+*.p8
 *.conf.private
 secrets/
 .env
 .env.local
+key.txt
+keys.txt
+oci/config
+.oci/
+*.token
+*.session
 
 # WireGuard configs (may contain private keys)
 *.conf
@@ -44,6 +51,21 @@ harness/token.txt
 harness/oci-config.txt
 harness/auth-state.json
 harness/__pycache__/
+harness/**/__pycache__/
 harness/*.log
+harness/*.json
+harness/*.pyc
 
 harness/setup-state.json
+
+# Local/generated cleanup artifacts
+rescue-snapshots/
+UNCOMMITTED_BEFORE_REDIRECT_RESCUE.diff
+.cleanup-backup/
+.gradle-workspace*/
+.gradle-build-cache/
+g/
+g2/
+android/hs_err_pid*.log
+crash*.log
+hs_err_pid*.log
