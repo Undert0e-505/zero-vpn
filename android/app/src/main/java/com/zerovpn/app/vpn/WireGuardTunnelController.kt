@@ -3,6 +3,8 @@ package com.zerovpn.app.vpn
 import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.net.VpnService
 import android.util.Log
 import com.wireguard.android.backend.GoBackend
@@ -28,6 +30,7 @@ class WireGuardTunnelController(
         const val KEY_ACTIVE_ENDPOINT = "active_endpoint"
         const val KEY_ACTIVE_TUNNEL_ADDRESS = "active_tunnel_address"
         const val KEY_ACTIVE_SELECTED_EXIT_ID = "active_selected_exit_id"
+        const val KEY_ACTIVE_CONNECTED_AT = "active_connected_at"
     }
 
     private val appContext = context.applicationContext
@@ -44,6 +47,7 @@ class WireGuardTunnelController(
     private var activeExitId: String? = null
     private var activeTunnel: ZeroVpnTunnel? = null
     private var activeTunnelName: String? = null
+    private var restoredRuntimeConfig: String? = null
 
     fun prepareVpn(): Intent? {
         val intent = VpnService.prepare(appContext)
@@ -91,10 +95,35 @@ class WireGuardTunnelController(
     suspend fun reconcile(exits: List<ConfiguredExit>, selectedExitId: String?) {
         val persistedTunnelName = prefs.getString(KEY_ACTIVE_TUNNEL_NAME, null)
         val persistedExitId = prefs.getString(KEY_ACTIVE_EXIT_ID, null)
+        val persistedConnectedAt = prefs.getLong(KEY_ACTIVE_CONNECTED_AT, 0L).takeIf { it > 0L }
+        val vpnSnapshot = inspectAndroidVpnTransport()
         if (persistedTunnelName.isNullOrBlank()) {
-            if (activeTunnel == null && _state.value !is VpnConnectionState.Disconnected) {
+            if (vpnSnapshot.detected) {
+                activeExitId = null
+                activeTunnelName = vpnSnapshot.interfaceName ?: "Android VPN"
+                _state.value = VpnConnectionState.ActiveUnknown(activeTunnelName ?: "Android VPN")
+                _diagnostics.value = _diagnostics.value.copy(
+                    backendState = "VPN Active",
+                    activeExitId = null,
+                    persistedActiveExitId = null,
+                    persistedTunnelName = null,
+                    selectedExitId = selectedExitId,
+                    tunnelName = activeTunnelName,
+                    reconciliationSource = "Android TRANSPORT_VPN fallback; no persisted ZeroVPN tunnel metadata",
+                    androidVpnDetected = true,
+                    androidVpnInterfaceName = vpnSnapshot.interfaceName,
+                    androidVpnDnsServers = vpnSnapshot.dnsServers,
+                    androidVpnRoutes = vpnSnapshot.routes,
+                    androidVpnLinkAddresses = vpnSnapshot.linkAddresses,
+                    lastError = "Active Android VPN detected; exit mapping unavailable.",
+                )
+            } else if (activeTunnel == null && _state.value !is VpnConnectionState.Disconnected) {
                 _state.value = VpnConnectionState.Disconnected
-                _diagnostics.value = _diagnostics.value.copy(backendState = "Disconnected")
+                _diagnostics.value = _diagnostics.value.copy(
+                    backendState = "Disconnected",
+                    reconciliationSource = "stale cleared",
+                    androidVpnDetected = false,
+                )
             }
             return
         }
@@ -105,18 +134,32 @@ class WireGuardTunnelController(
                 if (tunnelState == Tunnel.State.DOWN) {
                     clearActiveState()
                     _state.value = VpnConnectionState.Disconnected
-                    _diagnostics.value = _diagnostics.value.copy(backendState = "Disconnected")
+                    _diagnostics.value = _diagnostics.value.copy(
+                        backendState = "Disconnected",
+                        reconciliationSource = "tunnel callback DOWN",
+                    )
                 }
             }
             val tunnelState = withContext(Dispatchers.IO) { backend.getState(tunnel) }
-            val isRunning = persistedTunnelName in runningNames || tunnelState == Tunnel.State.UP
+            val goBackendIsRunning = persistedTunnelName in runningNames || tunnelState == Tunnel.State.UP
+            val matchedPersistedExit = exits.firstOrNull { it.id == persistedExitId }
+            val matchedExit = matchedPersistedExit
+                ?: exits.firstOrNull { it.id == selectedExitId }
+                ?: exits.singleOrNull()
 
-            if (!isRunning) {
-                Log.d(TAG, "Reconcile cleared stale active VPN metadata for tunnel=$persistedTunnelName")
+            if (!goBackendIsRunning && !vpnSnapshot.detected) {
+                Log.d(TAG, "Reconcile cleared stale active VPN metadata for tunnel=$persistedTunnelName; GoBackend DOWN and no Android VPN transport")
                 clearActiveState()
                 _state.value = VpnConnectionState.Disconnected
                 _diagnostics.value = _diagnostics.value.copy(
                     backendState = "Disconnected",
+                    persistedActiveExitId = persistedExitId,
+                    persistedTunnelName = persistedTunnelName,
+                    persistedConnectedAt = persistedConnectedAt,
+                    selectedExitId = selectedExitId,
+                    reconciliationSource = "stale cleared",
+                    goBackendRunningTunnelNames = runningNames.joinToString(", ").ifBlank { "none" },
+                    androidVpnDetected = false,
                     lastError = null,
                 )
                 return
@@ -125,45 +168,96 @@ class WireGuardTunnelController(
             activeTunnel = tunnel
             activeTunnelName = persistedTunnelName
             activeExitId = persistedExitId
+            restoredRuntimeConfig = matchedPersistedExit?.wireGuardConfig
 
-            val matchedExit = exits.firstOrNull { it.id == persistedExitId }
-                ?: exits.firstOrNull { it.id == selectedExitId }
-                ?: exits.singleOrNull()
             if (matchedExit != null && matchedExit.id == persistedExitId) {
                 val summary = summarizeRuntimeConfig(
                     exit = matchedExit,
                     tunnelName = persistedTunnelName,
-                    backendState = "Connected",
+                    backendState = if (goBackendIsRunning) "Connected" else "VPN Active",
                     runtimeConfig = matchedExit.wireGuardConfig,
-                    configParseStatus = "Reconciled after restart",
+                    configParseStatus = if (goBackendIsRunning) {
+                        "Reconciled after restart"
+                    } else {
+                        "Restored from Android VPN state"
+                    },
                 )
                 _state.value = VpnConnectionState.Connected(matchedExit.id)
                 _diagnostics.value = summary.copy(
                     activeExitId = matchedExit.id,
+                    persistedActiveExitId = persistedExitId,
+                    persistedTunnelName = persistedTunnelName,
+                    persistedConnectedAt = persistedConnectedAt,
+                    reconciliationSource = if (goBackendIsRunning) "GoBackend UP" else "Android TRANSPORT_VPN fallback",
+                    goBackendRunningTunnelNames = runningNames.joinToString(", ").ifBlank { "none" },
+                    androidVpnDetected = vpnSnapshot.detected,
+                    androidVpnInterfaceName = vpnSnapshot.interfaceName,
+                    androidVpnDnsServers = vpnSnapshot.dnsServers,
+                    androidVpnRoutes = vpnSnapshot.routes,
+                    androidVpnLinkAddresses = vpnSnapshot.linkAddresses,
                     lastError = null,
                 )
-                Log.d(TAG, "Reconciled active VPN tunnel=$persistedTunnelName exitId=${matchedExit.id}")
+                Log.d(TAG, "Reconciled active VPN tunnel=$persistedTunnelName exitId=${matchedExit.id} source=${_diagnostics.value.reconciliationSource}")
             } else {
                 _state.value = VpnConnectionState.ActiveUnknown(persistedTunnelName)
                 _diagnostics.value = _diagnostics.value.copy(
-                    backendState = "Connected",
+                    backendState = if (goBackendIsRunning) "Connected" else "VPN Active",
                     activeExitId = persistedExitId,
+                    persistedActiveExitId = persistedExitId,
+                    persistedTunnelName = persistedTunnelName,
+                    persistedConnectedAt = persistedConnectedAt,
                     tunnelName = persistedTunnelName,
                     endpoint = prefs.getString(KEY_ACTIVE_ENDPOINT, null),
                     tunnelAddress = prefs.getString(KEY_ACTIVE_TUNNEL_ADDRESS, null),
                     selectedExitId = selectedExitId,
+                    reconciliationSource = if (goBackendIsRunning) {
+                        "GoBackend UP; exit mapping unavailable"
+                    } else {
+                        "Android TRANSPORT_VPN fallback; exit mapping unavailable"
+                    },
+                    goBackendRunningTunnelNames = runningNames.joinToString(", ").ifBlank { "none" },
+                    androidVpnDetected = vpnSnapshot.detected,
+                    androidVpnInterfaceName = vpnSnapshot.interfaceName,
+                    androidVpnDnsServers = vpnSnapshot.dnsServers,
+                    androidVpnRoutes = vpnSnapshot.routes,
+                    androidVpnLinkAddresses = vpnSnapshot.linkAddresses,
                     lastError = "VPN is active, but the configured exit record is unavailable.",
                 )
                 Log.w(TAG, "Active VPN tunnel is running but exit metadata is unavailable: tunnel=$persistedTunnelName exitId=$persistedExitId")
             }
         } catch (e: Exception) {
             Log.w(TAG, "Unable to reconcile VPN state: ${e.javaClass.simpleName}: ${e.message}", e)
-            // GoBackend owns the active tunnel list; if it cannot confirm a running
-            // tunnel, avoid showing a stale connected state indefinitely.
+            if (vpnSnapshot.detected) {
+                activeTunnelName = persistedTunnelName
+                activeExitId = persistedExitId
+                _state.value = VpnConnectionState.ActiveUnknown(persistedTunnelName ?: "Android VPN")
+                _diagnostics.value = _diagnostics.value.copy(
+                    backendState = "VPN Active",
+                    activeExitId = persistedExitId,
+                    persistedActiveExitId = persistedExitId,
+                    persistedTunnelName = persistedTunnelName,
+                    persistedConnectedAt = persistedConnectedAt,
+                    tunnelName = persistedTunnelName,
+                    selectedExitId = selectedExitId,
+                    reconciliationSource = "Android TRANSPORT_VPN fallback after GoBackend error",
+                    androidVpnDetected = true,
+                    androidVpnInterfaceName = vpnSnapshot.interfaceName,
+                    androidVpnDnsServers = vpnSnapshot.dnsServers,
+                    androidVpnRoutes = vpnSnapshot.routes,
+                    androidVpnLinkAddresses = vpnSnapshot.linkAddresses,
+                    lastError = "GoBackend could not verify VPN state: ${e.message}",
+                )
+                return
+            }
             clearActiveState()
             _state.value = VpnConnectionState.Disconnected
             _diagnostics.value = _diagnostics.value.copy(
                 backendState = "Unknown",
+                persistedActiveExitId = persistedExitId,
+                persistedTunnelName = persistedTunnelName,
+                persistedConnectedAt = persistedConnectedAt,
+                reconciliationSource = "stale cleared after GoBackend error and no Android VPN",
+                androidVpnDetected = false,
                 lastError = "Unable to verify VPN state: ${e.message}",
             )
         }
@@ -199,6 +293,7 @@ class WireGuardTunnelController(
                     activeExitId = null
                     activeTunnel = null
                     activeTunnelName = null
+                    restoredRuntimeConfig = null
                     _state.value = VpnConnectionState.Disconnected
                 }
             }
@@ -219,9 +314,14 @@ class WireGuardTunnelController(
             activeTunnel = tunnel
             activeTunnelName = tunnelName
             activeExitId = exit.id
+            restoredRuntimeConfig = runtimeConfig
             persistActiveState(exit, tunnelName, parsedSummary)
             _state.value = VpnConnectionState.Connected(exit.id)
-            _diagnostics.value = parsedSummary.copy(backendState = "Connected", lastError = null)
+            _diagnostics.value = parsedSummary.copy(
+                backendState = "Connected",
+                reconciliationSource = "GoBackend connect",
+                lastError = null,
+            )
             Log.d(TAG, "Tunnel connect success exitId=${exit.id}, tunnelName=$tunnelName")
         } catch (e: Exception) {
             clearActiveState()
@@ -245,8 +345,24 @@ class WireGuardTunnelController(
             _diagnostics.value = _diagnostics.value.copy(backendState = "Disconnecting")
             if (tunnel != null) {
                 withContext(Dispatchers.IO) {
-                    backend.setState(tunnel, Tunnel.State.DOWN, null)
+                    val backendKnowsTunnel = backend.getState(tunnel) == Tunnel.State.UP ||
+                        tunnelName in backend.runningTunnelNames
+                    if (backendKnowsTunnel) {
+                        backend.setState(tunnel, Tunnel.State.DOWN, null)
+                    } else {
+                        val config = restoredRuntimeConfig?.let { parseConfig(it) }
+                        if (config != null) {
+                            Log.d(TAG, "Disconnecting restored Android VPN by reacquiring tunnel handle first")
+                            backend.setState(tunnel, Tunnel.State.UP, config)
+                            backend.setState(tunnel, Tunnel.State.DOWN, null)
+                        } else {
+                            backend.setState(tunnel, Tunnel.State.DOWN, null)
+                        }
+                    }
                 }
+            }
+            if (inspectAndroidVpnTransport().detected) {
+                error("Android still reports an active VPN. Disconnect from Android VPN settings if this persists.")
             }
             clearActiveState()
             _state.value = VpnConnectionState.Disconnected
@@ -265,6 +381,8 @@ class WireGuardTunnelController(
 
     suspend fun disconnectIfActive(exitId: String?): Boolean {
         if (activeTunnel == null && prefs.getString(KEY_ACTIVE_TUNNEL_NAME, null).isNullOrBlank()) return true
+        val currentExitId = activeExitId ?: prefs.getString(KEY_ACTIVE_EXIT_ID, null)
+        if (exitId != null && currentExitId != exitId) return true
         return try {
             disconnect()
             true
@@ -307,6 +425,9 @@ class WireGuardTunnelController(
             backendState = backendState,
             selectedExitId = exit.id,
             activeExitId = activeExitId,
+            persistedActiveExitId = prefs.getString(KEY_ACTIVE_EXIT_ID, null),
+            persistedTunnelName = prefs.getString(KEY_ACTIVE_TUNNEL_NAME, null),
+            persistedConnectedAt = prefs.getLong(KEY_ACTIVE_CONNECTED_AT, 0L).takeIf { it > 0L },
             tunnelName = tunnelName,
             configParseStatus = configParseStatus,
             runtimeConfigRedacted = redactWireGuardConfig(runtimeConfig),
@@ -330,6 +451,7 @@ class WireGuardTunnelController(
             putString(KEY_ACTIVE_ENDPOINT, diagnostics.endpoint ?: "${exit.publicIp}:${exit.wireGuardPort}")
             putString(KEY_ACTIVE_TUNNEL_ADDRESS, diagnostics.tunnelAddress ?: "10.66.66.2/32")
             putString(KEY_ACTIVE_SELECTED_EXIT_ID, exit.id)
+            putLong(KEY_ACTIVE_CONNECTED_AT, System.currentTimeMillis())
         }.apply()
     }
 
@@ -337,14 +459,52 @@ class WireGuardTunnelController(
         activeExitId = null
         activeTunnel = null
         activeTunnelName = null
+        restoredRuntimeConfig = null
         prefs.edit().apply {
             remove(KEY_ACTIVE_EXIT_ID)
             remove(KEY_ACTIVE_TUNNEL_NAME)
             remove(KEY_ACTIVE_ENDPOINT)
             remove(KEY_ACTIVE_TUNNEL_ADDRESS)
             remove(KEY_ACTIVE_SELECTED_EXIT_ID)
+            remove(KEY_ACTIVE_CONNECTED_AT)
         }.apply()
     }
+
+    private fun inspectAndroidVpnTransport(): AndroidVpnSnapshot {
+        return runCatching {
+            val connectivityManager = appContext.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+            for (network in connectivityManager.allNetworks) {
+                val capabilities = connectivityManager.getNetworkCapabilities(network) ?: continue
+                if (!capabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) continue
+                val properties = connectivityManager.getLinkProperties(network)
+                return AndroidVpnSnapshot(
+                    detected = true,
+                    interfaceName = properties?.interfaceName,
+                    dnsServers = properties?.dnsServers
+                        ?.joinToString(", ") { it.hostAddress.orEmpty() }
+                        ?.takeIf { it.isNotBlank() },
+                    routes = properties?.routes
+                        ?.joinToString(", ") { it.toString() }
+                        ?.takeIf { it.isNotBlank() },
+                    linkAddresses = properties?.linkAddresses
+                        ?.joinToString(", ") { it.toString() }
+                        ?.takeIf { it.isNotBlank() },
+                )
+            }
+            AndroidVpnSnapshot(detected = false)
+        }.getOrElse { e ->
+            Log.w(TAG, "Unable to inspect Android VPN transport: ${e.javaClass.simpleName}: ${e.message}", e)
+            AndroidVpnSnapshot(detected = false)
+        }
+    }
+
+    private data class AndroidVpnSnapshot(
+        val detected: Boolean,
+        val interfaceName: String? = null,
+        val dnsServers: String? = null,
+        val routes: String? = null,
+        val linkAddresses: String? = null,
+    )
 
     private fun validateRuntimeConfig(exit: ConfiguredExit, diagnostics: VpnDiagnostics): String {
         val failures = mutableListOf<String>()

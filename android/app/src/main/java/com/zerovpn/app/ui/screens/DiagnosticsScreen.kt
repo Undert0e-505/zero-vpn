@@ -75,10 +75,16 @@ fun DiagnosticsScreen(
     val vpnDiagnostics by vpnViewModel.diagnostics.collectAsState()
     val userDiagnostics by vpnViewModel.userDiagnostics.collectAsState()
     val scrollState = rememberScrollState()
+    val activeExitId = when (val currentState = vpnState) {
+        is VpnConnectionState.Connected -> currentState.exitId
+        is VpnConnectionState.ActiveUnknown -> vpnDiagnostics.activeExitId
+        else -> null
+    }
     val selectedExit = exits.firstOrNull { it.id == selectedExitId } ?: exits.singleOrNull()
+    val diagnosticsExit = activeExitId?.let { id -> exits.firstOrNull { it.id == id } } ?: selectedExit
 
-    LaunchedEffect(selectedExit?.id, selectedExit?.wireGuardConfig) {
-        selectedExit?.let { vpnViewModel.prepareDiagnostics(it) }
+    LaunchedEffect(diagnosticsExit?.id, diagnosticsExit?.wireGuardConfig) {
+        diagnosticsExit?.let { vpnViewModel.prepareDiagnostics(it) }
     }
 
     LaunchedEffect(vpnState) {
@@ -117,8 +123,8 @@ fun DiagnosticsScreen(
 
         ConnectionDiagnosticsCard(
             vpnState = vpnState,
-            selectedExitName = selectedExit?.name,
-            selectedExitEndpoint = selectedExit?.let { "${it.publicIp}:${it.wireGuardPort}" },
+            selectedExitName = diagnosticsExit?.name,
+            selectedExitEndpoint = diagnosticsExit?.let { "${it.publicIp}:${it.wireGuardPort}" },
             diagnostics = vpnDiagnostics,
             userDiagnostics = userDiagnostics,
             onRefresh = { vpnViewModel.refreshUserDiagnostics(force = true) },
@@ -235,8 +241,20 @@ private fun WireGuardDebugCard(
         )
 
         DebugValue("Backend state", diagnostics.backendState)
+        DebugValue("Reconcile source", diagnostics.reconciliationSource ?: "N/A")
         DebugValue("Selected exit id", diagnostics.selectedExitId ?: "N/A")
         DebugValue("Active exit id", diagnostics.activeExitId ?: "N/A")
+        DebugValue("Persisted active exit id", diagnostics.persistedActiveExitId ?: "N/A")
+        DebugValue("Persisted tunnel", diagnostics.persistedTunnelName ?: "N/A")
+        diagnostics.persistedConnectedAt?.let {
+            DebugValue("Persisted connected", DateFormat.getDateTimeInstance().format(Date(it)))
+        }
+        DebugValue("GoBackend running", diagnostics.goBackendRunningTunnelNames ?: "N/A")
+        DebugValue("Android VPN transport", if (diagnostics.androidVpnDetected) "Detected" else "Not detected")
+        DebugValue("Android VPN interface", diagnostics.androidVpnInterfaceName ?: "N/A")
+        DebugBlock("Android VPN DNS", diagnostics.androidVpnDnsServers ?: "N/A")
+        DebugBlock("Android VPN routes", diagnostics.androidVpnRoutes ?: "N/A")
+        DebugBlock("Android VPN addresses", diagnostics.androidVpnLinkAddresses ?: "N/A")
         DebugValue("Tunnel name", diagnostics.tunnelName ?: "N/A")
         DebugValue("Config.parse", diagnostics.configParseStatus ?: "N/A")
         DebugValue("Validation", diagnostics.keyValidation ?: "N/A")
