@@ -5,6 +5,7 @@ import android.content.SharedPreferences
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.zerovpn.app.oci.OciProvisioner
+import com.zerovpn.app.vpn.ConfiguredExit
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -30,11 +31,32 @@ class ProvisioningViewModel : ViewModel() {
     private val _isDevMode = MutableStateFlow(true)
     val isDevMode: StateFlow<Boolean> = _isDevMode.asStateFlow()
 
+    data class SshDebugInfo(
+        val publicIp: String,
+        val username: String,
+        val privateKey: String,
+    ) {
+        val windowsSshCommand: String
+            get() = "ssh -i C:\\ssh-keys\\zerovpn_current_vm_key $username@$publicIp"
+    }
+
+    private val _sshDebugInfo = MutableStateFlow<SshDebugInfo?>(null)
+    val sshDebugInfo: StateFlow<SshDebugInfo?> = _sshDebugInfo.asStateFlow()
+
+    private val _configuredExits = MutableStateFlow<List<ConfiguredExit>>(emptyList())
+    val configuredExits: StateFlow<List<ConfiguredExit>> = _configuredExits.asStateFlow()
+
+    private val _selectedExitId = MutableStateFlow<String?>(null)
+    val selectedExitId: StateFlow<String?> = _selectedExitId.asStateFlow()
+
     private var provisioner: OciProvisioner? = null
     private var authResult: OciProvisioner.AuthResult? = null
     private var preflightResult: OciProvisioner.PreflightResult? = null
     private var resourceIds: OciProvisioner.ResourceIds? = null
     private var clientConfig: String? = null
+    private var wireGuardClientPublicKey: String? = null
+    private var wireGuardServerPublicKey: String? = null
+    private var wireGuardServerPeerPublicKey: String? = null
     private var homeRegion: String? = null
     private var apiKeyUserOcid: String? = null
     private var apiKeyTenancyOcid: String? = null
@@ -62,10 +84,24 @@ class ProvisioningViewModel : ViewModel() {
             apiKeyFingerprint = prefs.getString("api_key_fingerprint", null)
             val savedIp = prefs.getString("public_ip", null)
             val savedPort = prefs.getInt("wireguard_port", 51820)
+            clientConfig = prefs.getString("wireguard_client_config", null)
+            wireGuardClientPublicKey = prefs.getString("wireguard_client_public_key", null)
+            wireGuardServerPublicKey = prefs.getString("wireguard_server_public_key", null)
+            wireGuardServerPeerPublicKey = prefs.getString("wireguard_server_peer_public_key", null)
             resourceIds = loadResourceIds()
             if (savedIp != null && stateStr == "Success") {
                 _publicIp.value = savedIp
                 _wireGuardPort.value = savedPort
+                clientConfig?.let {
+                    val exit = buildConfiguredExit(
+                        publicIp = savedIp,
+                        wireGuardPort = savedPort,
+                        region = homeRegion ?: "uk-london-1",
+                        wireGuardConfig = it,
+                    )
+                    _configuredExits.value = listOf(exit)
+                    _selectedExitId.value = prefs.getString("selected_exit_id", exit.id) ?: exit.id
+                }
                 _state.value = ProvisioningState.Success(
                     publicIp = savedIp,
                     wireGuardPort = savedPort,
@@ -80,6 +116,23 @@ class ProvisioningViewModel : ViewModel() {
     private fun persistState() {
         if (!::prefs.isInitialized) return
         prefs.edit().apply {
+            listOf(
+                "home_region",
+                "api_key_user_ocid",
+                "api_key_tenancy_ocid",
+                "api_key_fingerprint",
+                "public_ip",
+                "wireguard_client_config",
+                "wireguard_client_public_key",
+                "wireguard_server_public_key",
+                "wireguard_server_peer_public_key",
+                "selected_exit_id",
+                "resource_vcn_id",
+                "resource_sl_id",
+                "resource_subnet_id",
+                "resource_igw_id",
+                "resource_instance_id",
+            ).forEach { remove(it) }
             putString("state", _state.value::class.simpleName)
             putBoolean("is_dev_mode", _isDevMode.value)
             homeRegion?.let { putString("home_region", it) }
@@ -88,6 +141,11 @@ class ProvisioningViewModel : ViewModel() {
             apiKeyFingerprint?.let { putString("api_key_fingerprint", it) }
             _publicIp.value?.let { putString("public_ip", it) }
             putInt("wireguard_port", _wireGuardPort.value)
+            clientConfig?.let { putString("wireguard_client_config", it) }
+            wireGuardClientPublicKey?.let { putString("wireguard_client_public_key", it) }
+            wireGuardServerPublicKey?.let { putString("wireguard_server_public_key", it) }
+            wireGuardServerPeerPublicKey?.let { putString("wireguard_server_peer_public_key", it) }
+            _selectedExitId.value?.let { putString("selected_exit_id", it) }
             resourceIds?.let { rids ->
                 rids.vcnId?.let { putString("resource_vcn_id", it) }
                 rids.slId?.let { putString("resource_sl_id", it) }
@@ -125,11 +183,50 @@ class ProvisioningViewModel : ViewModel() {
         _state.value = ProvisioningState.PreStart
     }
 
+    fun prepareNewProvisioningFlow() {
+        if (_state.value is ProvisioningState.Success || _state.value is ProvisioningState.Running || _state.value is ProvisioningState.Destroying) {
+            return
+        }
+        _events.value = emptyList()
+        _currentPhase.value = null
+        _publicIp.value = null
+        _wireGuardPort.value = 51820
+        _configuredExits.value = emptyList()
+        _selectedExitId.value = null
+        _sshDebugInfo.value = null
+        provisioner = null
+        authResult = null
+        preflightResult = null
+        resourceIds = null
+        clientConfig = null
+        wireGuardClientPublicKey = null
+        wireGuardServerPublicKey = null
+        wireGuardServerPeerPublicKey = null
+        homeRegion = null
+        apiKeyUserOcid = null
+        apiKeyTenancyOcid = null
+        apiKeyFingerprint = null
+        _state.value = ProvisioningState.PreStart
+    }
+
     fun cancel() {
         _state.value = ProvisioningState.Idle
         _events.value = emptyList()
         _currentPhase.value = null
         _publicIp.value = null
+        _configuredExits.value = emptyList()
+        _selectedExitId.value = null
+        _sshDebugInfo.value = null
+        clientConfig = null
+        wireGuardClientPublicKey = null
+        wireGuardServerPublicKey = null
+        wireGuardServerPeerPublicKey = null
+        persistState()
+    }
+
+    fun selectExit(exitId: String?) {
+        _selectedExitId.value = exitId?.takeIf { id -> _configuredExits.value.any { it.id == id } }
+        persistState()
     }
 
     fun startProvisioning(context: Context) {
@@ -139,6 +236,11 @@ class ProvisioningViewModel : ViewModel() {
             _isDevMode.value = prefs.getBoolean("is_dev_mode", true)
         }
         _events.value = emptyList()
+        _sshDebugInfo.value = null
+        clientConfig = null
+        wireGuardClientPublicKey = null
+        wireGuardServerPublicKey = null
+        wireGuardServerPeerPublicKey = null
         _state.value = ProvisioningState.Running
         viewModelScope.launch {
             runProvisioning(context)
@@ -152,6 +254,11 @@ class ProvisioningViewModel : ViewModel() {
         _events.value = emptyList()
         _currentPhase.value = null
         _publicIp.value = null
+        _sshDebugInfo.value = null
+        clientConfig = null
+        wireGuardClientPublicKey = null
+        wireGuardServerPublicKey = null
+        wireGuardServerPeerPublicKey = null
         _state.value = ProvisioningState.Running
         viewModelScope.launch {
             runProvisioning(context)
@@ -210,8 +317,14 @@ class ProvisioningViewModel : ViewModel() {
                 _events.value = emptyList()
                 _currentPhase.value = null
                 _publicIp.value = null
+                _configuredExits.value = emptyList()
+                _selectedExitId.value = null
+                _sshDebugInfo.value = null
                 resourceIds = null
                 clientConfig = null
+                wireGuardClientPublicKey = null
+                wireGuardServerPublicKey = null
+                wireGuardServerPeerPublicKey = null
                 authResult = null
                 apiKeyUserOcid = null
                 apiKeyTenancyOcid = null
@@ -256,7 +369,14 @@ class ProvisioningViewModel : ViewModel() {
             _events.value = emptyList()
             _currentPhase.value = null
             _publicIp.value = null
+            _configuredExits.value = emptyList()
+            _selectedExitId.value = null
+            _sshDebugInfo.value = null
             resourceIds = null
+            clientConfig = null
+            wireGuardClientPublicKey = null
+            wireGuardServerPublicKey = null
+            wireGuardServerPeerPublicKey = null
             persistState()
         }
     }
@@ -364,8 +484,24 @@ class ProvisioningViewModel : ViewModel() {
             val (rids, result) = prov.provision(auth, preflight)
             resourceIds = rids
             clientConfig = result.clientConfig
+            wireGuardClientPublicKey = result.clientPublicKey
+            wireGuardServerPublicKey = result.serverPublicKey
+            wireGuardServerPeerPublicKey = result.serverPeerPublicKey
             _publicIp.value = result.publicIp
             _wireGuardPort.value = result.wireGuardPort
+            _sshDebugInfo.value = SshDebugInfo(
+                publicIp = result.publicIp,
+                username = result.sshUsername,
+                privateKey = result.sshPrivateKey,
+            )
+            val configuredExit = buildConfiguredExit(
+                publicIp = result.publicIp,
+                wireGuardPort = result.wireGuardPort,
+                region = homeRegion ?: "uk-london-1",
+                wireGuardConfig = result.clientConfig,
+            )
+            _configuredExits.value = listOf(configuredExit)
+            _selectedExitId.value = configuredExit.id
 
             _currentPhase.value = Phase.DONE
             _state.value = ProvisioningState.Success(
@@ -393,5 +529,35 @@ class ProvisioningViewModel : ViewModel() {
             message = message,
         )
         _events.value = _events.value + event
+    }
+
+    private fun buildConfiguredExit(
+        publicIp: String,
+        wireGuardPort: Int,
+        region: String,
+        wireGuardConfig: String,
+    ): ConfiguredExit = ConfiguredExit(
+        id = "oracle:$publicIp:$wireGuardPort",
+        name = "Oracle Cloud Exit",
+        publicIp = publicIp,
+        wireGuardPort = wireGuardPort,
+        region = region,
+        wireGuardConfig = wireGuardConfig,
+        serverPublicKey = wireGuardServerPublicKey ?: parseWireGuardValue(wireGuardConfig, "Peer", "PublicKey"),
+        serverPeerPublicKey = wireGuardServerPeerPublicKey ?: wireGuardClientPublicKey,
+        clientPublicKey = wireGuardClientPublicKey,
+    )
+
+    private fun parseWireGuardValue(config: String, sectionName: String, key: String): String? {
+        val start = config.indexOf("[$sectionName]")
+        if (start < 0) return null
+        val next = config.indexOf("\n[", start + sectionName.length + 2)
+        val section = if (next >= 0) config.substring(start, next) else config.substring(start)
+        return section.lineSequence()
+            .map { it.trim() }
+            .firstOrNull { it.startsWith(key, ignoreCase = true) && it.contains("=") }
+            ?.substringAfter("=")
+            ?.trim()
+            ?.takeIf { it.isNotBlank() }
     }
 }

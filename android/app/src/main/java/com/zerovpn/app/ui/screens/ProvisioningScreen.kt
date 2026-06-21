@@ -52,6 +52,7 @@ fun ProvisioningScreen(
     onBack: () -> Unit,
     modifier: Modifier = Modifier,
     viewModel: ProvisioningViewModel = viewModel(),
+    onDestroy: (() -> Unit)? = null,
 ) {
     val state by viewModel.state.collectAsState()
     val events by viewModel.events.collectAsState()
@@ -137,7 +138,7 @@ fun ProvisioningScreen(
                             android.widget.Toast.LENGTH_SHORT,
                         ).show()
                     },
-                    onDestroy = { viewModel.destroyNode(context) },
+                    onDestroy = { onDestroy?.invoke() ?: viewModel.destroyNode(context) },
                 )
             }
 

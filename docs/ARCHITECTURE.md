@@ -84,6 +84,14 @@ Phone ──WireGuard tunnel──> Exit node ──NAT──> Internet
 The exit node sees the phone's traffic destination. The phone's local
 network and ISP only see encrypted WireGuard UDP to the exit node.
 
+For OCI Android-provisioned exits, the VM has three separate gates:
+OCI ingress, the Ubuntu guest firewall, and WireGuard cryptographic
+acceptance. Android `VpnService` reporting connected is not enough to
+prove a server handshake. The server-side truth test is `sudo wg show`
+with a recent handshake and non-zero transfer counters. See
+`docs/OCI_VM_SETUP.md` for the 2026-06-21 OCI/WireGuard debugging
+playbook and firewall ordering requirements.
+
 In Volunteer Network Mode, the path is:
 
 ```

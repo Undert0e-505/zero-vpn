@@ -1,28 +1,61 @@
 package com.zerovpn.app.ui.screens
 
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.lifecycle.viewmodel.compose.viewModel
+import com.zerovpn.app.ui.provisioning.ProvisioningViewModel
 import com.zerovpn.app.ui.theme.*
+import com.zerovpn.app.vpn.VpnDiagnostics
+import com.zerovpn.app.vpn.VpnViewModel
 
 @Composable
 fun DiagnosticsScreen(
     modifier: Modifier = Modifier,
+    provisioningViewModel: ProvisioningViewModel = viewModel(),
+    vpnViewModel: VpnViewModel = viewModel(),
 ) {
+    val context = LocalContext.current
+    val isDevMode by provisioningViewModel.isDevMode.collectAsState()
+    val sshDebugInfo by provisioningViewModel.sshDebugInfo.collectAsState()
+    val exits by provisioningViewModel.configuredExits.collectAsState()
+    val selectedExitId by provisioningViewModel.selectedExitId.collectAsState()
+    val vpnDiagnostics by vpnViewModel.diagnostics.collectAsState()
+    val scrollState = rememberScrollState()
+    val selectedExit = exits.firstOrNull { it.id == selectedExitId } ?: exits.singleOrNull()
+
+    LaunchedEffect(selectedExit?.id, selectedExit?.wireGuardConfig) {
+        selectedExit?.let { vpnViewModel.prepareDiagnostics(it) }
+    }
+
     Column(
         modifier = modifier
             .fillMaxSize()
             .background(Bg)
             .padding(horizontal = 16.dp)
-            .padding(top = 4.dp, bottom = 40.dp),
+            .padding(top = 4.dp, bottom = 40.dp)
+            .verticalScroll(scrollState),
     ) {
         Text(
             text = "DIAGNOSTICS",
@@ -65,5 +98,175 @@ fun DiagnosticsScreen(
             }
             Spacer(modifier = Modifier.height(8.dp))
         }
+
+        if (isDevMode) {
+            Spacer(modifier = Modifier.height(12.dp))
+            WireGuardDebugCard(vpnDiagnostics)
+            Spacer(modifier = Modifier.height(12.dp))
+            SshDebugCard(
+                sshDebugInfo = sshDebugInfo,
+                onCopyPrivateKey = {
+                    sshDebugInfo?.privateKey?.let { key ->
+                        copyToClipboard(context, "ZeroVPN VM SSH private key", key)
+                    }
+                },
+                onCopyCommand = {
+                    sshDebugInfo?.windowsSshCommand?.let { command ->
+                        copyToClipboard(context, "ZeroVPN VM SSH command", command)
+                    }
+                },
+            )
+        }
     }
+}
+
+@Composable
+private fun WireGuardDebugCard(
+    diagnostics: VpnDiagnostics,
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(Surface, RoundedCornerShape(8.dp))
+            .border(1.dp, Border, RoundedCornerShape(8.dp))
+            .padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        Text(
+            text = "WIREGUARD KEY DIAGNOSTICS",
+            style = SectionTitleStyle,
+        )
+        Text(
+            text = "Developer-mode public-key summary. WireGuard private keys are not displayed.",
+            fontSize = 13.sp,
+            color = TextDim,
+            lineHeight = 18.sp,
+        )
+
+        DebugValue("Backend state", diagnostics.backendState)
+        DebugValue("Selected exit id", diagnostics.selectedExitId ?: "N/A")
+        DebugValue("Active exit id", diagnostics.activeExitId ?: "N/A")
+        DebugValue("Tunnel name", diagnostics.tunnelName ?: "N/A")
+        DebugValue("Config.parse", diagnostics.configParseStatus ?: "N/A")
+        DebugValue("Validation", diagnostics.keyValidation ?: "N/A")
+        DebugValue("Interface Address", diagnostics.tunnelAddress ?: "N/A")
+        DebugValue("DNS", diagnostics.dns ?: "N/A")
+        DebugValue("Endpoint", diagnostics.endpoint ?: "N/A")
+        DebugValue("AllowedIPs", diagnostics.allowedIps ?: "N/A")
+        DebugBlock("Android client public key", diagnostics.androidClientPublicKey ?: "N/A")
+        DebugBlock("Android peer/server public key", diagnostics.androidPeerServerPublicKey ?: "N/A")
+        DebugBlock("Selected node server public key", diagnostics.selectedNodeServerPublicKey ?: "N/A")
+        DebugBlock("Provisioned server peer public key", diagnostics.provisionedServerPeerPublicKey ?: "N/A")
+        DebugBlock("Exact runtime config passed to Config.parse", diagnostics.runtimeConfigRedacted ?: "N/A")
+    }
+}
+
+@Composable
+private fun SshDebugCard(
+    sshDebugInfo: ProvisioningViewModel.SshDebugInfo?,
+    onCopyPrivateKey: () -> Unit,
+    onCopyCommand: () -> Unit,
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(Surface, RoundedCornerShape(8.dp))
+            .border(1.dp, Danger.copy(alpha = 0.6f), RoundedCornerShape(8.dp))
+            .padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        Text(
+            text = "SSH DEBUG ACCESS",
+            style = SectionTitleStyle,
+            color = Danger,
+        )
+        Text(
+            text = "Temporary debug only. Anyone with this key can SSH into this VM. Destroy this node after debugging.",
+            fontSize = 13.sp,
+            fontWeight = FontWeight.SemiBold,
+            color = Danger,
+            lineHeight = 18.sp,
+        )
+
+        if (sshDebugInfo == null) {
+            Text(
+                text = "No generated VM SSH private key is available in memory. Provision a node in this app session, then return here.",
+                fontSize = 13.sp,
+                color = TextDim,
+                lineHeight = 18.sp,
+            )
+            return
+        }
+
+        DebugValue("VM IP", sshDebugInfo.publicIp)
+        DebugValue("SSH user", sshDebugInfo.username)
+        DebugBlock("SSH command", sshDebugInfo.windowsSshCommand)
+        DebugBlock("Private key", sshDebugInfo.privateKey)
+
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            Button(
+                onClick = onCopyPrivateKey,
+                modifier = Modifier.weight(1f),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = Danger,
+                    contentColor = Bg,
+                ),
+            ) {
+                Text("Copy Key", fontSize = 13.sp, fontWeight = FontWeight.Bold)
+            }
+            OutlinedButton(
+                onClick = onCopyCommand,
+                modifier = Modifier.weight(1f),
+                colors = ButtonDefaults.outlinedButtonColors(
+                    contentColor = TextPrimary,
+                ),
+            ) {
+                Text("Copy Command", fontSize = 13.sp, fontWeight = FontWeight.Medium)
+            }
+        }
+    }
+}
+
+@Composable
+private fun DebugValue(label: String, value: String) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween,
+    ) {
+        Text(label, fontSize = 13.sp, color = TextDim)
+        Text(
+            text = value,
+            fontSize = 13.sp,
+            fontWeight = FontWeight.Medium,
+            color = TextPrimary,
+            fontFamily = FontFamily.Monospace,
+        )
+    }
+}
+
+@Composable
+private fun DebugBlock(label: String, value: String) {
+    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        Text(label, fontSize = 13.sp, color = TextDim)
+        Text(
+            text = value,
+            modifier = Modifier
+                .fillMaxWidth()
+                .background(Bg, RoundedCornerShape(6.dp))
+                .border(1.dp, Border, RoundedCornerShape(6.dp))
+                .padding(10.dp),
+            fontSize = 11.sp,
+            color = TextPrimary,
+            fontFamily = FontFamily.Monospace,
+            lineHeight = 15.sp,
+        )
+    }
+}
+
+private fun copyToClipboard(context: Context, label: String, value: String) {
+    val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+    clipboard.setPrimaryClip(ClipData.newPlainText(label, value))
 }
