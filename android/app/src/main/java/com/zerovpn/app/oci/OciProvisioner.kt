@@ -206,9 +206,7 @@ class OciProvisioner(
                 val params = session.parameters
 
                 if (uri == "/" || uri.startsWith("/?")) {
-                    val html = """<script>h=window.location.hash;if(h[0]==='#')h=h.substr(1);
-                        var r=new XMLHttpRequest();r.onload=function(){document.write('OK')};
-                        r.open('GET','/token?'+h);r.send();</script>"""
+                    val html = authCallbackPage()
                     return newFixedLengthResponse(NanoHTTPD.Response.Status.OK, "text/html", html)
                 } else if (uri.startsWith("/token")) {
                     val token = params["security_token"]?.firstOrNull()
@@ -272,6 +270,48 @@ class OciProvisioner(
             tenancyOcid = tenancyOcid,
             fingerprint = fingerprint,
         )
+    }
+
+    private fun authCallbackPage(): String {
+        return """
+            <!doctype html>
+            <html>
+            <head>
+              <meta name="viewport" content="width=device-width, initial-scale=1">
+              <title>Oracle sign-in complete</title>
+              <style>
+                body { font-family: sans-serif; margin: 0; padding: 24px; color: #102027; background: #f7f9fb; }
+                main { max-width: 520px; margin: 40px auto; }
+                h1 { font-size: 24px; margin: 0 0 12px; }
+                p { font-size: 16px; line-height: 1.45; }
+                a.button { display: inline-block; margin-top: 16px; padding: 12px 16px; border-radius: 8px; background: #00D1B2; color: #001312; font-weight: 700; text-decoration: none; }
+                .muted { color: #52646d; font-size: 14px; }
+              </style>
+            </head>
+            <body>
+              <main>
+                <h1>Oracle sign-in is complete.</h1>
+                <p>Return to ZeroVPN to continue.</p>
+                <a class="button" href="${OciAuthReturn.CALLBACK_URI}">Open ZeroVPN</a>
+                <p class="muted">If ZeroVPN does not open, use your recent apps button and return to ZeroVPN.</p>
+              </main>
+              <script>
+                (function() {
+                  var h = window.location.hash || "";
+                  if (h.charAt(0) === "#") h = h.substring(1);
+                  if (h.length > 0) {
+                    var r = new XMLHttpRequest();
+                    r.onload = function() {
+                      setTimeout(function() { window.location.href = "${OciAuthReturn.CALLBACK_URI}"; }, 600);
+                    };
+                    r.open("GET", "/token?" + h);
+                    r.send();
+                  }
+                })();
+              </script>
+            </body>
+            </html>
+        """.trimIndent()
     }
 
     // --- Phase 2: Preflight ---

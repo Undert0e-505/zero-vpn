@@ -37,6 +37,7 @@ import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.zerovpn.app.oci.OciAuthReturn
 import com.zerovpn.app.ui.provisioning.ProvisioningViewModel
 import com.zerovpn.app.ui.screens.*
 import com.zerovpn.app.ui.theme.*
@@ -79,6 +80,15 @@ fun NavGraph() {
         provisioningViewModel.initPrefs(context)
     }
 
+    LaunchedEffect(Unit) {
+        OciAuthReturn.returns.collect {
+            provisioningViewModel.markAuthReturned()
+            navController.navigate(Screen.OracleProvision.route) {
+                launchSingleTop = true
+            }
+        }
+    }
+
     LaunchedEffect(configuredExits, selectedExitId) {
         vpnViewModel.reconcile(configuredExits, selectedExitId)
     }
@@ -87,6 +97,7 @@ fun NavGraph() {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
                 vpnViewModel.reconcile(configuredExits, selectedExitId)
+                provisioningViewModel.onAppResumed()
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)

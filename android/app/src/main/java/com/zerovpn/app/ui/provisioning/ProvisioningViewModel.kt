@@ -1,15 +1,25 @@
 package com.zerovpn.app.ui.provisioning
 
 import android.content.Context
+import android.content.Intent
 import android.content.SharedPreferences
+import android.net.Uri
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import androidx.browser.customtabs.CustomTabsIntent
 import com.zerovpn.app.oci.OciProvisioner
 import com.zerovpn.app.vpn.ConfiguredExit
+import com.zerovpn.app.vpn.ExitLifecycleState
+import com.zerovpn.app.vpn.ExitProvider
+import com.zerovpn.app.vpn.OciResourceIds
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
+import org.json.JSONArray
+import org.json.JSONObject
+import java.util.UUID
 
 class ProvisioningViewModel : ViewModel() {
 
@@ -30,6 +40,9 @@ class ProvisioningViewModel : ViewModel() {
 
     private val _isDevMode = MutableStateFlow(true)
     val isDevMode: StateFlow<Boolean> = _isDevMode.asStateFlow()
+
+    private val _oracleOnboardingState = MutableStateFlow(OracleOnboardingState.NotStarted)
+    val oracleOnboardingState: StateFlow<OracleOnboardingState> = _oracleOnboardingState.asStateFlow()
 
     data class SshDebugInfo(
         val publicIp: String,
@@ -61,6 +74,8 @@ class ProvisioningViewModel : ViewModel() {
     private var apiKeyUserOcid: String? = null
     private var apiKeyTenancyOcid: String? = null
     private var apiKeyFingerprint: String? = null
+    private var pendingProvisionExitId: String? = null
+    private var provisioningJob: Job? = null
 
     // State persistence
     private lateinit var prefs: SharedPreferences
@@ -76,12 +91,43 @@ class ProvisioningViewModel : ViewModel() {
     private fun loadPersistedState() {
         if (!::prefs.isInitialized) return
         _isDevMode.value = prefs.getBoolean("is_dev_mode", true)
+        _oracleOnboardingState.value = runCatching {
+            OracleOnboardingState.valueOf(
+                prefs.getString("oracle_onboarding_state", OracleOnboardingState.NotStarted.name)
+                    ?: OracleOnboardingState.NotStarted.name,
+            )
+        }.getOrDefault(OracleOnboardingState.NotStarted)
+        homeRegion = prefs.getString("home_region", null)
+        apiKeyUserOcid = prefs.getString("api_key_user_ocid", null)
+        apiKeyTenancyOcid = prefs.getString("api_key_tenancy_ocid", null)
+        apiKeyFingerprint = prefs.getString("api_key_fingerprint", null)
+
+        val exits = loadConfiguredExits()
+        if (exits.isNotEmpty()) {
+            _configuredExits.value = exits
+            _selectedExitId.value = prefs.getString("selected_exit_id", null)
+                ?.takeIf { id -> exits.any { it.id == id } }
+                ?: exits.first().id
+            val selected = exits.firstOrNull { it.id == _selectedExitId.value } ?: exits.first()
+            _publicIp.value = selected.publicIp
+            _wireGuardPort.value = selected.wireGuardPort
+            clientConfig = selected.wireGuardConfig
+            wireGuardClientPublicKey = selected.clientPublicKey
+            wireGuardServerPublicKey = selected.serverPublicKey
+            wireGuardServerPeerPublicKey = selected.serverPeerPublicKey
+            resourceIds = selected.ociResourceIds?.toProvisionerResourceIds()
+            _state.value = ProvisioningState.Success(
+                publicIp = selected.publicIp,
+                wireGuardPort = selected.wireGuardPort,
+                region = selected.region,
+                isDevMode = _isDevMode.value,
+            )
+            persistState()
+            return
+        }
+
         val stateStr = prefs.getString("state", null)
         if (stateStr != null) {
-            homeRegion = prefs.getString("home_region", null)
-            apiKeyUserOcid = prefs.getString("api_key_user_ocid", null)
-            apiKeyTenancyOcid = prefs.getString("api_key_tenancy_ocid", null)
-            apiKeyFingerprint = prefs.getString("api_key_fingerprint", null)
             val savedIp = prefs.getString("public_ip", null)
             val savedPort = prefs.getInt("wireguard_port", 51820)
             clientConfig = prefs.getString("wireguard_client_config", null)
@@ -94,13 +140,19 @@ class ProvisioningViewModel : ViewModel() {
                 _wireGuardPort.value = savedPort
                 clientConfig?.let {
                     val exit = buildConfiguredExit(
+                        exitId = prefs.getString("selected_exit_id", null) ?: newExitId(),
+                        name = "Exit 1",
                         publicIp = savedIp,
                         wireGuardPort = savedPort,
                         region = homeRegion ?: "uk-london-1",
                         wireGuardConfig = it,
+                        resourceIds = resourceIds,
+                        sshUsername = null,
+                        sshPrivateKey = null,
+                        createdAt = prefs.getLong("created_at", System.currentTimeMillis()),
                     )
                     _configuredExits.value = listOf(exit)
-                    _selectedExitId.value = prefs.getString("selected_exit_id", exit.id) ?: exit.id
+                    _selectedExitId.value = exit.id
                 }
                 _state.value = ProvisioningState.Success(
                     publicIp = savedIp,
@@ -134,6 +186,7 @@ class ProvisioningViewModel : ViewModel() {
                 "resource_instance_id",
             ).forEach { remove(it) }
             putString("state", _state.value::class.simpleName)
+            putString("oracle_onboarding_state", _oracleOnboardingState.value.name)
             putBoolean("is_dev_mode", _isDevMode.value)
             homeRegion?.let { putString("home_region", it) }
             apiKeyUserOcid?.let { putString("api_key_user_ocid", it) }
@@ -146,6 +199,7 @@ class ProvisioningViewModel : ViewModel() {
             wireGuardServerPublicKey?.let { putString("wireguard_server_public_key", it) }
             wireGuardServerPeerPublicKey?.let { putString("wireguard_server_peer_public_key", it) }
             _selectedExitId.value?.let { putString("selected_exit_id", it) }
+            putString("configured_exits_json", serializeConfiguredExits(_configuredExits.value))
             resourceIds?.let { rids ->
                 rids.vcnId?.let { putString("resource_vcn_id", it) }
                 rids.slId?.let { putString("resource_sl_id", it) }
@@ -153,8 +207,26 @@ class ProvisioningViewModel : ViewModel() {
                 rids.igwId?.let { putString("resource_igw_id", it) }
                 rids.instanceId?.let { putString("resource_instance_id", it) }
             }
-            // No secrets stored
+            // OCI API keys are owned per exit. Destroy deletes only the saved fingerprint
+            // for the target exit after relogin; other exits' signing keys are preserved.
+            // SSH debug private keys stay in memory for the provisioning session only.
         }.apply()
+    }
+
+    private fun loadConfiguredExits(): List<ConfiguredExit> {
+        val raw = prefs.getString("configured_exits_json", null)?.takeIf { it.isNotBlank() }
+            ?: return emptyList()
+        return runCatching {
+            val array = JSONArray(raw)
+            buildList {
+                for (i in 0 until array.length()) {
+                    val json = array.getJSONObject(i)
+                    add(json.toConfiguredExit())
+                }
+            }
+        }.getOrElse {
+            emptyList()
+        }
     }
 
     private fun loadResourceIds(): OciProvisioner.ResourceIds? {
@@ -181,18 +253,18 @@ class ProvisioningViewModel : ViewModel() {
 
     fun showPreStart() {
         _state.value = ProvisioningState.PreStart
+        _oracleOnboardingState.value = OracleOnboardingState.NotStarted
+        persistState()
     }
 
     fun prepareNewProvisioningFlow() {
-        if (_state.value is ProvisioningState.Success || _state.value is ProvisioningState.Running || _state.value is ProvisioningState.Destroying) {
+        if (_state.value is ProvisioningState.Running || _state.value is ProvisioningState.Destroying) {
             return
         }
         _events.value = emptyList()
         _currentPhase.value = null
         _publicIp.value = null
         _wireGuardPort.value = 51820
-        _configuredExits.value = emptyList()
-        _selectedExitId.value = null
         _sshDebugInfo.value = null
         provisioner = null
         authResult = null
@@ -206,26 +278,82 @@ class ProvisioningViewModel : ViewModel() {
         apiKeyUserOcid = null
         apiKeyTenancyOcid = null
         apiKeyFingerprint = null
+        pendingProvisionExitId = null
         _state.value = ProvisioningState.PreStart
+        _oracleOnboardingState.value = OracleOnboardingState.NotStarted
+        persistState()
+    }
+
+    fun launchOracleSignup(context: Context) {
+        _oracleOnboardingState.value = OracleOnboardingState.SignupLaunched
+        persistState()
+        openUrl(context, ORACLE_SIGNUP_URL)
+    }
+
+    fun acknowledgeAccountCreated() {
+        _oracleOnboardingState.value = OracleOnboardingState.ReadyToAuthenticate
+        persistState()
+    }
+
+    fun markAuthReturned() {
+        if (_oracleOnboardingState.value == OracleOnboardingState.AuthLaunched ||
+            _oracleOnboardingState.value == OracleOnboardingState.WaitingForAuthReturn
+        ) {
+            _oracleOnboardingState.value = OracleOnboardingState.AuthReturned
+            persistState()
+        }
+    }
+
+    fun onAppResumed() {
+        if (_oracleOnboardingState.value == OracleOnboardingState.SignupLaunched) {
+            _oracleOnboardingState.value = OracleOnboardingState.WaitingForAccountSetup
+            persistState()
+        } else if (_oracleOnboardingState.value == OracleOnboardingState.AuthLaunched) {
+            _oracleOnboardingState.value = OracleOnboardingState.WaitingForAuthReturn
+            persistState()
+        }
     }
 
     fun cancel() {
-        _state.value = ProvisioningState.Idle
         _events.value = emptyList()
         _currentPhase.value = null
         _publicIp.value = null
-        _configuredExits.value = emptyList()
-        _selectedExitId.value = null
         _sshDebugInfo.value = null
         clientConfig = null
         wireGuardClientPublicKey = null
         wireGuardServerPublicKey = null
         wireGuardServerPeerPublicKey = null
+        resourceIds = null
+        authResult = null
+        preflightResult = null
+        pendingProvisionExitId = null
+        provisioningJob?.cancel()
+        provisioningJob = null
+        _oracleOnboardingState.value = OracleOnboardingState.NotStarted
+        restoreStateFromSelectedExitOrIdle()
         persistState()
     }
 
     fun selectExit(exitId: String?) {
         _selectedExitId.value = exitId?.takeIf { id -> _configuredExits.value.any { it.id == id } }
+            ?: _configuredExits.value.firstOrNull()?.id
+        val selected = _configuredExits.value.firstOrNull { it.id == _selectedExitId.value }
+        if (selected != null) {
+            _publicIp.value = selected.publicIp
+            _wireGuardPort.value = selected.wireGuardPort
+            clientConfig = selected.wireGuardConfig
+            resourceIds = selected.ociResourceIds?.toProvisionerResourceIds()
+            apiKeyUserOcid = selected.apiKeyUserOcid
+            apiKeyTenancyOcid = selected.apiKeyTenancyOcid
+            apiKeyFingerprint = selected.apiKeyFingerprint
+            _sshDebugInfo.value = selected.sshPrivateKey?.let {
+                SshDebugInfo(
+                    publicIp = selected.publicIp,
+                    username = selected.sshUsername ?: "ubuntu",
+                    privateKey = it,
+                )
+            }
+        }
         persistState()
     }
 
@@ -236,6 +364,7 @@ class ProvisioningViewModel : ViewModel() {
 
     fun startProvisioning(context: Context) {
         if (_state.value is ProvisioningState.Running) return
+        _oracleOnboardingState.value = OracleOnboardingState.AuthLaunched
         // Read the latest dev mode setting from SharedPreferences
         if (::prefs.isInitialized) {
             _isDevMode.value = prefs.getBoolean("is_dev_mode", true)
@@ -247,7 +376,9 @@ class ProvisioningViewModel : ViewModel() {
         wireGuardServerPublicKey = null
         wireGuardServerPeerPublicKey = null
         _state.value = ProvisioningState.Running
-        viewModelScope.launch {
+        persistState()
+        provisioningJob?.cancel()
+        provisioningJob = viewModelScope.launch {
             runProvisioning(context)
         }
     }
@@ -264,8 +395,11 @@ class ProvisioningViewModel : ViewModel() {
         wireGuardClientPublicKey = null
         wireGuardServerPublicKey = null
         wireGuardServerPeerPublicKey = null
+        _oracleOnboardingState.value = OracleOnboardingState.AuthLaunched
         _state.value = ProvisioningState.Running
-        viewModelScope.launch {
+        persistState()
+        provisioningJob?.cancel()
+        provisioningJob = viewModelScope.launch {
             runProvisioning(context)
         }
     }
@@ -277,13 +411,27 @@ class ProvisioningViewModel : ViewModel() {
         }
     }
 
-    fun destroyNode(context: Context) {
+    fun destroyNode(context: Context, exitId: String? = _selectedExitId.value) {
+        val targetExit = exitId?.let { id -> _configuredExits.value.firstOrNull { it.id == id } }
         _state.value = ProvisioningState.Destroying
+        if (targetExit != null) {
+            updateExit(targetExit.id) { it.copy(lifecycleState = ExitLifecycleState.DESTROYING, lastError = null) }
+        }
         viewModelScope.launch {
-            val currentRids = resourceIds ?: loadResourceIds()
-            val currentRegion = homeRegion ?: "uk-london-1"
+            val currentRids = targetExit?.ociResourceIds?.toProvisionerResourceIds() ?: resourceIds ?: loadResourceIds()
+            val currentRegion = targetExit?.region ?: homeRegion ?: "uk-london-1"
+            val currentApiKeyUserOcid = targetExit?.apiKeyUserOcid ?: apiKeyUserOcid
+            val currentApiKeyFingerprint = targetExit?.apiKeyFingerprint ?: apiKeyFingerprint
 
             if (currentRids == null) {
+                targetExit?.let {
+                    updateExit(it.id) { exit ->
+                        exit.copy(
+                            lifecycleState = ExitLifecycleState.FAILED,
+                            lastError = "Local resource IDs are missing. Delete the node resources manually in the Oracle Console.",
+                        )
+                    }
+                }
                 _state.value = ProvisioningState.Failure(
                     failedPhase = Phase.DONE,
                     lastSuccessPhase = null,
@@ -314,16 +462,20 @@ class ProvisioningViewModel : ViewModel() {
                     rids = currentRids,
                     auth = currentAuth,
                     homeRegion = currentRegion,
-                    apiKeyUserOcid = apiKeyUserOcid,
-                    apiKeyFingerprint = apiKeyFingerprint,
+                    apiKeyUserOcid = currentApiKeyUserOcid,
+                    apiKeyFingerprint = currentApiKeyFingerprint,
                 )
                 emit(Phase.DONE, Status.SUCCESS, "Node destroyed. Resources released.")
                 _state.value = ProvisioningState.Destroyed
                 _events.value = emptyList()
                 _currentPhase.value = null
                 _publicIp.value = null
-                _configuredExits.value = emptyList()
-                _selectedExitId.value = null
+                targetExit?.let { removed ->
+                    _configuredExits.value = _configuredExits.value.filterNot { it.id == removed.id }
+                    if (_selectedExitId.value == removed.id) {
+                        _selectedExitId.value = _configuredExits.value.firstOrNull()?.id
+                    }
+                }
                 _sshDebugInfo.value = null
                 resourceIds = null
                 clientConfig = null
@@ -335,9 +487,17 @@ class ProvisioningViewModel : ViewModel() {
                 apiKeyTenancyOcid = null
                 apiKeyFingerprint = null
                 if (::prefs.isInitialized) {
-                    prefs.edit().clear().apply()
+                    persistState()
                 }
             } catch (e: Exception) {
+                targetExit?.let {
+                    updateExit(it.id) { exit ->
+                        exit.copy(
+                            lifecycleState = ExitLifecycleState.FAILED,
+                            lastError = e.message,
+                        )
+                    }
+                }
                 _state.value = ProvisioningState.Failure(
                     failedPhase = _currentPhase.value ?: Phase.DONE,
                     lastSuccessPhase = null,
@@ -374,14 +534,14 @@ class ProvisioningViewModel : ViewModel() {
             _events.value = emptyList()
             _currentPhase.value = null
             _publicIp.value = null
-            _configuredExits.value = emptyList()
-            _selectedExitId.value = null
             _sshDebugInfo.value = null
             resourceIds = null
             clientConfig = null
             wireGuardClientPublicKey = null
             wireGuardServerPublicKey = null
             wireGuardServerPeerPublicKey = null
+            pendingProvisionExitId = null
+            restoreStateFromSelectedExitOrIdle()
             persistState()
         }
     }
@@ -404,6 +564,8 @@ class ProvisioningViewModel : ViewModel() {
             // Phase 1: Auth
             _currentPhase.value = Phase.AUTH
             authResult = prov.authenticate()
+            _oracleOnboardingState.value = OracleOnboardingState.ReadyToProvision
+            persistState()
 
             // Phase 2: Preflight
             _currentPhase.value = Phase.API_KEY
@@ -447,6 +609,9 @@ class ProvisioningViewModel : ViewModel() {
                 lastSuccessPhase = lastSuccess,
                 errorMessage = e.message,
             )
+            if (_currentPhase.value == Phase.AUTH) {
+                _oracleOnboardingState.value = OracleOnboardingState.AuthFailed
+            }
             persistState()
         }
     }
@@ -500,12 +665,18 @@ class ProvisioningViewModel : ViewModel() {
                 privateKey = result.sshPrivateKey,
             )
             val configuredExit = buildConfiguredExit(
+                exitId = pendingProvisionExitId ?: newExitId(),
+                name = nextExitName(),
                 publicIp = result.publicIp,
                 wireGuardPort = result.wireGuardPort,
                 region = homeRegion ?: "uk-london-1",
                 wireGuardConfig = result.clientConfig,
+                resourceIds = rids,
+                sshUsername = result.sshUsername,
+                sshPrivateKey = result.sshPrivateKey,
+                createdAt = System.currentTimeMillis(),
             )
-            _configuredExits.value = listOf(configuredExit)
+            _configuredExits.value = _configuredExits.value + configuredExit
             _selectedExitId.value = configuredExit.id
 
             _currentPhase.value = Phase.DONE
@@ -515,6 +686,7 @@ class ProvisioningViewModel : ViewModel() {
                 region = homeRegion ?: "uk-london-1",
                 isDevMode = _isDevMode.value,
             )
+            _oracleOnboardingState.value = OracleOnboardingState.NotStarted
             persistState()
         } catch (e: Exception) {
             _state.value = ProvisioningState.Failure(
@@ -522,7 +694,24 @@ class ProvisioningViewModel : ViewModel() {
                 lastSuccessPhase = null,
                 errorMessage = e.message,
             )
+            if (_currentPhase.value == Phase.AUTH) {
+                _oracleOnboardingState.value = OracleOnboardingState.AuthFailed
+            }
             persistState()
+        }
+    }
+
+    private fun openUrl(context: Context, url: String) {
+        val uri = Uri.parse(url)
+        runCatching {
+            val customTabsIntent = CustomTabsIntent.Builder()
+                .setShowTitle(true)
+                .build()
+            customTabsIntent.intent.flags = Intent.FLAG_ACTIVITY_NEW_TASK
+            customTabsIntent.launchUrl(context, uri)
+        }.getOrElse {
+            val intent = Intent(Intent.ACTION_VIEW, uri).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            context.startActivity(intent)
         }
     }
 
@@ -537,17 +726,35 @@ class ProvisioningViewModel : ViewModel() {
     }
 
     private fun buildConfiguredExit(
+        exitId: String,
+        name: String,
         publicIp: String,
         wireGuardPort: Int,
         region: String,
         wireGuardConfig: String,
+        resourceIds: OciProvisioner.ResourceIds?,
+        sshUsername: String?,
+        sshPrivateKey: String?,
+        createdAt: Long,
     ): ConfiguredExit = ConfiguredExit(
-        id = "oracle:$publicIp:$wireGuardPort",
-        name = "Oracle Cloud Exit",
+        id = exitId,
+        name = name,
         publicIp = publicIp,
         wireGuardPort = wireGuardPort,
         region = region,
         wireGuardConfig = wireGuardConfig,
+        provider = ExitProvider.OCI,
+        endpointHost = publicIp,
+        endpointPort = wireGuardPort,
+        instanceId = resourceIds?.instanceId,
+        sshUsername = sshUsername,
+        sshPrivateKey = sshPrivateKey,
+        apiKeyUserOcid = apiKeyUserOcid,
+        apiKeyTenancyOcid = apiKeyTenancyOcid,
+        apiKeyFingerprint = apiKeyFingerprint,
+        lifecycleState = ExitLifecycleState.READY,
+        createdAt = createdAt,
+        ociResourceIds = resourceIds?.toConfiguredResourceIds(),
         serverPublicKey = wireGuardServerPublicKey ?: parseWireGuardValue(wireGuardConfig, "Peer", "PublicKey"),
         serverPeerPublicKey = wireGuardServerPeerPublicKey ?: wireGuardClientPublicKey,
         clientPublicKey = wireGuardClientPublicKey,
@@ -564,5 +771,147 @@ class ProvisioningViewModel : ViewModel() {
             ?.substringAfter("=")
             ?.trim()
             ?.takeIf { it.isNotBlank() }
+    }
+
+    private fun restoreStateFromSelectedExitOrIdle() {
+        val selected = _selectedExitId.value?.let { id -> _configuredExits.value.firstOrNull { it.id == id } }
+            ?: _configuredExits.value.firstOrNull()
+        if (selected == null) {
+            _selectedExitId.value = null
+            _state.value = ProvisioningState.Idle
+            return
+        }
+        _selectedExitId.value = selected.id
+        _publicIp.value = selected.publicIp
+        _wireGuardPort.value = selected.wireGuardPort
+        _state.value = ProvisioningState.Success(
+            publicIp = selected.publicIp,
+            wireGuardPort = selected.wireGuardPort,
+            region = selected.region,
+            isDevMode = _isDevMode.value,
+        )
+    }
+
+    private fun updateExit(exitId: String, transform: (ConfiguredExit) -> ConfiguredExit) {
+        _configuredExits.value = _configuredExits.value.map { exit ->
+            if (exit.id == exitId) transform(exit) else exit
+        }
+        persistState()
+    }
+
+    private fun nextExitName(): String {
+        val used = _configuredExits.value.mapNotNull { exit ->
+            Regex("""^Exit (\d+)$""").matchEntire(exit.name)?.groupValues?.getOrNull(1)?.toIntOrNull()
+        }
+        return "Exit ${((used.maxOrNull() ?: 0) + 1)}"
+    }
+
+    private fun newExitId(): String = "oci:${UUID.randomUUID()}"
+
+    private fun OciProvisioner.ResourceIds.toConfiguredResourceIds(): OciResourceIds = OciResourceIds(
+        vcnId = vcnId,
+        securityListId = slId,
+        subnetId = subnetId,
+        internetGatewayId = igwId,
+        instanceId = instanceId,
+    )
+
+    private fun OciResourceIds.toProvisionerResourceIds(): OciProvisioner.ResourceIds = OciProvisioner.ResourceIds(
+        vcnId = vcnId,
+        slId = securityListId,
+        subnetId = subnetId,
+        igwId = internetGatewayId,
+        instanceId = instanceId,
+    )
+
+    private fun serializeConfiguredExits(exits: List<ConfiguredExit>): String {
+        val array = JSONArray()
+        exits.sortedBy { it.createdAt }.forEach { exit ->
+            array.put(exit.toJson())
+        }
+        return array.toString()
+    }
+
+    private fun ConfiguredExit.toJson(): JSONObject = JSONObject()
+        .put("id", id)
+        .put("name", name)
+        .put("provider", provider.name)
+        .put("publicIp", publicIp)
+        .put("wireGuardPort", wireGuardPort)
+        .put("region", region)
+        .put("wireGuardConfig", wireGuardConfig)
+        .put("endpointHost", endpointHost)
+        .put("endpointPort", endpointPort)
+        .put("compartmentId", compartmentId)
+        .put("instanceId", instanceId)
+        .put("sshUsername", sshUsername)
+        .put("sshPrivateKey", JSONObject.NULL)
+        .put("apiKeyUserOcid", apiKeyUserOcid)
+        .put("apiKeyTenancyOcid", apiKeyTenancyOcid)
+        .put("apiKeyFingerprint", apiKeyFingerprint)
+        .put("lifecycleState", lifecycleState.name)
+        .put("createdAt", createdAt)
+        .put("lastConnectedAt", lastConnectedAt)
+        .put("lastError", lastError)
+        .put("serverPublicKey", serverPublicKey)
+        .put("serverPeerPublicKey", serverPeerPublicKey)
+        .put("clientPublicKey", clientPublicKey)
+        .put("ociResourceIds", ociResourceIds?.toJson())
+
+    private fun OciResourceIds.toJson(): JSONObject = JSONObject()
+        .put("vcnId", vcnId)
+        .put("securityListId", securityListId)
+        .put("subnetId", subnetId)
+        .put("internetGatewayId", internetGatewayId)
+        .put("instanceId", instanceId)
+
+    private fun JSONObject.toConfiguredExit(): ConfiguredExit {
+        val resourceJson = optJSONObject("ociResourceIds")
+        return ConfiguredExit(
+            id = getString("id"),
+            name = optString("name").takeIf { it.isNotBlank() } ?: "Exit 1",
+            provider = runCatching { ExitProvider.valueOf(optString("provider", ExitProvider.OCI.name)) }.getOrDefault(ExitProvider.OCI),
+            publicIp = getString("publicIp"),
+            wireGuardPort = optInt("wireGuardPort", 51820),
+            region = optString("region", "uk-london-1"),
+            wireGuardConfig = getString("wireGuardConfig"),
+            endpointHost = optString("endpointHost").takeIf { it.isNotBlank() } ?: getString("publicIp"),
+            endpointPort = optInt("endpointPort", optInt("wireGuardPort", 51820)),
+            compartmentId = optNullableString("compartmentId"),
+            instanceId = optNullableString("instanceId"),
+            sshUsername = optNullableString("sshUsername"),
+            sshPrivateKey = optNullableString("sshPrivateKey"),
+            apiKeyUserOcid = optNullableString("apiKeyUserOcid"),
+            apiKeyTenancyOcid = optNullableString("apiKeyTenancyOcid"),
+            apiKeyFingerprint = optNullableString("apiKeyFingerprint"),
+            lifecycleState = runCatching {
+                ExitLifecycleState.valueOf(optString("lifecycleState", ExitLifecycleState.READY.name))
+            }.getOrDefault(ExitLifecycleState.READY),
+            createdAt = optLong("createdAt", System.currentTimeMillis()),
+            lastConnectedAt = optLongOrNull("lastConnectedAt"),
+            lastError = optNullableString("lastError"),
+            ociResourceIds = resourceJson?.let {
+                OciResourceIds(
+                    vcnId = it.optNullableString("vcnId"),
+                    securityListId = it.optNullableString("securityListId"),
+                    subnetId = it.optNullableString("subnetId"),
+                    internetGatewayId = it.optNullableString("internetGatewayId"),
+                    instanceId = it.optNullableString("instanceId"),
+                )
+            },
+            serverPublicKey = optNullableString("serverPublicKey"),
+            serverPeerPublicKey = optNullableString("serverPeerPublicKey"),
+            clientPublicKey = optNullableString("clientPublicKey"),
+        )
+    }
+
+    private fun JSONObject.optNullableString(name: String): String? =
+        if (has(name) && !isNull(name)) optString(name).takeIf { it.isNotBlank() } else null
+
+    private fun JSONObject.optLongOrNull(name: String): Long? =
+        if (has(name) && !isNull(name)) optLong(name) else null
+
+    companion object {
+        const val ORACLE_SIGNUP_URL = "https://signup.oraclecloud.com/"
     }
 }

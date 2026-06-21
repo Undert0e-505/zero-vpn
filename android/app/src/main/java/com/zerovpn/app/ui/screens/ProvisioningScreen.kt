@@ -23,6 +23,9 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -32,6 +35,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.zerovpn.app.ui.provisioning.OracleOnboardingState
 import com.zerovpn.app.ui.provisioning.Phase
 import com.zerovpn.app.ui.provisioning.ProvisioningEvent
 import com.zerovpn.app.ui.provisioning.ProvisioningState
@@ -60,6 +64,7 @@ fun ProvisioningScreen(
     val publicIp by viewModel.publicIp.collectAsState()
     val wireGuardPort by viewModel.wireGuardPort.collectAsState()
     val isDevMode by viewModel.isDevMode.collectAsState()
+    val onboardingState by viewModel.oracleOnboardingState.collectAsState()
     val context = LocalContext.current
 
     // Initialize prefs on first composition
@@ -89,7 +94,7 @@ fun ProvisioningScreen(
             )
             Spacer(modifier = Modifier.width(12.dp))
             Text(
-                text = "ORACLE PROVISIONING",
+                text = "Create Oracle Free Exit",
                 style = SectionTitleStyle,
             )
             Spacer(modifier = Modifier.weight(1f))
@@ -97,24 +102,46 @@ fun ProvisioningScreen(
 
         when (val s = state) {
             is ProvisioningState.Idle -> {
-                PreStartContent(
-                    onStart = { viewModel.startProvisioning(context) },
+                OracleOnboardingContent(
+                    onboardingState = onboardingState,
+                    onExistingAccount = { viewModel.startProvisioning(context) },
+                    onCreateAccount = { viewModel.launchOracleSignup(context) },
+                    onAccountCreated = {
+                        viewModel.acknowledgeAccountCreated()
+                        viewModel.startProvisioning(context)
+                    },
                     onCancel = { viewModel.cancel(); onBack() },
                 )
             }
 
             is ProvisioningState.PreStart -> {
-                PreStartContent(
-                    onStart = { viewModel.startProvisioning(context) },
+                OracleOnboardingContent(
+                    onboardingState = onboardingState,
+                    onExistingAccount = { viewModel.startProvisioning(context) },
+                    onCreateAccount = { viewModel.launchOracleSignup(context) },
+                    onAccountCreated = {
+                        viewModel.acknowledgeAccountCreated()
+                        viewModel.startProvisioning(context)
+                    },
                     onCancel = { viewModel.cancel(); onBack() },
                 )
             }
 
             is ProvisioningState.Running -> {
-                ProgressContent(
-                    events = events,
-                    currentPhase = currentPhase,
-                )
+                if (currentPhase == Phase.AUTH) {
+                    AuthWaitingContent(
+                        events = events,
+                        onboardingState = onboardingState,
+                        onContinue = { viewModel.onAppResumed() },
+                        onRetry = { viewModel.retry(context) },
+                        onBack = { viewModel.cancel(); onBack() },
+                    )
+                } else {
+                    ProgressContent(
+                        events = events,
+                        currentPhase = currentPhase,
+                    )
+                }
             }
 
             is ProvisioningState.UkWarning -> {
@@ -172,34 +199,103 @@ fun ProvisioningScreen(
 // -- Pre-start -------------------------------------------------
 
 @Composable
-private fun PreStartContent(
-    onStart: () -> Unit,
+private fun OracleOnboardingContent(
+    onboardingState: OracleOnboardingState,
+    onExistingAccount: () -> Unit,
+    onCreateAccount: () -> Unit,
+    onAccountCreated: () -> Unit,
     onCancel: () -> Unit,
 ) {
+    var showNext by remember { mutableStateOf(false) }
     Column(
         modifier = Modifier.fillMaxWidth(),
         verticalArrangement = Arrangement.spacedBy(16.dp),
     ) {
         Text(
-            text = "Before you start",
+            text = "Create Oracle Free Exit",
             fontSize = 18.sp,
             fontWeight = FontWeight.SemiBold,
             color = TextPrimary,
         )
 
+        Text(
+            text = "ZeroVPN creates your own Oracle Always Free VM and turns it into a WireGuard exit. To do that, you need an Oracle Cloud account.",
+            fontSize = 14.sp,
+            color = TextDim,
+            lineHeight = 20.sp,
+        )
+
+        if (onboardingState == OracleOnboardingState.WaitingForAccountSetup ||
+            onboardingState == OracleOnboardingState.ReadyToAuthenticate
+        ) {
+            Text(
+                text = "When Oracle account setup is complete, continue here.",
+                fontSize = 14.sp,
+                color = TextPrimary,
+                lineHeight = 20.sp,
+            )
+            Button(
+                onClick = onAccountCreated,
+                modifier = Modifier.fillMaxWidth().height(48.dp),
+                shape = RoundedCornerShape(8.dp),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = Accent,
+                    contentColor = Bg,
+                ),
+            ) {
+                Text("I've created my account - continue", fontSize = 14.sp, fontWeight = FontWeight.Bold)
+            }
+        }
+
         Column(
             verticalArrangement = Arrangement.spacedBy(10.dp),
             modifier = Modifier.fillMaxWidth(),
         ) {
-            BulletPoint("Oracle signup or login may be required")
-            BulletPoint("Oracle may require card and 2FA")
-            BulletPoint("ZeroVPN never sees your Oracle password, card, 2FA, or cookies")
-            BulletPoint("Home region cannot be changed later")
-            BulletPoint("UK London region: dev/test mode only. This validates the pipeline but is not a non-UK exit.")
-            BulletPoint("Setup takes 4-6 minutes")
+            Button(
+                onClick = onExistingAccount,
+                modifier = Modifier.fillMaxWidth().height(48.dp),
+                shape = RoundedCornerShape(8.dp),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = Accent,
+                    contentColor = Bg,
+                ),
+            ) {
+                Text("I already have an Oracle Cloud account", fontSize = 13.sp, fontWeight = FontWeight.Bold)
+            }
+            OutlinedButton(
+                onClick = onCreateAccount,
+                modifier = Modifier.fillMaxWidth().height(48.dp),
+                shape = RoundedCornerShape(8.dp),
+                colors = ButtonDefaults.outlinedButtonColors(
+                    contentColor = Accent,
+                ),
+            ) {
+                Text("Create a free Oracle Cloud account", fontSize = 13.sp, fontWeight = FontWeight.Medium)
+            }
+            OutlinedButton(
+                onClick = { showNext = !showNext },
+                modifier = Modifier.fillMaxWidth().height(48.dp),
+                shape = RoundedCornerShape(8.dp),
+                colors = ButtonDefaults.outlinedButtonColors(
+                    contentColor = TextDim,
+                ),
+            ) {
+                Text("What happens next?", fontSize = 14.sp, fontWeight = FontWeight.Medium)
+            }
         }
 
-        Spacer(modifier = Modifier.height(8.dp))
+        if (showNext) {
+            Column(
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                BulletPoint("Oracle may ask for email, phone, or payment verification.")
+                BulletPoint("Oracle may require MFA or two-factor authentication setup.")
+                BulletPoint("Complete those steps in Oracle.")
+                BulletPoint("Return to ZeroVPN.")
+                BulletPoint("ZeroVPN will then create the API key and provision the Always Free VM exit.")
+            }
+        }
 
         Row(
             modifier = Modifier.fillMaxWidth(),
@@ -214,17 +310,6 @@ private fun PreStartContent(
                 ),
             ) {
                 Text("Cancel", fontSize = 14.sp, fontWeight = FontWeight.Medium)
-            }
-            Button(
-                onClick = onStart,
-                modifier = Modifier.weight(1f).height(48.dp),
-                shape = RoundedCornerShape(8.dp),
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = Accent,
-                    contentColor = Bg,
-                ),
-            ) {
-                Text("Start", fontSize = 14.sp, fontWeight = FontWeight.Bold)
             }
         }
     }
@@ -250,6 +335,88 @@ private fun BulletPoint(text: String) {
             lineHeight = 20.sp,
             modifier = Modifier.weight(1f),
         )
+    }
+}
+
+@Composable
+private fun AuthWaitingContent(
+    events: List<ProvisioningEvent>,
+    onboardingState: OracleOnboardingState,
+    onContinue: () -> Unit,
+    onRetry: () -> Unit,
+    onBack: () -> Unit,
+) {
+    Column(
+        modifier = Modifier.fillMaxWidth(),
+        verticalArrangement = Arrangement.spacedBy(16.dp),
+    ) {
+        Text(
+            text = "Complete Oracle sign-in in your browser.",
+            fontSize = 18.sp,
+            fontWeight = FontWeight.SemiBold,
+            color = TextPrimary,
+        )
+        Text(
+            text = if (onboardingState == OracleOnboardingState.AuthReturned) {
+                "Oracle returned to ZeroVPN. Continuing setup..."
+            } else {
+                "After sign-in, ZeroVPN should return here automatically. If it does not, switch back to ZeroVPN and tap Continue."
+            },
+            fontSize = 14.sp,
+            color = TextDim,
+            lineHeight = 20.sp,
+        )
+        if (onboardingState == OracleOnboardingState.WaitingForAuthReturn) {
+            Text(
+                text = "Still waiting for Oracle sign-in to complete.",
+                fontSize = 14.sp,
+                color = WarningYellow,
+                lineHeight = 20.sp,
+            )
+        }
+        val latestEvent = events.lastOrNull()
+        Text(
+            text = latestEvent?.message ?: "Opening Oracle sign-in...",
+            fontSize = 13.sp,
+            fontFamily = FontFamily.Monospace,
+            color = if (latestEvent?.status == Status.ERROR) Danger else Accent,
+            modifier = Modifier
+                .fillMaxWidth()
+                .background(Surface, RoundedCornerShape(8.dp))
+                .padding(12.dp),
+        )
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            OutlinedButton(
+                onClick = onBack,
+                modifier = Modifier.weight(1f).height(48.dp),
+                shape = RoundedCornerShape(8.dp),
+                colors = ButtonDefaults.outlinedButtonColors(contentColor = TextDim),
+            ) {
+                Text("Back", fontSize = 14.sp, fontWeight = FontWeight.Medium)
+            }
+            OutlinedButton(
+                onClick = onRetry,
+                modifier = Modifier.weight(1f).height(48.dp),
+                shape = RoundedCornerShape(8.dp),
+                colors = ButtonDefaults.outlinedButtonColors(contentColor = Accent),
+            ) {
+                Text("Open Oracle sign-in again", fontSize = 12.sp, fontWeight = FontWeight.Medium)
+            }
+        }
+        Button(
+            onClick = onContinue,
+            modifier = Modifier.fillMaxWidth().height(48.dp),
+            shape = RoundedCornerShape(8.dp),
+            colors = ButtonDefaults.buttonColors(
+                containerColor = Accent,
+                contentColor = Bg,
+            ),
+        ) {
+            Text("I've finished signing in - continue", fontSize = 14.sp, fontWeight = FontWeight.Bold)
+        }
     }
 }
 
@@ -673,13 +840,13 @@ private fun DestroyedContent(
             modifier = Modifier.size(48.dp),
         )
         Text(
-            text = "Node destroyed",
+            text = "Exit destroyed",
             fontSize = 18.sp,
             fontWeight = FontWeight.SemiBold,
             color = TextPrimary,
         )
         Text(
-            text = "All resources have been released.",
+            text = "This exit's resources have been released.",
             fontSize = 14.sp,
             color = TextDim,
         )
