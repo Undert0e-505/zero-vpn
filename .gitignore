@@ -47,6 +47,7 @@ oci/config
 # Project brief (internal, not for public release)
 PROJECT_BRIEF.md
 harness/oci-key.pem
+harness/oci-key.pub
 harness/token.txt
 harness/oci-config.txt
 harness/auth-state.json
