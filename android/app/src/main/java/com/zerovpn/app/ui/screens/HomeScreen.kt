@@ -37,6 +37,7 @@ import kotlinx.coroutines.launch
 @Composable
 fun HomeScreen(
     snackbarHostState: SnackbarHostState,
+    onDestroyStarted: () -> Unit,
     modifier: Modifier = Modifier,
     viewModel: ProvisioningViewModel = viewModel(),
 ) {
@@ -69,6 +70,7 @@ fun HomeScreen(
                 TextButton(onClick = {
                     showDestroyDialog = false
                     viewModel.destroyNode(context)
+                    onDestroyStarted()
                 }) {
                     Text("Destroy", color = Danger)
                 }

@@ -34,6 +34,8 @@ import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
+import androidx.lifecycle.viewmodel.compose.viewModel
+import com.zerovpn.app.ui.provisioning.ProvisioningViewModel
 import com.zerovpn.app.ui.screens.*
 import com.zerovpn.app.ui.theme.*
 
@@ -58,6 +60,7 @@ private val screens = listOf(
 fun NavGraph() {
     val navController = rememberNavController()
     val snackbarHostState = remember { SnackbarHostState() }
+    val provisioningViewModel: ProvisioningViewModel = viewModel()
 
     val navBackStackEntry by navController.currentBackStackEntryAsState()
     val currentDestination = navBackStackEntry?.destination
@@ -116,7 +119,11 @@ fun NavGraph() {
             modifier = Modifier.padding(innerPadding),
         ) {
             composable(Screen.Home.route) {
-                HomeScreen(snackbarHostState = snackbarHostState)
+                HomeScreen(
+                    snackbarHostState = snackbarHostState,
+                    viewModel = provisioningViewModel,
+                    onDestroyStarted = { navController.navigate(Screen.OracleProvision.route) },
+                )
             }
             composable(Screen.AddExit.route) {
                 AddExitScreen(
@@ -128,6 +135,7 @@ fun NavGraph() {
                 ProvisioningScreen(
                     snackbarHostState = snackbarHostState,
                     onBack = { navController.popBackStack() },
+                    viewModel = provisioningViewModel,
                 )
             }
             composable(Screen.NodeInvite.route) {
