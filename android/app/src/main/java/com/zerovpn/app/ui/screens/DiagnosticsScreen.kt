@@ -5,7 +5,15 @@ import android.content.ClipboardManager
 import android.content.Context
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
-import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
@@ -14,21 +22,42 @@ import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.zerovpn.app.ui.provisioning.ProvisioningViewModel
-import com.zerovpn.app.ui.theme.*
+import com.zerovpn.app.ui.theme.Accent
+import com.zerovpn.app.ui.theme.Bg
+import com.zerovpn.app.ui.theme.Border
+import com.zerovpn.app.ui.theme.Danger
+import com.zerovpn.app.ui.theme.SectionTitleStyle
+import com.zerovpn.app.ui.theme.Surface
+import com.zerovpn.app.ui.theme.TextDim
+import com.zerovpn.app.ui.theme.TextPrimary
+import com.zerovpn.app.vpn.DnsLeakStatus
+import com.zerovpn.app.vpn.ExitIpStatus
+import com.zerovpn.app.vpn.LastHandshakeStatus
+import com.zerovpn.app.vpn.UserDiagnosticsState
+import com.zerovpn.app.vpn.VpnConnectionState
 import com.zerovpn.app.vpn.VpnDiagnostics
 import com.zerovpn.app.vpn.VpnViewModel
+import java.text.DateFormat
+import java.util.Date
+
+private val DiagnosticsWarning = Color(0xFFFFC107)
 
 @Composable
 fun DiagnosticsScreen(
@@ -37,16 +66,37 @@ fun DiagnosticsScreen(
     vpnViewModel: VpnViewModel = viewModel(),
 ) {
     val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
     val isDevMode by provisioningViewModel.isDevMode.collectAsState()
     val sshDebugInfo by provisioningViewModel.sshDebugInfo.collectAsState()
     val exits by provisioningViewModel.configuredExits.collectAsState()
     val selectedExitId by provisioningViewModel.selectedExitId.collectAsState()
+    val vpnState by vpnViewModel.state.collectAsState()
     val vpnDiagnostics by vpnViewModel.diagnostics.collectAsState()
+    val userDiagnostics by vpnViewModel.userDiagnostics.collectAsState()
     val scrollState = rememberScrollState()
     val selectedExit = exits.firstOrNull { it.id == selectedExitId } ?: exits.singleOrNull()
 
     LaunchedEffect(selectedExit?.id, selectedExit?.wireGuardConfig) {
         selectedExit?.let { vpnViewModel.prepareDiagnostics(it) }
+    }
+
+    LaunchedEffect(vpnState) {
+        vpnViewModel.refreshUserDiagnostics(
+            force = vpnState is VpnConnectionState.Connected || vpnState is VpnConnectionState.ActiveUnknown,
+        )
+    }
+
+    DisposableEffect(lifecycleOwner, vpnState) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                vpnViewModel.refreshUserDiagnostics(force = false)
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+        }
     }
 
     Column(
@@ -65,39 +115,14 @@ fun DiagnosticsScreen(
 
         Spacer(modifier = Modifier.height(4.dp))
 
-        val items = listOf(
-            "Exit IP",
-            "Country",
-            "DNS Leak Check",
-            "Last Handshake",
-            "Logs",
+        ConnectionDiagnosticsCard(
+            vpnState = vpnState,
+            selectedExitName = selectedExit?.name,
+            selectedExitEndpoint = selectedExit?.let { "${it.publicIp}:${it.wireGuardPort}" },
+            diagnostics = vpnDiagnostics,
+            userDiagnostics = userDiagnostics,
+            onRefresh = { vpnViewModel.refreshUserDiagnostics(force = true) },
         )
-
-        for (item in items) {
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .background(Surface, RoundedCornerShape(8.dp))
-                    .border(1.dp, Border, RoundedCornerShape(8.dp))
-                    .padding(horizontal = 16.dp, vertical = 14.dp),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Text(
-                    text = item,
-                    fontSize = 15.sp,
-                    fontWeight = FontWeight.Medium,
-                    color = TextPrimary,
-                )
-                Text(
-                    text = "N/A — not connected",
-                    fontSize = 13.sp,
-                    fontWeight = FontWeight.Normal,
-                    color = TextDim,
-                )
-            }
-            Spacer(modifier = Modifier.height(8.dp))
-        }
 
         if (isDevMode) {
             Spacer(modifier = Modifier.height(12.dp))
@@ -115,6 +140,72 @@ fun DiagnosticsScreen(
                         copyToClipboard(context, "ZeroVPN VM SSH command", command)
                     }
                 },
+            )
+        }
+    }
+}
+
+@Composable
+private fun ConnectionDiagnosticsCard(
+    vpnState: VpnConnectionState,
+    selectedExitName: String?,
+    selectedExitEndpoint: String?,
+    diagnostics: VpnDiagnostics,
+    userDiagnostics: UserDiagnosticsState,
+    onRefresh: () -> Unit,
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(Surface, RoundedCornerShape(8.dp))
+            .border(1.dp, Border, RoundedCornerShape(8.dp))
+            .padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                text = "CONNECTION DIAGNOSTICS",
+                style = SectionTitleStyle,
+            )
+            Button(
+                onClick = onRefresh,
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = Accent,
+                    contentColor = Bg,
+                ),
+            ) {
+                Text("Refresh", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+            }
+        }
+        DebugValue("Connection", connectionText(vpnState))
+        DebugValue("Selected exit", selectedExitName ?: "N/A")
+        DebugValue("Endpoint", diagnostics.endpoint ?: selectedExitEndpoint ?: "N/A")
+        DebugValue("Exit IP", exitIpText(userDiagnostics))
+        DebugValue("Country", countryText(userDiagnostics))
+        DebugValue("DNS Leak Check", dnsLeakText(userDiagnostics))
+        userDiagnostics.dnsLeakDetail?.let { detail ->
+            Text(
+                text = detail,
+                fontSize = 12.sp,
+                color = dnsStatusColor(userDiagnostics.dnsLeakStatus),
+                lineHeight = 17.sp,
+            )
+        }
+        DebugValue("Last Handshake", handshakeText(userDiagnostics))
+        DebugValue("Logs", "Coming later")
+        userDiagnostics.lastUpdated?.let {
+            DebugValue("Last updated", DateFormat.getTimeInstance(DateFormat.MEDIUM).format(Date(it)))
+        }
+        userDiagnostics.userVisibleError?.let { error ->
+            Text(
+                text = "Diagnostic warning: $error",
+                fontSize = 12.sp,
+                color = DiagnosticsWarning,
+                lineHeight = 17.sp,
             )
         }
     }
@@ -264,6 +355,61 @@ private fun DebugBlock(label: String, value: String) {
             lineHeight = 15.sp,
         )
     }
+}
+
+private fun connectionText(vpnState: VpnConnectionState): String = when (vpnState) {
+    is VpnConnectionState.Connected -> "Connected"
+    is VpnConnectionState.ActiveUnknown -> "VPN active"
+    is VpnConnectionState.Connecting -> "Connecting"
+    is VpnConnectionState.Disconnecting -> "Disconnecting"
+    is VpnConnectionState.PermissionRequired -> "Permission required"
+    is VpnConnectionState.Failed -> "Failed"
+    VpnConnectionState.Disconnected -> "Disconnected"
+}
+
+private fun exitIpText(state: UserDiagnosticsState): String = when (state.exitIpStatus) {
+    ExitIpStatus.Idle -> "Not checked"
+    ExitIpStatus.Loading -> "Checking..."
+    ExitIpStatus.Available -> state.exitIp ?: "Available"
+    ExitIpStatus.Failed -> "Unavailable"
+    ExitIpStatus.NotConnected -> "Not connected"
+}
+
+private fun countryText(state: UserDiagnosticsState): String = when (state.exitIpStatus) {
+    ExitIpStatus.Available -> listOfNotNull(state.exitCountry, state.exitProviderOrAsn)
+        .joinToString(" - ")
+        .ifBlank { "Unavailable" }
+    ExitIpStatus.Loading -> "Checking..."
+    ExitIpStatus.NotConnected -> "Not connected"
+    ExitIpStatus.Failed -> "Unavailable"
+    ExitIpStatus.Idle -> "Not checked"
+}
+
+private fun dnsLeakText(state: UserDiagnosticsState): String = when (state.dnsLeakStatus) {
+    DnsLeakStatus.Idle -> "Not checked"
+    DnsLeakStatus.Loading -> "Checking..."
+    DnsLeakStatus.Passed -> "Using configured DNS (${state.dnsResolverSummary ?: "Cloudflare"})"
+    DnsLeakStatus.Warning -> "Check resolver (${state.dnsResolverSummary ?: "unknown"})"
+    DnsLeakStatus.Failed -> "Unavailable"
+    DnsLeakStatus.Unknown -> "Unknown"
+    DnsLeakStatus.NotConnected -> "Not connected"
+}
+
+private fun handshakeText(state: UserDiagnosticsState): String = when (state.lastHandshakeStatus) {
+    LastHandshakeStatus.Available -> state.lastHandshakeText ?: "Available"
+    LastHandshakeStatus.Unavailable -> state.lastHandshakeText ?: "Unavailable"
+    LastHandshakeStatus.NotConnected -> "Not connected"
+}
+
+@Composable
+private fun dnsStatusColor(status: DnsLeakStatus): Color = when (status) {
+    DnsLeakStatus.Passed -> Accent
+    DnsLeakStatus.Warning -> DiagnosticsWarning
+    DnsLeakStatus.Failed -> DiagnosticsWarning
+    DnsLeakStatus.Unknown,
+    DnsLeakStatus.Loading,
+    DnsLeakStatus.Idle,
+    DnsLeakStatus.NotConnected -> TextDim
 }
 
 private fun copyToClipboard(context: Context, label: String, value: String) {

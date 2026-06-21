@@ -69,7 +69,13 @@ fun HomeScreen(
 
     val hasExit = state is ProvisioningState.Success
     val successState = state as? ProvisioningState.Success
-    val activeExitId = (vpnState as? VpnConnectionState.Connected)?.exitId
+    val activeExitId = when (val currentState = vpnState) {
+        is VpnConnectionState.Connected -> currentState.exitId
+        is VpnConnectionState.ActiveUnknown -> vpnDiagnostics.activeExitId
+        else -> null
+    }
+    val vpnIsActive = vpnState is VpnConnectionState.Connected ||
+        vpnState is VpnConnectionState.ActiveUnknown
     val selectedExit = exits.firstOrNull { it.id == selectedExitId }
         ?: exits.singleOrNull()
     val selectedExitIsActive = selectedExit?.id == activeExitId
@@ -81,6 +87,7 @@ fun HomeScreen(
         is VpnConnectionState.Disconnecting -> "Disconnecting"
         is VpnConnectionState.PermissionRequired -> "Waiting for Permission"
         is VpnConnectionState.Connected -> "Disconnect"
+        is VpnConnectionState.ActiveUnknown -> "Disconnect"
         else -> "Connect"
     }
 
@@ -158,10 +165,13 @@ fun HomeScreen(
                 is VpnConnectionState.Disconnecting -> "Disconnecting"
                 is VpnConnectionState.PermissionRequired -> "Permission Required"
                 is VpnConnectionState.Failed -> "Connection Failed"
+                is VpnConnectionState.ActiveUnknown -> "VPN Active"
                 VpnConnectionState.Disconnected -> if (hasExit) "Ready" else "Disconnected"
             },
             modeLabel = if (hasExit) {
                 selectedExit?.let { "${it.name} - WireGuard" } ?: "Select an exit"
+            } else if (vpnState is VpnConnectionState.ActiveUnknown) {
+                "Active tunnel - exit metadata unavailable"
             } else {
                 "No mode selected"
             },
@@ -174,7 +184,7 @@ fun HomeScreen(
                     )
                     if (buttonBusy) {
                         return@launch
-                    } else if (activeExitId != null) {
+                    } else if (vpnIsActive) {
                         vpnViewModel.disconnect()
                     } else if (!hasExit) {
                         snackbarHostState.showSnackbar("No exit configured")
@@ -205,7 +215,7 @@ fun HomeScreen(
                     }
                 }
             },
-            connected = activeExitId != null,
+            connected = vpnIsActive,
             buttonEnabled = !buttonBusy,
         )
 

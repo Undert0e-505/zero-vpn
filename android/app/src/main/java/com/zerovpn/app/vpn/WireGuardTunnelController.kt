@@ -2,6 +2,7 @@ package com.zerovpn.app.vpn
 
 import android.content.Context
 import android.content.Intent
+import android.content.SharedPreferences
 import android.net.VpnService
 import android.util.Log
 import com.wireguard.android.backend.GoBackend
@@ -21,10 +22,18 @@ class WireGuardTunnelController(
 ) {
     private companion object {
         const val TAG = "ZeroVPN/WireGuard"
+        const val PREFS_NAME = "zerovpn_vpn"
+        const val KEY_ACTIVE_EXIT_ID = "active_exit_id"
+        const val KEY_ACTIVE_TUNNEL_NAME = "active_tunnel_name"
+        const val KEY_ACTIVE_ENDPOINT = "active_endpoint"
+        const val KEY_ACTIVE_TUNNEL_ADDRESS = "active_tunnel_address"
+        const val KEY_ACTIVE_SELECTED_EXIT_ID = "active_selected_exit_id"
     }
 
     private val appContext = context.applicationContext
     private val backend by lazy { GoBackend(appContext) }
+    private val prefs: SharedPreferences =
+        appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 
     private val _state = MutableStateFlow<VpnConnectionState>(VpnConnectionState.Disconnected)
     val state: StateFlow<VpnConnectionState> = _state.asStateFlow()
@@ -62,13 +71,102 @@ class WireGuardTunnelController(
     }
 
     fun prepareDiagnostics(exit: ConfiguredExit) {
+        val currentState = _state.value
+        val backendState = if (
+            currentState is VpnConnectionState.Connected && currentState.exitId == exit.id
+        ) {
+            "Connected"
+        } else {
+            "Ready"
+        }
         _diagnostics.value = summarizeRuntimeConfig(
             exit = exit,
             tunnelName = tunnelNameFor(exit),
-            backendState = "Ready",
+            backendState = backendState,
             runtimeConfig = exit.wireGuardConfig,
             configParseStatus = "Not parsed",
         )
+    }
+
+    suspend fun reconcile(exits: List<ConfiguredExit>, selectedExitId: String?) {
+        val persistedTunnelName = prefs.getString(KEY_ACTIVE_TUNNEL_NAME, null)
+        val persistedExitId = prefs.getString(KEY_ACTIVE_EXIT_ID, null)
+        if (persistedTunnelName.isNullOrBlank()) {
+            if (activeTunnel == null && _state.value !is VpnConnectionState.Disconnected) {
+                _state.value = VpnConnectionState.Disconnected
+                _diagnostics.value = _diagnostics.value.copy(backendState = "Disconnected")
+            }
+            return
+        }
+
+        try {
+            val runningNames = withContext(Dispatchers.IO) { backend.runningTunnelNames }
+            val tunnel = activeTunnel ?: ZeroVpnTunnel(persistedTunnelName) { tunnelState ->
+                if (tunnelState == Tunnel.State.DOWN) {
+                    clearActiveState()
+                    _state.value = VpnConnectionState.Disconnected
+                    _diagnostics.value = _diagnostics.value.copy(backendState = "Disconnected")
+                }
+            }
+            val tunnelState = withContext(Dispatchers.IO) { backend.getState(tunnel) }
+            val isRunning = persistedTunnelName in runningNames || tunnelState == Tunnel.State.UP
+
+            if (!isRunning) {
+                Log.d(TAG, "Reconcile cleared stale active VPN metadata for tunnel=$persistedTunnelName")
+                clearActiveState()
+                _state.value = VpnConnectionState.Disconnected
+                _diagnostics.value = _diagnostics.value.copy(
+                    backendState = "Disconnected",
+                    lastError = null,
+                )
+                return
+            }
+
+            activeTunnel = tunnel
+            activeTunnelName = persistedTunnelName
+            activeExitId = persistedExitId
+
+            val matchedExit = exits.firstOrNull { it.id == persistedExitId }
+                ?: exits.firstOrNull { it.id == selectedExitId }
+                ?: exits.singleOrNull()
+            if (matchedExit != null && matchedExit.id == persistedExitId) {
+                val summary = summarizeRuntimeConfig(
+                    exit = matchedExit,
+                    tunnelName = persistedTunnelName,
+                    backendState = "Connected",
+                    runtimeConfig = matchedExit.wireGuardConfig,
+                    configParseStatus = "Reconciled after restart",
+                )
+                _state.value = VpnConnectionState.Connected(matchedExit.id)
+                _diagnostics.value = summary.copy(
+                    activeExitId = matchedExit.id,
+                    lastError = null,
+                )
+                Log.d(TAG, "Reconciled active VPN tunnel=$persistedTunnelName exitId=${matchedExit.id}")
+            } else {
+                _state.value = VpnConnectionState.ActiveUnknown(persistedTunnelName)
+                _diagnostics.value = _diagnostics.value.copy(
+                    backendState = "Connected",
+                    activeExitId = persistedExitId,
+                    tunnelName = persistedTunnelName,
+                    endpoint = prefs.getString(KEY_ACTIVE_ENDPOINT, null),
+                    tunnelAddress = prefs.getString(KEY_ACTIVE_TUNNEL_ADDRESS, null),
+                    selectedExitId = selectedExitId,
+                    lastError = "VPN is active, but the configured exit record is unavailable.",
+                )
+                Log.w(TAG, "Active VPN tunnel is running but exit metadata is unavailable: tunnel=$persistedTunnelName exitId=$persistedExitId")
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Unable to reconcile VPN state: ${e.javaClass.simpleName}: ${e.message}", e)
+            // GoBackend owns the active tunnel list; if it cannot confirm a running
+            // tunnel, avoid showing a stale connected state indefinitely.
+            clearActiveState()
+            _state.value = VpnConnectionState.Disconnected
+            _diagnostics.value = _diagnostics.value.copy(
+                backendState = "Unknown",
+                lastError = "Unable to verify VPN state: ${e.message}",
+            )
+        }
     }
 
     suspend fun connect(exit: ConfiguredExit) {
@@ -121,13 +219,12 @@ class WireGuardTunnelController(
             activeTunnel = tunnel
             activeTunnelName = tunnelName
             activeExitId = exit.id
+            persistActiveState(exit, tunnelName, parsedSummary)
             _state.value = VpnConnectionState.Connected(exit.id)
             _diagnostics.value = parsedSummary.copy(backendState = "Connected", lastError = null)
             Log.d(TAG, "Tunnel connect success exitId=${exit.id}, tunnelName=$tunnelName")
         } catch (e: Exception) {
-            activeExitId = null
-            activeTunnel = null
-            activeTunnelName = null
+            clearActiveState()
             Log.e(TAG, "Tunnel connect failed exitId=${exit.id}: ${e.javaClass.simpleName}: ${e.message}", e)
             _diagnostics.value = _diagnostics.value.copy(
                 backendState = "Failed",
@@ -140,19 +237,18 @@ class WireGuardTunnelController(
 
     suspend fun disconnect() {
         val exitId = activeExitId
-        val tunnel = activeTunnel
+        val tunnelName = activeTunnelName ?: prefs.getString(KEY_ACTIVE_TUNNEL_NAME, null)
+        val tunnel = activeTunnel ?: tunnelName?.let { ZeroVpnTunnel(it) {} }
         _state.value = VpnConnectionState.Disconnecting(exitId)
         try {
-            Log.d(TAG, "Tunnel disconnect start exitId=$exitId, tunnelName=$activeTunnelName")
+            Log.d(TAG, "Tunnel disconnect start exitId=$exitId, tunnelName=$tunnelName")
             _diagnostics.value = _diagnostics.value.copy(backendState = "Disconnecting")
             if (tunnel != null) {
                 withContext(Dispatchers.IO) {
                     backend.setState(tunnel, Tunnel.State.DOWN, null)
                 }
             }
-            activeExitId = null
-            activeTunnel = null
-            activeTunnelName = null
+            clearActiveState()
             _state.value = VpnConnectionState.Disconnected
             _diagnostics.value = _diagnostics.value.copy(backendState = "Disconnected", lastError = null)
             Log.d(TAG, "Tunnel disconnect success exitId=$exitId")
@@ -168,12 +264,23 @@ class WireGuardTunnelController(
     }
 
     suspend fun disconnectIfActive(exitId: String?): Boolean {
-        if (activeTunnel == null) return true
+        if (activeTunnel == null && prefs.getString(KEY_ACTIVE_TUNNEL_NAME, null).isNullOrBlank()) return true
         return try {
             disconnect()
             true
         } catch (e: Exception) {
             false
+        }
+    }
+
+    suspend fun latestHandshakeEpochMillis(): Long? {
+        val tunnel = activeTunnel ?: return null
+        return withContext(Dispatchers.IO) {
+            val stats = backend.getStatistics(tunnel)
+            stats.peers()
+                .mapNotNull { peer -> stats.peer(peer)?.latestHandshakeEpochMillis() }
+                .filter { it > 0L }
+                .maxOrNull()
         }
     }
 
@@ -214,6 +321,29 @@ class WireGuardTunnelController(
             selectedNodeServerPublicKey = exit.serverPublicKey,
             provisionedServerPeerPublicKey = exit.serverPeerPublicKey,
         )
+    }
+
+    private fun persistActiveState(exit: ConfiguredExit, tunnelName: String, diagnostics: VpnDiagnostics) {
+        prefs.edit().apply {
+            putString(KEY_ACTIVE_EXIT_ID, exit.id)
+            putString(KEY_ACTIVE_TUNNEL_NAME, tunnelName)
+            putString(KEY_ACTIVE_ENDPOINT, diagnostics.endpoint ?: "${exit.publicIp}:${exit.wireGuardPort}")
+            putString(KEY_ACTIVE_TUNNEL_ADDRESS, diagnostics.tunnelAddress ?: "10.66.66.2/32")
+            putString(KEY_ACTIVE_SELECTED_EXIT_ID, exit.id)
+        }.apply()
+    }
+
+    private fun clearActiveState() {
+        activeExitId = null
+        activeTunnel = null
+        activeTunnelName = null
+        prefs.edit().apply {
+            remove(KEY_ACTIVE_EXIT_ID)
+            remove(KEY_ACTIVE_TUNNEL_NAME)
+            remove(KEY_ACTIVE_ENDPOINT)
+            remove(KEY_ACTIVE_TUNNEL_ADDRESS)
+            remove(KEY_ACTIVE_SELECTED_EXIT_ID)
+        }.apply()
     }
 
     private fun validateRuntimeConfig(exit: ConfiguredExit, diagnostics: VpnDiagnostics): String {
