@@ -15,12 +15,13 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.zerovpn.app.BuildConfig
 import com.zerovpn.app.ui.theme.*
 
 @Composable
 fun SettingsScreen(
     modifier: Modifier = Modifier,
-    isDevMode: Boolean = true,
+    isDevMode: Boolean = false,
     onDevModeChange: (Boolean) -> Unit = {},
 ) {
     Column(
@@ -54,7 +55,7 @@ fun SettingsScreen(
             )
             Spacer(modifier = Modifier.height(4.dp))
             Text(
-                text = "Version 0.1.0-dev",
+                text = "Version ${BuildConfig.VERSION_NAME}",
                 fontSize = 13.sp,
                 fontWeight = FontWeight.Normal,
                 color = TextDim,

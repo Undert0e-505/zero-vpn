@@ -40,7 +40,7 @@ class ProvisioningViewModel : ViewModel() {
     private val _wireGuardPort = MutableStateFlow(51820)
     val wireGuardPort: StateFlow<Int> = _wireGuardPort.asStateFlow()
 
-    private val _isDevMode = MutableStateFlow(true)
+    private val _isDevMode = MutableStateFlow(false)
     val isDevMode: StateFlow<Boolean> = _isDevMode.asStateFlow()
 
     private val _oracleOnboardingState = MutableStateFlow(OracleOnboardingState.NotStarted)
@@ -97,7 +97,7 @@ class ProvisioningViewModel : ViewModel() {
 
     private fun loadPersistedState() {
         if (!::prefs.isInitialized) return
-        _isDevMode.value = prefs.getBoolean("is_dev_mode", true)
+        _isDevMode.value = prefs.getBoolean("is_dev_mode", false)
         _oracleOnboardingState.value = runCatching {
             OracleOnboardingState.valueOf(
                 prefs.getString("oracle_onboarding_state", OracleOnboardingState.NotStarted.name)
@@ -385,7 +385,7 @@ class ProvisioningViewModel : ViewModel() {
         _oracleOnboardingState.value = OracleOnboardingState.AuthLaunched
         // Read the latest dev mode setting from SharedPreferences
         if (::prefs.isInitialized) {
-            _isDevMode.value = prefs.getBoolean("is_dev_mode", true)
+            _isDevMode.value = prefs.getBoolean("is_dev_mode", false)
         }
         _events.value = emptyList()
         _sshDebugInfo.value = null
@@ -403,7 +403,7 @@ class ProvisioningViewModel : ViewModel() {
 
     fun retry(context: Context) {
         if (::prefs.isInitialized) {
-            _isDevMode.value = prefs.getBoolean("is_dev_mode", true)
+            _isDevMode.value = prefs.getBoolean("is_dev_mode", false)
         }
         _events.value = emptyList()
         _currentPhase.value = null
