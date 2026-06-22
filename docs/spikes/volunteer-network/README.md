@@ -62,15 +62,17 @@ That path should be designed separately from public Volunteer Network mode.
 * [Implementation plan](06-implementation-plan.md)
 * [Open questions](07-open-questions.md)
 * [Device test results](08-device-test-results.md)
+* [tun2socks feasibility plan](09-tun2socks-feasibility.md)
 * [Sources](sources.md)
 
 ## Next Action
 
-Harden the Phase 1 embedded Tor SOCKS proof of concept:
+Decide how to integrate the selected tun2socks candidate:
 
-1. Record richer bootstrap timing, phase, and retry diagnostics.
-2. Treat cold and warm bootstrap timeouts differently.
-3. Verify Stop shuts down Tor and marks SOCKS inactive.
-4. Add developer controls to copy diagnostics and clear Tor state.
-5. Keep the feature behind Developer Mode.
-6. Do not route Android device traffic yet.
+1. Prefer a maintained AAR if one becomes available.
+2. Otherwise decide whether to add `hev-socks5-tunnel` as a pinned native
+   source dependency/submodule.
+3. Do not add prebuilt native binaries manually.
+4. Keep the feature behind Developer Mode.
+5. Do not route Android device traffic until DNS, UDP, lifecycle, and stop
+   behavior are explicitly validated.
