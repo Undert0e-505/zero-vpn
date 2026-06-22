@@ -216,11 +216,14 @@ object OciRequestSigner {
         val padded = payload.padEnd((payload.length + 3) / 4 * 4, '=')
         val json = String(Base64.getUrlDecoder().decode(padded))
         val jsonObj = JSONObject(json)
-        return mapOf(
-            "sub" to jsonObj.optString("sub"),
-            "tenant" to jsonObj.optString("tenant"),
-            "exp" to jsonObj.optLong("exp", 0L).takeIf { it > 0 },
-        )
+        return buildMap {
+            for (key in jsonObj.keys()) {
+                put(key, jsonObj.opt(key))
+            }
+            put("sub", jsonObj.optString("sub"))
+            put("tenant", jsonObj.optString("tenant"))
+            put("exp", jsonObj.optLong("exp", 0L).takeIf { it > 0 })
+        }
     }
 
     /**
@@ -230,6 +233,7 @@ object OciRequestSigner {
         "uk-london-1" to "uk-london-1",
         "us-ashburn-1" to "us-ashburn-1",
         "us-phoenix-1" to "us-phoenix-1",
+        "ca-montreal-1" to "ca-montreal-1",
         "eu-frankfurt-1" to "eu-frankfurt-1",
         "ap-tokyo-1" to "ap-tokyo-1",
         "ap-sydney-1" to "ap-sydney-1",
@@ -246,9 +250,11 @@ object OciRequestSigner {
         "eu-milan-1" to "eu-milan-1",
         "eu-stockholm-1" to "eu-stockholm-1",
         "eu-paris-1" to "eu-paris-1",
+        "eu-marseille-1" to "eu-marseille-1",
         "uk-cardiff-1" to "uk-cardiff-1",
         "ap-chuncheon-1" to "ap-chuncheon-1",
         "ap-hyderabad-1" to "ap-hyderabad-1",
+        "ap-singapore-1" to "ap-singapore-1",
         "ap-melbourne-1" to "ap-melbourne-1",
         "il-jerusalem-1" to "il-jerusalem-1",
         "mx-queretaro-1" to "mx-queretaro-1",
@@ -265,6 +271,7 @@ object OciRequestSigner {
         "us-ashburn-1" to "oraclecloud.com",
         "us-phoenix-1" to "oraclecloud.com",
         "ca-toronto-1" to "oraclecloud.com",
+        "ca-montreal-1" to "oraclecloud.com",
         "eu-frankfurt-1" to "oraclecloud.com",
         "eu-amsterdam-1" to "oraclecloud.com",
         "eu-zurich-1" to "oraclecloud.com",
@@ -272,6 +279,7 @@ object OciRequestSigner {
         "eu-milan-1" to "oraclecloud.com",
         "eu-stockholm-1" to "oraclecloud.com",
         "eu-paris-1" to "oraclecloud.com",
+        "eu-marseille-1" to "oraclecloud.com",
         "ap-tokyo-1" to "oraclecloud.com",
         "ap-sydney-1" to "oraclecloud.com",
         "ap-mumbai-1" to "oraclecloud.com",
@@ -279,6 +287,7 @@ object OciRequestSigner {
         "ap-osaka-1" to "oraclecloud.com",
         "ap-chuncheon-1" to "oraclecloud.com",
         "ap-hyderabad-1" to "oraclecloud.com",
+        "ap-singapore-1" to "oraclecloud.com",
         "ap-melbourne-1" to "oraclecloud.com",
         "sa-saopaulo-1" to "oraclecloud.com",
         "sa-vinhedo-1" to "oraclecloud.com",
@@ -293,4 +302,3 @@ object OciRequestSigner {
         return regionRealms[region] ?: "oraclecloud.com"
     }
 }
-
