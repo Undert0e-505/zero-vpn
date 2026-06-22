@@ -15,6 +15,8 @@ import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.SnackbarHostState
@@ -42,6 +44,8 @@ import com.zerovpn.app.ui.provisioning.ProvisioningState
 import com.zerovpn.app.ui.provisioning.ProvisioningViewModel
 import com.zerovpn.app.ui.provisioning.Status
 import com.zerovpn.app.ui.theme.*
+import com.zerovpn.app.oci.OciRegion
+import com.zerovpn.app.oci.OciRegions
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -65,6 +69,7 @@ fun ProvisioningScreen(
     val wireGuardPort by viewModel.wireGuardPort.collectAsState()
     val isDevMode by viewModel.isDevMode.collectAsState()
     val onboardingState by viewModel.oracleOnboardingState.collectAsState()
+    val selectedOracleRegion by viewModel.selectedOracleRegion.collectAsState()
     val context = LocalContext.current
 
     // Initialize prefs on first composition
@@ -104,6 +109,9 @@ fun ProvisioningScreen(
             is ProvisioningState.Idle -> {
                 OracleOnboardingContent(
                     onboardingState = onboardingState,
+                    selectedRegion = selectedOracleRegion,
+                    regions = viewModel.oracleRegions,
+                    onSelectRegion = viewModel::selectOracleRegion,
                     onExistingAccount = { viewModel.startProvisioning(context) },
                     onCreateAccount = { viewModel.launchOracleSignup(context) },
                     onAccountCreated = {
@@ -117,6 +125,9 @@ fun ProvisioningScreen(
             is ProvisioningState.PreStart -> {
                 OracleOnboardingContent(
                     onboardingState = onboardingState,
+                    selectedRegion = selectedOracleRegion,
+                    regions = viewModel.oracleRegions,
+                    onSelectRegion = viewModel::selectOracleRegion,
                     onExistingAccount = { viewModel.startProvisioning(context) },
                     onCreateAccount = { viewModel.launchOracleSignup(context) },
                     onAccountCreated = {
@@ -175,6 +186,9 @@ fun ProvisioningScreen(
                     lastSuccessPhase = s.lastSuccessPhase,
                     errorMessage = s.errorMessage,
                     events = events,
+                    selectedRegion = selectedOracleRegion,
+                    regions = viewModel.oracleRegions,
+                    onSelectRegion = viewModel::selectOracleRegion,
                     onRetry = { viewModel.retry(context) },
                     onCleanup = { viewModel.cleanup(context) },
                 )
@@ -201,12 +215,16 @@ fun ProvisioningScreen(
 @Composable
 private fun OracleOnboardingContent(
     onboardingState: OracleOnboardingState,
+    selectedRegion: String?,
+    regions: List<OciRegion>,
+    onSelectRegion: (String?) -> Unit,
     onExistingAccount: () -> Unit,
     onCreateAccount: () -> Unit,
     onAccountCreated: () -> Unit,
     onCancel: () -> Unit,
 ) {
     var showNext by remember { mutableStateOf(false) }
+    var regionMenuExpanded by remember { mutableStateOf(false) }
     Column(
         modifier = Modifier.fillMaxWidth(),
         verticalArrangement = Arrangement.spacedBy(16.dp),
@@ -224,6 +242,59 @@ private fun OracleOnboardingContent(
             color = TextDim,
             lineHeight = 20.sp,
         )
+
+        Column(
+            modifier = Modifier.fillMaxWidth(),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Text(
+                text = "Oracle region",
+                fontSize = 14.sp,
+                fontWeight = FontWeight.SemiBold,
+                color = TextPrimary,
+            )
+            Text(
+                text = "ZeroVPN will try to discover your home region automatically after sign-in. If discovery fails, choose the region shown in Oracle Cloud Console and retry.",
+                fontSize = 13.sp,
+                color = TextDim,
+                lineHeight = 18.sp,
+            )
+            Box(modifier = Modifier.fillMaxWidth()) {
+                OutlinedButton(
+                    onClick = { regionMenuExpanded = true },
+                    modifier = Modifier.fillMaxWidth().height(48.dp),
+                    shape = RoundedCornerShape(8.dp),
+                    colors = ButtonDefaults.outlinedButtonColors(contentColor = TextPrimary),
+                ) {
+                    Text(
+                        text = selectedRegion?.let { OciRegions.labelFor(it) } ?: "Optional: choose region manually",
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.Medium,
+                    )
+                }
+                DropdownMenu(
+                    expanded = regionMenuExpanded,
+                    onDismissRequest = { regionMenuExpanded = false },
+                    modifier = Modifier.background(Surface),
+                ) {
+                    regions.forEach { region ->
+                        DropdownMenuItem(
+                            text = {
+                                Text(
+                                    text = "${region.label} - ${region.id}",
+                                    fontSize = 13.sp,
+                                    color = TextPrimary,
+                                )
+                            },
+                            onClick = {
+                                onSelectRegion(region.id)
+                                regionMenuExpanded = false
+                            },
+                        )
+                    }
+                }
+            }
+        }
 
         if (onboardingState == OracleOnboardingState.WaitingForAccountSetup ||
             onboardingState == OracleOnboardingState.ReadyToAuthenticate
@@ -677,11 +748,15 @@ private fun FailureContent(
     lastSuccessPhase: Phase?,
     errorMessage: String?,
     events: List<ProvisioningEvent>,
+    selectedRegion: String?,
+    regions: List<OciRegion>,
+    onSelectRegion: (String?) -> Unit,
     onRetry: () -> Unit,
     onCleanup: () -> Unit,
 ) {
     val scrollState = rememberScrollState()
     val timeFormat = SimpleDateFormat("HH:mm:ss", Locale.getDefault())
+    var regionMenuExpanded by remember { mutableStateOf(false) }
 
     Column(
         modifier = Modifier.fillMaxWidth(),
@@ -723,6 +798,61 @@ private fun FailureContent(
                         color = Danger,
                         modifier = Modifier.padding(top = 4.dp),
                     )
+                }
+            }
+        }
+
+        if (failedPhase == Phase.API_KEY) {
+            Column(
+                modifier = Modifier.fillMaxWidth(),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                Text(
+                    text = "Oracle home region",
+                    fontSize = 14.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = TextPrimary,
+                )
+                Text(
+                    text = "ZeroVPN tries to discover this automatically. If discovery failed, choose the region shown in Oracle Cloud Console and retry.",
+                    fontSize = 13.sp,
+                    color = TextDim,
+                    lineHeight = 18.sp,
+                )
+                Box(modifier = Modifier.fillMaxWidth()) {
+                    OutlinedButton(
+                        onClick = { regionMenuExpanded = true },
+                        modifier = Modifier.fillMaxWidth().height(48.dp),
+                        shape = RoundedCornerShape(8.dp),
+                        colors = ButtonDefaults.outlinedButtonColors(contentColor = TextPrimary),
+                    ) {
+                        Text(
+                            text = selectedRegion?.let { OciRegions.labelFor(it) } ?: "Choose region manually",
+                            fontSize = 13.sp,
+                            fontWeight = FontWeight.Medium,
+                        )
+                    }
+                    DropdownMenu(
+                        expanded = regionMenuExpanded,
+                        onDismissRequest = { regionMenuExpanded = false },
+                        modifier = Modifier.background(Surface),
+                    ) {
+                        regions.forEach { region ->
+                            DropdownMenuItem(
+                                text = {
+                                    Text(
+                                        text = "${region.label} - ${region.id}",
+                                        fontSize = 13.sp,
+                                        color = TextPrimary,
+                                    )
+                                },
+                                onClick = {
+                                    onSelectRegion(region.id)
+                                    regionMenuExpanded = false
+                                },
+                            )
+                        }
+                    }
                 }
             }
         }

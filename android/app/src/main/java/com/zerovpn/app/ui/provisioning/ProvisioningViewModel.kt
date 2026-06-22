@@ -8,6 +8,8 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.browser.customtabs.CustomTabsIntent
 import com.zerovpn.app.oci.OciProvisioner
+import com.zerovpn.app.oci.OciRegion
+import com.zerovpn.app.oci.OciRegions
 import com.zerovpn.app.vpn.ConfiguredExit
 import com.zerovpn.app.vpn.ExitLifecycleState
 import com.zerovpn.app.vpn.ExitProvider
@@ -43,6 +45,11 @@ class ProvisioningViewModel : ViewModel() {
 
     private val _oracleOnboardingState = MutableStateFlow(OracleOnboardingState.NotStarted)
     val oracleOnboardingState: StateFlow<OracleOnboardingState> = _oracleOnboardingState.asStateFlow()
+
+    private val _selectedOracleRegion = MutableStateFlow<String?>(null)
+    val selectedOracleRegion: StateFlow<String?> = _selectedOracleRegion.asStateFlow()
+
+    val oracleRegions: List<OciRegion> = OciRegions.common
 
     data class SshDebugInfo(
         val publicIp: String,
@@ -98,6 +105,8 @@ class ProvisioningViewModel : ViewModel() {
             )
         }.getOrDefault(OracleOnboardingState.NotStarted)
         homeRegion = prefs.getString("home_region", null)
+        _selectedOracleRegion.value = prefs.getString("selected_oracle_region", null)
+            ?: homeRegion
         apiKeyUserOcid = prefs.getString("api_key_user_ocid", null)
         apiKeyTenancyOcid = prefs.getString("api_key_tenancy_ocid", null)
         apiKeyFingerprint = prefs.getString("api_key_fingerprint", null)
@@ -144,7 +153,7 @@ class ProvisioningViewModel : ViewModel() {
                         name = "Exit 1",
                         publicIp = savedIp,
                         wireGuardPort = savedPort,
-                        region = homeRegion ?: "uk-london-1",
+                        region = homeRegion ?: LEGACY_REGION_FALLBACK,
                         wireGuardConfig = it,
                         resourceIds = resourceIds,
                         sshUsername = null,
@@ -157,7 +166,7 @@ class ProvisioningViewModel : ViewModel() {
                 _state.value = ProvisioningState.Success(
                     publicIp = savedIp,
                     wireGuardPort = savedPort,
-                    region = homeRegion ?: "uk-london-1",
+                    region = homeRegion ?: LEGACY_REGION_FALLBACK,
                     isDevMode = _isDevMode.value,
                 )
             }
@@ -170,6 +179,7 @@ class ProvisioningViewModel : ViewModel() {
         prefs.edit().apply {
             listOf(
                 "home_region",
+                "selected_oracle_region",
                 "api_key_user_ocid",
                 "api_key_tenancy_ocid",
                 "api_key_fingerprint",
@@ -189,6 +199,7 @@ class ProvisioningViewModel : ViewModel() {
             putString("oracle_onboarding_state", _oracleOnboardingState.value.name)
             putBoolean("is_dev_mode", _isDevMode.value)
             homeRegion?.let { putString("home_region", it) }
+            _selectedOracleRegion.value?.let { putString("selected_oracle_region", it) }
             apiKeyUserOcid?.let { putString("api_key_user_ocid", it) }
             apiKeyTenancyOcid?.let { putString("api_key_tenancy_ocid", it) }
             apiKeyFingerprint?.let { putString("api_key_fingerprint", it) }
@@ -362,6 +373,13 @@ class ProvisioningViewModel : ViewModel() {
         persistState()
     }
 
+    fun selectOracleRegion(region: String?) {
+        _selectedOracleRegion.value = region?.takeIf { selected ->
+            oracleRegions.any { it.id == selected }
+        }
+        persistState()
+    }
+
     fun startProvisioning(context: Context) {
         if (_state.value is ProvisioningState.Running) return
         _oracleOnboardingState.value = OracleOnboardingState.AuthLaunched
@@ -419,7 +437,7 @@ class ProvisioningViewModel : ViewModel() {
         }
         viewModelScope.launch {
             val currentRids = targetExit?.ociResourceIds?.toProvisionerResourceIds() ?: resourceIds ?: loadResourceIds()
-            val currentRegion = targetExit?.region ?: homeRegion ?: "uk-london-1"
+            val currentRegion = targetExit?.region ?: homeRegion ?: LEGACY_REGION_FALLBACK
             val currentApiKeyUserOcid = targetExit?.apiKeyUserOcid ?: apiKeyUserOcid
             val currentApiKeyFingerprint = targetExit?.apiKeyFingerprint ?: apiKeyFingerprint
 
@@ -513,7 +531,7 @@ class ProvisioningViewModel : ViewModel() {
         viewModelScope.launch {
             val currentRids = resourceIds
             val currentAuth = authResult
-            val currentRegion = homeRegion ?: "uk-london-1"
+            val currentRegion = homeRegion ?: _selectedOracleRegion.value ?: LEGACY_REGION_FALLBACK
 
             if (currentRids != null && currentAuth != null) {
                 emit(Phase.DONE, Status.RUNNING, "Cleaning up partial resources...")
@@ -548,7 +566,8 @@ class ProvisioningViewModel : ViewModel() {
 
     private suspend fun runProvisioning(context: Context) {
         try {
-            provisioner = OciProvisioner(context, "uk-london-1", _isDevMode.value)
+            val authBootstrapRegion = homeRegion ?: _selectedOracleRegion.value ?: AUTH_BOOTSTRAP_REGION
+            provisioner = OciProvisioner(context, authBootstrapRegion, _isDevMode.value)
 
             // Collect events from provisioner
             val prov = provisioner!!
@@ -569,7 +588,13 @@ class ProvisioningViewModel : ViewModel() {
 
             // Phase 2: Preflight
             _currentPhase.value = Phase.API_KEY
-            preflightResult = prov.preflight(authResult!!)
+            val preferredRegion = homeRegion ?: _selectedOracleRegion.value
+            val preferredSource = when {
+                homeRegion != null -> "persisted"
+                _selectedOracleRegion.value != null -> "user-selected fallback"
+                else -> "none"
+            }
+            preflightResult = prov.preflight(authResult!!, preferredRegion, preferredSource)
 
             if (!preflightResult!!.success) {
                 eventJob.cancel()
@@ -586,6 +611,7 @@ class ProvisioningViewModel : ViewModel() {
             if (preflightResult!!.isUkRegion && _isDevMode.value) {
                 eventJob.cancel()
                 homeRegion = preflightResult!!.homeRegion
+                _selectedOracleRegion.value = preflightResult!!.homeRegion
                 _state.value = ProvisioningState.UkWarning(preflightResult!!.homeRegion)
                 persistState()
                 return
@@ -618,7 +644,9 @@ class ProvisioningViewModel : ViewModel() {
 
     private suspend fun continueProvisioningAfterWarning(context: Context) {
         try {
-            val prov = provisioner ?: OciProvisioner(context, "uk-london-1", _isDevMode.value).also { provisioner = it }
+            val warningRegion = preflightResult?.homeRegion ?: homeRegion ?: _selectedOracleRegion.value
+                ?: throw IllegalStateException("Oracle region is not available.")
+            val prov = provisioner ?: OciProvisioner(context, warningRegion, _isDevMode.value).also { provisioner = it }
             val auth = authResult ?: return
 
             val eventJob = viewModelScope.launch {
@@ -646,6 +674,7 @@ class ProvisioningViewModel : ViewModel() {
             val auth = authResult!!
             val preflight = preflightResult!!
             homeRegion = preflight.homeRegion
+            _selectedOracleRegion.value = preflight.homeRegion
             apiKeyUserOcid = auth.userOcid
             apiKeyTenancyOcid = auth.tenancyOcid
             apiKeyFingerprint = auth.fingerprint
@@ -669,7 +698,7 @@ class ProvisioningViewModel : ViewModel() {
                 name = nextExitName(),
                 publicIp = result.publicIp,
                 wireGuardPort = result.wireGuardPort,
-                region = homeRegion ?: "uk-london-1",
+                region = homeRegion ?: _selectedOracleRegion.value ?: LEGACY_REGION_FALLBACK,
                 wireGuardConfig = result.clientConfig,
                 resourceIds = rids,
                 sshUsername = result.sshUsername,
@@ -683,7 +712,7 @@ class ProvisioningViewModel : ViewModel() {
             _state.value = ProvisioningState.Success(
                 publicIp = result.publicIp,
                 wireGuardPort = result.wireGuardPort,
-                region = homeRegion ?: "uk-london-1",
+                region = homeRegion ?: _selectedOracleRegion.value ?: LEGACY_REGION_FALLBACK,
                 isDevMode = _isDevMode.value,
             )
             _oracleOnboardingState.value = OracleOnboardingState.NotStarted
@@ -873,7 +902,7 @@ class ProvisioningViewModel : ViewModel() {
             provider = runCatching { ExitProvider.valueOf(optString("provider", ExitProvider.OCI.name)) }.getOrDefault(ExitProvider.OCI),
             publicIp = getString("publicIp"),
             wireGuardPort = optInt("wireGuardPort", 51820),
-            region = optString("region", "uk-london-1"),
+            region = optString("region", LEGACY_REGION_FALLBACK),
             wireGuardConfig = getString("wireGuardConfig"),
             endpointHost = optString("endpointHost").takeIf { it.isNotBlank() } ?: getString("publicIp"),
             endpointPort = optInt("endpointPort", optInt("wireGuardPort", 51820)),
@@ -913,5 +942,7 @@ class ProvisioningViewModel : ViewModel() {
 
     companion object {
         const val ORACLE_SIGNUP_URL = "https://signup.oraclecloud.com/"
+        private const val LEGACY_REGION_FALLBACK = "uk-london-1"
+        private const val AUTH_BOOTSTRAP_REGION = "us-ashburn-1"
     }
 }
