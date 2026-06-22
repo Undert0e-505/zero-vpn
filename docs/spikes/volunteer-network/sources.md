@@ -53,12 +53,31 @@ Primary sources used for this spike.
 
   Lightweight tun2socks-style project. Orbot's Android README references it as
   a native dependency, making it directly relevant to Orbot-style architecture.
+  Its README describes Android support, SOCKS5 configuration, TCP redirection,
+  UDP relay modes, optional map-DNS configuration, and a C API that accepts a
+  TUN file descriptor. License: MIT.
+
+* SocksTun:
+  https://github.com/heiher/sockstun
+
+  Android VPN-over-SOCKS app built on `hev-socks5-tunnel`. Useful prior art for
+  Android `VpnService.Builder`, TUN fd handoff, configuration generation, and
+  stop sequencing. It builds native code with `ndk-build` and a git submodule
+  rather than a Maven AAR. License: MIT.
 
 * xjasonlyu tun2socks:
   https://github.com/xjasonlyu/tun2socks
 
   A tun2socks implementation powered by the gVisor TCP/IP stack. Candidate for
-  comparison on Android packaging, licensing, DNS, and UDP behavior.
+  comparison on Android packaging, licensing, DNS, and UDP behavior. Its README
+  describes SOCKS support and user-space networking. License: MIT.
+
+* Outline Foundation outline-go-tun2socks:
+  https://github.com/OutlineFoundation/outline-go-tun2socks
+
+  The repository README says this repo is no longer maintained and points to
+  Outline/Intra repositories. It remains useful historical prior art for
+  Android Go tun2socks builds. License: Apache 2.0.
 
 ## Android Platform
 
