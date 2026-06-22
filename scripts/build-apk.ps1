@@ -274,8 +274,12 @@ if (-not $DryRun) {
     if ($LASTEXITCODE -ne 0) { Fail "Could not check remote tag: $($remoteTag -join "`n")" }
     if ($remoteTag) { Fail "Remote tag already exists: $TagName" }
 
+    $previousErrorActionPreference = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
     $releaseView = & gh release view $TagName 2>$null
-    if ($LASTEXITCODE -eq 0) { Fail "GitHub release already exists: $TagName" }
+    $releaseViewExitCode = $LASTEXITCODE
+    $ErrorActionPreference = $previousErrorActionPreference
+    if ($releaseViewExitCode -eq 0) { Fail "GitHub release already exists: $TagName" }
 } else {
     Write-Host "[dry-run] would check remote tag and GitHub release existence for $TagName" -ForegroundColor Yellow
 }
