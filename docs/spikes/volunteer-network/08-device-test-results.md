@@ -18,6 +18,19 @@ Observed successful diagnostics:
 * exit IP changed between successful runs
 * final state: Ready
 
+Observed Stop behavior after diagnostics hardening:
+
+* Stop moved the spike state to Stopped.
+* `stoppedAt` and `stopDurationMs` were populated.
+* `socksActive=false` after Stop.
+* The local SOCKS listener closed.
+* The post-stop SOCKS probe failed with `ECONNREFUSED`, as expected.
+
+Tor-android can briefly continue reporting `STOPPING` after the app has unbound
+from the service and the SOCKS listener is closed. Treat that as an effective
+stop for this spike when `socksActive=false`, the service is unbound, and the
+post-stop SOCKS probe fails as expected.
+
 Early runs did not always complete. The first few attempts stalled or timed out
 around 45% or 55% bootstrap progress. Later runs consistently reached 100%,
 which suggests cold bootstrap and initial Tor state/cache creation need better
