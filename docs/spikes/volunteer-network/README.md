@@ -27,19 +27,22 @@ It does not mean:
 * onion-site browsing unless explicitly implemented later
 * a replacement for a professionally audited privacy product
 
-Technical implementation may involve Tor, Orbot, Onionmasq, Arti, SOCKS, or
+Technical implementation may involve embedded Tor, Onionmasq, Arti, SOCKS, or
 tun2socks-style routing, but the primary user-facing name should remain
-Volunteer Network.
+Volunteer Network. Orbot is useful prior art, not the primary integration path.
 
 ## Current Recommendation
 
-Short term, build an Orbot companion proof of concept. It is the fastest
-low-risk way to learn whether a Volunteer Network flow is useful without
-embedding Tor or native tunneling code into ZeroVPN immediately.
+Short term, build a self-contained embedded Tor SOCKS proof of concept inside
+ZeroVPN. The first step should start local Tor, wait for bootstrap, expose a
+local SOCKS port, perform one explicitly SOCKS-routed test request, and shut
+down cleanly. It should stay behind Developer Mode and must not route Android
+device traffic.
 
-Medium term, prototype embedded local Tor plus tun2socks behind Android
-VpnService. This is the likely integrated app path, but it has meaningful
-complexity around DNS, UDP, battery use, licensing, and user expectations.
+Medium term, add a Volunteer Network internal controller and then prototype
+VpnService plus tun2socks behind Developer Mode. This is the likely integrated
+app path, but it has meaningful complexity around DNS, UDP, battery use,
+licensing, and user expectations.
 
 Long term, track the Tor Project's Onionmasq, Arti, and Tor VPN work. That
 direction is more aligned with a modern embedded tunnel architecture, but it
@@ -62,9 +65,11 @@ That path should be designed separately from public Volunteer Network mode.
 
 ## Next Action
 
-Run Phase 1 as a small Orbot companion proof of concept:
+Run Phase 1 as a small embedded Tor SOCKS proof of concept:
 
-1. Detect whether Orbot is installed.
-2. Offer a clear install/open path.
-3. Document whether the UX is acceptable.
-4. Do not claim this is a fully integrated ZeroVPN mode.
+1. Add tor-android or an equivalent embedded Tor dependency.
+2. Start Tor locally and wait for bootstrap.
+3. Expose a local SOCKS port.
+4. Perform one HTTP test request through the local SOCKS proxy.
+5. Shut down cleanly.
+6. Do not route Android device traffic yet.

@@ -116,5 +116,6 @@ dependencies {
     implementation(libs.jsch)
     implementation(libs.androidx.browser)
     implementation(libs.wireguard.tunnel)
+    implementation(libs.tor.android)
     debugImplementation(libs.androidx.compose.ui.tooling)
 }

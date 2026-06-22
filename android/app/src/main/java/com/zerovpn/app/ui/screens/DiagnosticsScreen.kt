@@ -54,6 +54,9 @@ import com.zerovpn.app.vpn.UserDiagnosticsState
 import com.zerovpn.app.vpn.VpnConnectionState
 import com.zerovpn.app.vpn.VpnDiagnostics
 import com.zerovpn.app.vpn.VpnViewModel
+import com.zerovpn.app.volunteer.VolunteerNetworkController
+import com.zerovpn.app.volunteer.VolunteerNetworkDiagnostics
+import com.zerovpn.app.volunteer.VolunteerNetworkState
 import java.text.DateFormat
 import java.util.Date
 
@@ -64,6 +67,7 @@ fun DiagnosticsScreen(
     modifier: Modifier = Modifier,
     provisioningViewModel: ProvisioningViewModel = viewModel(),
     vpnViewModel: VpnViewModel = viewModel(),
+    volunteerNetworkController: VolunteerNetworkController = viewModel(),
 ) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
@@ -74,6 +78,8 @@ fun DiagnosticsScreen(
     val vpnState by vpnViewModel.state.collectAsState()
     val vpnDiagnostics by vpnViewModel.diagnostics.collectAsState()
     val userDiagnostics by vpnViewModel.userDiagnostics.collectAsState()
+    val volunteerState by volunteerNetworkController.state.collectAsState()
+    val volunteerDiagnostics by volunteerNetworkController.diagnostics.collectAsState()
     val scrollState = rememberScrollState()
     val activeExitId = when (val currentState = vpnState) {
         is VpnConnectionState.Connected -> currentState.exitId
@@ -134,6 +140,13 @@ fun DiagnosticsScreen(
             Spacer(modifier = Modifier.height(12.dp))
             WireGuardDebugCard(vpnDiagnostics)
             Spacer(modifier = Modifier.height(12.dp))
+            VolunteerNetworkSpikeCard(
+                state = volunteerState,
+                diagnostics = volunteerDiagnostics,
+                onStart = { volunteerNetworkController.startTest() },
+                onStop = { volunteerNetworkController.stopTest() },
+            )
+            Spacer(modifier = Modifier.height(12.dp))
             SshDebugCard(
                 sshDebugInfo = sshDebugInfo,
                 onCopyPrivateKey = {
@@ -148,6 +161,72 @@ fun DiagnosticsScreen(
                 },
             )
         }
+    }
+}
+
+@Composable
+private fun VolunteerNetworkSpikeCard(
+    state: VolunteerNetworkState,
+    diagnostics: VolunteerNetworkDiagnostics,
+    onStart: () -> Unit,
+    onStop: () -> Unit,
+) {
+    val startEnabled = state is VolunteerNetworkState.Idle ||
+        state is VolunteerNetworkState.Stopped ||
+        state is VolunteerNetworkState.Failed
+    val stopEnabled = state !is VolunteerNetworkState.Idle &&
+        state !is VolunteerNetworkState.Stopped &&
+        state !is VolunteerNetworkState.Stopping
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(Surface, RoundedCornerShape(8.dp))
+            .border(1.dp, Border, RoundedCornerShape(8.dp))
+            .padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        Text(
+            text = "VOLUNTEER NETWORK SPIKE",
+            style = SectionTitleStyle,
+        )
+        Text(
+            text = "Embedded Tor SOCKS proof of concept. Developer diagnostics only; this does not route Android device traffic.",
+            fontSize = 13.sp,
+            color = TextDim,
+            lineHeight = 18.sp,
+        )
+        DebugValue("State", volunteerStateText(state))
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            Button(
+                onClick = onStart,
+                enabled = startEnabled,
+                modifier = Modifier.weight(1f),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = Accent,
+                    contentColor = Bg,
+                    disabledContainerColor = Border,
+                    disabledContentColor = TextDim,
+                ),
+            ) {
+                Text("Start test", fontSize = 13.sp, fontWeight = FontWeight.Bold)
+            }
+            OutlinedButton(
+                onClick = onStop,
+                enabled = stopEnabled,
+                modifier = Modifier.weight(1f),
+                colors = ButtonDefaults.outlinedButtonColors(
+                    contentColor = TextPrimary,
+                    disabledContentColor = TextDim,
+                ),
+            ) {
+                Text("Stop", fontSize = 13.sp, fontWeight = FontWeight.Medium)
+            }
+        }
+        DebugBlock("Diagnostics", diagnostics.toDebugText())
     }
 }
 
@@ -383,6 +462,24 @@ private fun connectionText(vpnState: VpnConnectionState): String = when (vpnStat
     is VpnConnectionState.PermissionRequired -> "Permission required"
     is VpnConnectionState.Failed -> "Failed"
     VpnConnectionState.Disconnected -> "Disconnected"
+}
+
+private fun volunteerStateText(state: VolunteerNetworkState): String = when (state) {
+    VolunteerNetworkState.Idle -> "Idle"
+    VolunteerNetworkState.StartingTor -> "StartingTor"
+    is VolunteerNetworkState.BootstrappingTor -> {
+        state.progress?.let { "BootstrappingTor ($it%)" } ?: "BootstrappingTor"
+    }
+    VolunteerNetworkState.SocksReady -> "SocksReady"
+    VolunteerNetworkState.TestingSocks -> "TestingSocks"
+    VolunteerNetworkState.Ready -> "Ready"
+    VolunteerNetworkState.Stopping -> "Stopping"
+    VolunteerNetworkState.Stopped -> "Stopped"
+    is VolunteerNetworkState.Failed -> listOfNotNull(
+        "Failed",
+        state.throwableClass,
+        state.message.takeIf { it.isNotBlank() },
+    ).joinToString(": ")
 }
 
 private fun exitIpText(state: UserDiagnosticsState): String = when (state.exitIpStatus) {
