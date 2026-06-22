@@ -1,158 +1,161 @@
 # ZeroVPN
 
-A free, open-source Android VPN and exit-node kit.
+ZeroVPN is an experimental open-source Android app for creating and using
+personal VPN exits.
 
-ZeroVPN routes Android traffic through an exit node that you control. It is
-not a VPN service provider: it does not sell subscriptions, operate shared
-exit nodes, collect ZeroVPN accounts, or run a central VPN backend.
+The current v0.1 path provisions an Oracle Cloud Always Free VM, installs
+WireGuard, and connects the Android device through that VM using Android
+`VpnService`.
 
-## Current status
+ZeroVPN is not a VPN service provider. It does not operate exit nodes, collect
+ZeroVPN accounts, sell VPN subscriptions, or run a central VPN backend. Traffic
+exits through infrastructure that you control.
 
-ZeroVPN is experimental and under active development. The currently working
-path is **Oracle Free Exit**: the Android app provisions an Oracle Cloud VM,
-configures WireGuard, and connects Android through it.
+## Status
 
-Other exit types shown in the UI are roadmap items and are not functional yet.
-Do not treat the app as polished or production-ready.
+ZeroVPN v0.1 is an experimental public pre-release.
 
-What works now:
+Currently working:
 
-- Android app.
-- Oracle Free Exit provisioning.
-- Oracle Cloud Always Free-compatible VM creation.
-- OCI networking and security rule setup.
-- WireGuard installation and configuration on the VM.
-- Android VPN connection through Android `VpnService` and the WireGuard backend.
-- User-facing diagnostics for exit IP, country/provider, DNS check, and last
-  handshake.
-- Developer diagnostics hidden behind Developer Mode.
-- Multiple saved OCI exits are in progress in the current branch, but the main
-  supported path is still Oracle Free Exit.
+- Create an Oracle Free Exit.
+- Authenticate with Oracle Cloud.
+- Discover the OCI home region automatically.
+- Provision an Oracle Cloud VM.
+- Configure WireGuard on the VM.
+- Connect Android traffic through the VM.
+- Show basic connection diagnostics.
 
-Not implemented or not polished yet:
+Known rough edges:
 
-- Volunteer Network.
-- Scan QR Invite.
-- Import Config.
+- Oracle account signup, login, and MFA are still awkward.
+- Users should create and verify their Oracle Cloud account before using the
+  app.
+- VM setup can still fail and diagnostics are still improving.
+- Destroy/recreate flow needs hardening.
+- Logs are not implemented yet.
+- Volunteer Network, QR Invite, Import Config, and Private Node are not
+  implemented yet.
+
+## What Works In v0.1
+
+- Creates an Oracle Free Exit using your own Oracle Cloud account.
+- Provisions a small Oracle VM intended for Oracle Always Free usage.
+- Installs and configures WireGuard on the VM.
+- Starts an Android VPN tunnel using Android's `VpnService`.
+- Shows basic diagnostics such as exit IP, DNS configuration, and handshake
+  status.
+
+## Planned / Not Implemented Yet
+
+- Volunteer Network Mode.
+- QR Invite / trusted operator invites.
+- Import existing WireGuard config.
 - Create Private Node.
-- Logs, where shown as placeholders.
-- Fully polished Oracle signup, login, MFA/2FA, and browser return flow.
+- In-app logs.
+- Better destroy/recreate lifecycle.
+- Better onboarding and failure recovery.
 
-## Important: prepare your Oracle account first
+## Important Limitations
 
-At the moment, the hardest part of using ZeroVPN is not the VPN tunnel. It is
-getting through Oracle's account signup, login, and two-factor authentication
-flow.
+This is experimental software. It may fail during Oracle provisioning, VM
+setup, connection, or teardown.
 
-ZeroVPN does not create your Oracle account for you. It does not handle your
-Oracle password. It does not set up Oracle MFA/2FA for you.
+ZeroVPN is not a privacy guarantee. A VPN changes your network exit, not your
+identity. Websites, apps, Oracle, the exit network, DNS infrastructure, and
+other systems may still observe traffic metadata.
 
-To avoid frustration, create and verify your Oracle Cloud account before
-installing or testing ZeroVPN.
+Use at your own risk. Do not use ZeroVPN for anything that requires a
+professionally audited security product.
 
-Official Oracle links:
+## Installation
+
+Download the v0.1 pre-release APK from GitHub:
+
+https://github.com/Undert0e-505/zero-vpn/releases/tag/v0.1
+
+Install `ZeroVPN-v0.1.apk`. The public release APK is signed. Android will ask
+you to allow installation from the browser or file manager you use to open the
+APK.
+
+## Before Using ZeroVPN
+
+You need:
+
+- An Android device.
+- An Oracle Cloud account.
+- Oracle account email, password, and MFA working in a browser.
+- Oracle Free Tier / Always Free eligibility.
+- An internet connection.
+
+ZeroVPN cannot create your Oracle account for you. It does not bypass Oracle
+login, payment-card verification, region checks, or MFA.
+
+Useful Oracle links:
 
 - Oracle Cloud Free Tier signup: https://signup.oraclecloud.com/
 - Oracle Cloud Free Tier overview: https://www.oracle.com/cloud/free/
 - Oracle MFA documentation: https://docs.oracle.com/en-us/iaas/Content/Identity/Tasks/usingmfa.htm
 - Oracle Cloud Console: https://cloud.oracle.com/
 
-Oracle may require email verification, phone verification, payment-card
-verification, region selection, identity checks, and MFA/2FA setup. ZeroVPN does
-not control Oracle's account, billing, verification, capacity, or MFA systems.
-Oracle does not approve every signup, Free Tier capacity is not guaranteed in
-every region, and signup may not be quick.
+## Basic Usage
 
-## Recommended setup before using ZeroVPN
+1. Install the APK from the v0.1 release.
+2. Open ZeroVPN.
+3. Choose **Add Exit**.
+4. Choose **Create Oracle Free Exit**.
+5. Sign in to Oracle when the browser opens.
+6. Return to ZeroVPN.
+7. Let ZeroVPN discover your Oracle account region and provision the VM.
+8. Connect.
 
-1. Create an Oracle Cloud Free Tier account using Oracle's official signup page:
-   https://signup.oraclecloud.com/
-2. Complete any email, phone, payment-card, region, or identity checks Oracle
-   requires.
-3. Sign in to the Oracle Cloud Console at least once:
-   https://cloud.oracle.com/
-4. Complete Oracle MFA/2FA setup if prompted.
-5. Confirm you can reach the Oracle Cloud Console normally in a browser.
-6. Then install or open ZeroVPN and choose **Create Oracle Free Exit**.
-7. If asked, choose the existing-account/sign-in path.
+If region discovery fails, the app may ask you to choose your Oracle
+account/tenancy region manually. This is an Oracle account setting, not a
+statement about where you physically live.
 
-Do not create extra Oracle accounts just for experimentation. Use Oracle's
-services within Oracle's terms and limits.
+## Build From Source
 
-## Oracle onboarding is not polished yet
+Requirements:
 
-Existing Oracle users should have the smoothest experience. New users should
-sign up for Oracle Cloud before using the app.
+- Windows-native PowerShell.
+- Android Studio or Android SDK installed.
+- JDK available to Gradle.
+- `android/local.properties` with `sdk.dir=...` if Gradle cannot find your SDK.
 
-The Oracle signup/login return journey is still rough. If the browser does not
-return to ZeroVPN automatically after Oracle login or MFA, switch back to
-ZeroVPN manually from Android recent apps and continue from there.
-
-This is known roughness and not the intended final UX. ZeroVPN should not leave
-users guessing, but this part of the app is still being improved.
-
-## What ZeroVPN does after Oracle login
-
-After Oracle login, ZeroVPN uses Oracle API access to create the cloud resources
-needed for an exit:
-
-- Creates a small VM intended to fit Oracle Always Free usage.
-- Configures OCI networking and firewall/security rules.
-- Installs and configures WireGuard on the VM.
-- Creates a WireGuard client profile for Android.
-- Connects the device through that VM.
-
-## What ZeroVPN does not do
-
-- It does not create your Oracle account.
-- It does not bypass Oracle login.
-- It does not bypass Oracle MFA/2FA.
-- It does not guarantee Oracle Free Tier approval or capacity.
-- It does not hide the fact that traffic exits from your Oracle VM.
-- It does not currently provide the Volunteer Network, Scan QR Invite, Import
-  Config, or Create Private Node modes.
-
-## Exit types
-
-1. **Oracle Free Exit** - working/current main path.
-2. **Volunteer Network** - planned / not implemented.
-3. **Scan QR Invite** - planned / not implemented.
-4. **Import Config** - planned / not implemented.
-5. **Create Private Node** - planned / not implemented.
-
-## Privacy and responsibility
-
-ZeroVPN creates a personal exit in your own Oracle account. Traffic exits
-through that VM. HTTPS still protects encrypted website and app content, but the
-destination service and network observers may see the Oracle VM as the source IP.
-
-DNS is currently configured through the VPN path, but use diagnostics to confirm
-behavior on your device and network.
-
-You are responsible for your Oracle account and any cloud resources created in
-it. Destroy exits when you no longer need them.
-
-## Developer status
-
-Developer Mode hides raw WireGuard and SSH diagnostics from normal users. Debug
-views and private-key displays are development aids and should not be treated as
-production UX.
-
-The project is under active development. Expect rough edges, especially around
-Oracle account onboarding and browser return behavior.
-
-## Building
-
-Android build notes are in `docs/ANDROID_BUILD.md`.
-
-From the Android project directory:
+Debug build:
 
 ```powershell
 cd android
 .\gradlew.bat assembleDebug
 ```
 
+Release dry-run:
+
+```powershell
+.\scripts\build-apk.ps1 -Version 0.1 -DryRun -PreRelease -Clean
+```
+
+Real release builds require local signing configuration and GitHub CLI
+authentication. Do not commit local signing files or release APKs.
+
+## Release Signing
+
+Public release APKs are signed.
+
+Local signing configuration is intentionally ignored by git. Use
+`android/signing.properties` or the supported signing environment variables.
+Do not commit `signing.properties`, keystores, passwords, APKs, or AAB files.
+
+## Privacy / Security Model
+
+ZeroVPN's current model is bring your own exit.
+
+It reduces dependence on a commercial VPN provider, but it does not make you
+anonymous. The Oracle VM is still a cloud VM in your Oracle account, and traffic
+exits from that VM.
+
+You are responsible for your Oracle account and any infrastructure created in
+it. Destroy exits when you no longer need them.
+
 ## License
 
-MIT (see `LICENSE`). Dependencies may carry their own licenses; a full license
-review should be done before release.
+MIT. See `LICENSE`.
