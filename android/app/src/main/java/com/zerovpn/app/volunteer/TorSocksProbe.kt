@@ -16,14 +16,15 @@ class TorSocksProbe {
         socksHost: String,
         socksPort: Int,
         url: String = DEFAULT_TEST_URL,
+        timeoutSeconds: Long = SOCKS_TEST_TIMEOUT_SECONDS,
     ): Result = withContext(Dispatchers.IO) {
         val proxy = Proxy(Proxy.Type.SOCKS, InetSocketAddress(socksHost, socksPort))
         val client = OkHttpClient.Builder()
             .proxy(proxy)
             .dns(NoLocalDns)
-            .connectTimeout(20, TimeUnit.SECONDS)
-            .readTimeout(20, TimeUnit.SECONDS)
-            .callTimeout(45, TimeUnit.SECONDS)
+            .connectTimeout(timeoutSeconds, TimeUnit.SECONDS)
+            .readTimeout(timeoutSeconds, TimeUnit.SECONDS)
+            .callTimeout(timeoutSeconds, TimeUnit.SECONDS)
             .build()
         val request = Request.Builder()
             .url(url)
@@ -61,5 +62,6 @@ class TorSocksProbe {
 
     companion object {
         const val DEFAULT_TEST_URL = "https://check.torproject.org/api/ip"
+        const val SOCKS_TEST_TIMEOUT_SECONDS = 20L
     }
 }

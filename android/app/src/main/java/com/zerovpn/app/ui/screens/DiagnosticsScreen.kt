@@ -145,6 +145,14 @@ fun DiagnosticsScreen(
                 diagnostics = volunteerDiagnostics,
                 onStart = { volunteerNetworkController.startTest() },
                 onStop = { volunteerNetworkController.stopTest() },
+                onClearState = { volunteerNetworkController.clearTorState() },
+                onCopyDiagnostics = {
+                    copyToClipboard(
+                        context,
+                        "ZeroVPN Volunteer Network diagnostics",
+                        volunteerDiagnostics.copyText(volunteerStateText(volunteerState)),
+                    )
+                },
             )
             Spacer(modifier = Modifier.height(12.dp))
             SshDebugCard(
@@ -170,6 +178,8 @@ private fun VolunteerNetworkSpikeCard(
     diagnostics: VolunteerNetworkDiagnostics,
     onStart: () -> Unit,
     onStop: () -> Unit,
+    onClearState: () -> Unit,
+    onCopyDiagnostics: () -> Unit,
 ) {
     val startEnabled = state is VolunteerNetworkState.Idle ||
         state is VolunteerNetworkState.Stopped ||
@@ -177,6 +187,10 @@ private fun VolunteerNetworkSpikeCard(
     val stopEnabled = state !is VolunteerNetworkState.Idle &&
         state !is VolunteerNetworkState.Stopped &&
         state !is VolunteerNetworkState.Stopping
+    val clearEnabled = state is VolunteerNetworkState.Idle ||
+        state is VolunteerNetworkState.Stopped ||
+        state is VolunteerNetworkState.Failed ||
+        state is VolunteerNetworkState.Ready
 
     Column(
         modifier = Modifier
@@ -226,7 +240,32 @@ private fun VolunteerNetworkSpikeCard(
                 Text("Stop", fontSize = 13.sp, fontWeight = FontWeight.Medium)
             }
         }
-        DebugBlock("Diagnostics", diagnostics.toDebugText())
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            OutlinedButton(
+                onClick = onCopyDiagnostics,
+                modifier = Modifier.weight(1f),
+                colors = ButtonDefaults.outlinedButtonColors(
+                    contentColor = TextPrimary,
+                ),
+            ) {
+                Text("Copy diagnostics", fontSize = 12.sp, fontWeight = FontWeight.Medium)
+            }
+            OutlinedButton(
+                onClick = onClearState,
+                enabled = clearEnabled,
+                modifier = Modifier.weight(1f),
+                colors = ButtonDefaults.outlinedButtonColors(
+                    contentColor = TextPrimary,
+                    disabledContentColor = TextDim,
+                ),
+            ) {
+                Text("Clear Tor state", fontSize = 12.sp, fontWeight = FontWeight.Medium)
+            }
+        }
+        DebugBlock("Diagnostics", diagnostics.toDebugText(volunteerStateText(state)))
     }
 }
 
@@ -481,6 +520,9 @@ private fun volunteerStateText(state: VolunteerNetworkState): String = when (sta
         state.message.takeIf { it.isNotBlank() },
     ).joinToString(": ")
 }
+
+private fun VolunteerNetworkDiagnostics.copyText(stateText: String): String =
+    "Volunteer Network Spike\n${toDebugText(stateText)}"
 
 private fun exitIpText(state: UserDiagnosticsState): String = when (state.exitIpStatus) {
     ExitIpStatus.Idle -> "Not checked"
