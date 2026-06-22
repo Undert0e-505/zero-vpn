@@ -2,7 +2,7 @@
 
 This document compares likely implementation paths for Volunteer Network mode.
 
-## Option A: Orbot Companion Integration
+## Option A: Orbot Companion Integration as Prior Art
 
 ZeroVPN detects whether Orbot is installed and guides the user to install,
 open, or configure it.
@@ -35,10 +35,11 @@ branding, and distribution wording.
 
 Suitability:
 
-* v0.2 proof of concept: strong
+* v0.2 proof of concept: useful only as prior art
 * v0.3 integrated mode: weak by itself
 
-Recommendation: use this first to validate demand and UX.
+Recommendation: do not use this as the primary Phase 1 path. Keep Orbot as
+prior art for lifecycle, copy, diagnostics, and Android VPN constraints.
 
 ## Option B: Embedded Tor Plus tun2socks
 
@@ -76,11 +77,13 @@ its transitive dependencies.
 
 Suitability:
 
-* v0.2: too large for first step
-* v0.3: plausible proof of concept if Orbot companion findings are positive
+* v0.2: appropriate if split into an embedded SOCKS proof of concept first
+* v0.3: plausible route to full-device routing after DNS, UDP, and lifecycle
+  behavior are proven
 
-Recommendation: likely integrated path, but only after a small local SOCKS
-proof of concept.
+Recommendation: primary implementation path. Start with embedded Tor SOCKS
+only, then add VpnService plus tun2socks after local bootstrap and proxy
+behavior are proven.
 
 ## Option C: Onionmasq, Tor VPN, and Arti-Aligned Path
 
@@ -146,10 +149,10 @@ Private Node than public Volunteer Network.
 
 ## Overall Recommendation
 
-1. Start with Orbot companion integration to validate UX quickly.
-2. Prototype embedded local Tor or Arti with one SOCKS-routed test connection.
+1. Use Orbot only as prior art. Do not make a companion-app flow the planned
+   Phase 1.
+2. Prototype embedded local Tor with one SOCKS-routed test connection.
 3. Add VpnService plus tun2socks only after DNS, UDP, lifecycle, and licensing
    questions have concrete answers.
 4. Keep volunteer WireGuard nodes separate until there is a trust and abuse
    model.
-

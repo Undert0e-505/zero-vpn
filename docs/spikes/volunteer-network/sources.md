@@ -14,7 +14,25 @@ Primary sources used for this spike.
 * Guardian Project tor-android:
   https://github.com/guardianproject/tor-android
 
-  Android Tor binary and library packaging. Relevant for any embedded Tor path.
+  Android Tor binary and library packaging. This is the Phase 1 dependency
+  candidate for the embedded Tor SOCKS proof of concept. The current README
+  documents `info.guardianproject:tor-android:0.4.9.9` and `jtorctl`, API 24
+  minimum, standard Android ABIs (`arm64-v8a`, `armeabi-v7a`, `x86`,
+  `x86_64`), and `INTERNET` permission. Maven Central currently publishes
+  `info.guardianproject:tor-android:0.4.9.9.1`; its POM lists BSD 3-Clause,
+  `androidx.localbroadcastmanager:localbroadcastmanager:1.1.0`,
+  `info.guardianproject:jtorctl:0.4.5.7`, and Kotlin stdlib as compile
+  dependencies.
+
+* Maven Central tor-android metadata:
+  https://repo1.maven.org/maven2/info/guardianproject/tor-android/maven-metadata.xml
+
+  Used to confirm the available Maven version for the embedded dependency.
+
+* Maven Central tor-android 0.4.9.9.1 POM:
+  https://repo1.maven.org/maven2/info/guardianproject/tor-android/0.4.9.9.1/tor-android-0.4.9.9.1.pom
+
+  Used to confirm dependency metadata and declared license.
 
 * Guardian Project Orbot-IPtProxy:
   https://github.com/guardianproject/Orbot-IPtProxy
@@ -77,4 +95,3 @@ Primary sources used for this spike.
   mentions Android portability work, and warns that conventional browsers can
   leak identifying information when pointed at Tor/Arti. This supports cautious
   ZeroVPN product language.
-
