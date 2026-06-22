@@ -29,6 +29,8 @@ class VolunteerVpnService : VpnService() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private var tunFd: ParcelFileDescriptor? = null
     private var hevRunning = false
+    private var stopInProgress = false
+    private var stopCompleted = false
     private var startedAt: Long? = null
     private val tunConfig = VolunteerTunConfig()
 
@@ -44,7 +46,9 @@ class VolunteerVpnService : VpnService() {
     }
 
     override fun onDestroy() {
-        stopVolunteerVpn()
+        if (!stopCompleted && !stopInProgress && (hevRunning || tunFd != null)) {
+            stopVolunteerVpn()
+        }
         scope.cancel()
         super.onDestroy()
     }
@@ -57,6 +61,7 @@ class VolunteerVpnService : VpnService() {
     private fun startVolunteerVpn(socksHost: String, socksPort: Int) {
         if (hevRunning || tunFd != null) return
 
+        stopCompleted = false
         startedAt = System.currentTimeMillis()
         val smoke = HevNativeLoader.smokeTest()
         val initialDiagnostics = VolunteerVpnDiagnostics(
@@ -178,34 +183,44 @@ class VolunteerVpnService : VpnService() {
     }
 
     private fun stopVolunteerVpn() {
+        if (stopInProgress || stopCompleted) return
+        stopInProgress = true
         scope.launch {
             val stopStartedAt = System.currentTimeMillis()
             VolunteerVpnRuntime.update(
                 VolunteerVpnState.Stopping,
                 VolunteerVpnRuntime.diagnostics.value.copy(volunteerVpnState = "Stopping"),
             )
-            withContext(Dispatchers.IO) {
+            val stopError = withContext(Dispatchers.IO) {
+                var error: String? = null
                 if (hevRunning) {
                     runCatching { HevNativeLoader.TProxyStopService() }
+                        .onFailure { error = "HEV stop failed: ${it.javaClass.simpleName}: ${it.message}" }
                     hevRunning = false
                 }
                 runCatching { tunFd?.close() }
+                    .onFailure { error = listOfNotNull(error, "TUN close failed: ${it.javaClass.simpleName}: ${it.message}").joinToString("; ") }
                 tunFd = null
+                error
             }
             delay(250L)
             val stoppedAt = System.currentTimeMillis()
-            VolunteerVpnRuntime.update(
-                VolunteerVpnState.Stopped,
-                VolunteerVpnRuntime.diagnostics.value.copy(
-                    volunteerVpnState = "Stopped",
-                    vpnServiceStarted = false,
-                    tunFdOpen = false,
-                    hevRunning = false,
-                    androidVpnActiveDetected = isAndroidVpnActive(),
-                    stoppedAt = stoppedAt,
-                    stopDurationMs = stoppedAt - stopStartedAt,
-                ),
+            val stoppedDiagnostics = VolunteerVpnRuntime.diagnostics.value.copy(
+                volunteerVpnState = if (stopError == null) "Stopped" else "Failed",
+                vpnServiceStarted = false,
+                tunFdOpen = false,
+                hevRunning = false,
+                androidVpnActiveDetected = isAndroidVpnActive(),
+                lastError = stopError ?: VolunteerVpnRuntime.diagnostics.value.lastError,
+                stoppedAt = stoppedAt,
+                stopDurationMs = stoppedAt - stopStartedAt,
             )
+            VolunteerVpnRuntime.update(
+                if (stopError == null) VolunteerVpnState.Stopped else VolunteerVpnState.Failed(stopError),
+                stoppedDiagnostics,
+            )
+            stopCompleted = true
+            stopInProgress = false
             stopSelf()
         }
     }
