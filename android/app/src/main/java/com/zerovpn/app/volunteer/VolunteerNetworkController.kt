@@ -52,7 +52,7 @@ class VolunteerNetworkController(application: Application) : AndroidViewModel(ap
                 torStateDirectoryExisted = snapshot.stateDirectoryExists,
                 torCacheDirectoryExisted = snapshot.cacheDirectoryExists,
                 torServiceBound = snapshot.torServiceBound,
-                torRunning = snapshot.torRunning,
+                torRunning = snapshot.torRunning.toString(),
                 torServiceStatus = snapshot.latestStatus,
                 lastTestUrl = TorSocksProbe.DEFAULT_TEST_URL,
             )
@@ -85,7 +85,7 @@ class VolunteerNetworkController(application: Application) : AndroidViewModel(ap
                     torCacheDirectoryExisted = startResult.cacheDirectoryExisted,
                     lastSuccessfulBootstrapAt = lastSuccessfulBootstrapAt,
                     torServiceBound = true,
-                    torRunning = true,
+                    torRunning = "true",
                     torServiceStatus = "ON",
                     lastError = null,
                 )
@@ -96,6 +96,10 @@ class VolunteerNetworkController(application: Application) : AndroidViewModel(ap
                     socksPort = startResult.socksPort,
                 )
                 _diagnostics.value = _diagnostics.value.copy(
+                    bootstrapProgress = 100,
+                    bootstrapPhase = "done",
+                    bootstrapSummary = "Done",
+                    lastBootstrapMessage = "Bootstrapped 100%: Done",
                     lastTestUrl = result.url,
                     lastTestStatus = result.status,
                     lastExitIp = result.exitIp,
@@ -112,8 +116,9 @@ class VolunteerNetworkController(application: Application) : AndroidViewModel(ap
                     stoppedAt = stopped.stoppedAt,
                     stopDurationMs = stopped.stopDurationMs,
                     torServiceBound = stopped.torServiceBound,
-                    torRunning = stopped.torRunning,
-                    torServiceStatus = stopped.latestStatus,
+                    torRunning = stopped.torRunningText(),
+                    torServiceStatus = stopped.statusText(),
+                    effectiveStopped = stopped.effectiveStopped,
                     lastError = message,
                 )
                 _state.value = VolunteerNetworkState.Failed(
@@ -131,8 +136,9 @@ class VolunteerNetworkController(application: Application) : AndroidViewModel(ap
                     stoppedAt = stopped.stoppedAt,
                     stopDurationMs = stopped.stopDurationMs,
                     torServiceBound = stopped.torServiceBound,
-                    torRunning = stopped.torRunning,
-                    torServiceStatus = stopped.latestStatus,
+                    torRunning = stopped.torRunningText(),
+                    torServiceStatus = stopped.statusText(),
+                    effectiveStopped = stopped.effectiveStopped,
                     lastError = e.message ?: e.javaClass.simpleName,
                 )
                 _state.value = VolunteerNetworkState.Failed(
@@ -163,14 +169,16 @@ class VolunteerNetworkController(application: Application) : AndroidViewModel(ap
                     "Failed as expected: ${e.javaClass.simpleName}: ${e.message ?: "no message"}"
                 }
             } ?: "Skipped: no SOCKS port"
+            val effectiveStopped = stopResult.effectiveStopped(afterStopProbe)
             _diagnostics.value = _diagnostics.value.copy(
                 socksActive = false,
                 stopRequestedAt = stopResult.stopRequestedAt,
                 stoppedAt = stopResult.stoppedAt,
                 stopDurationMs = stopResult.stopDurationMs,
                 torServiceBound = stopResult.torServiceBound,
-                torRunning = stopResult.torRunning,
-                torServiceStatus = stopResult.latestStatus,
+                torRunning = stopResult.torRunningText(effectiveStopped),
+                torServiceStatus = stopResult.statusText(effectiveStopped),
+                effectiveStopped = effectiveStopped,
                 socksProbeAfterStop = afterStopProbe,
             )
             _state.value = VolunteerNetworkState.Stopped
@@ -203,8 +211,9 @@ class VolunteerNetworkController(application: Application) : AndroidViewModel(ap
                 stoppedAt = stopped.stoppedAt,
                 stopDurationMs = stopped.stopDurationMs,
                 torServiceBound = stopped.torServiceBound,
-                torRunning = stopped.torRunning,
-                torServiceStatus = stopped.latestStatus,
+                torRunning = stopped.torRunningText(true),
+                torServiceStatus = stopped.statusText(true),
+                effectiveStopped = true,
                 torStateDirectoryExisted = cleared.stateDirectoryExisted,
                 torCacheDirectoryExisted = cleared.cacheDirectoryExisted,
                 lastError = clearStatus,
@@ -229,4 +238,26 @@ class VolunteerNetworkController(application: Application) : AndroidViewModel(ap
         get() = this !is VolunteerNetworkState.Idle &&
             this !is VolunteerNetworkState.Stopped &&
             this !is VolunteerNetworkState.Stopping
+
+    private val EmbeddedTorController.StopResult.effectiveStopped: Boolean
+        get() = !torServiceBound && !torRunning
+
+    private fun EmbeddedTorController.StopResult.effectiveStopped(probeResult: String): Boolean =
+        !torServiceBound && probeResult.startsWith("Failed as expected")
+
+    private fun EmbeddedTorController.StopResult.torRunningText(
+        effectiveStopped: Boolean = this.effectiveStopped,
+    ): String = when {
+        effectiveStopped -> "false"
+        torRunning && latestStatus == "STOPPING" -> "unknown/stopping"
+        torRunning -> "true"
+        else -> "false"
+    }
+
+    private fun EmbeddedTorController.StopResult.statusText(
+        effectiveStopped: Boolean = this.effectiveStopped,
+    ): String? = when {
+        effectiveStopped && latestStatus == "STOPPING" -> "STOPPING (effective stop)"
+        else -> latestStatus
+    }
 }

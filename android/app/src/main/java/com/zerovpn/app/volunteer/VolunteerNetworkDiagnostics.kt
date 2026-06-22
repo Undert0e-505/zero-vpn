@@ -30,8 +30,9 @@ data class VolunteerNetworkDiagnostics(
     val stoppedAt: Long? = null,
     val stopDurationMs: Long? = null,
     val torServiceBound: Boolean? = null,
-    val torRunning: Boolean? = null,
+    val torRunning: String? = null,
     val torServiceStatus: String? = null,
+    val effectiveStopped: Boolean? = null,
     val socksProbeAfterStop: String? = null,
 ) {
     fun toDebugText(stateText: String? = null): String = buildString {
@@ -62,8 +63,9 @@ data class VolunteerNetworkDiagnostics(
         appendLine("stoppedAt=${stoppedAt?.toDisplayTime() ?: "N/A"}")
         appendLine("stopDurationMs=${stopDurationMs ?: "N/A"}")
         appendLine("torServiceBound=${torServiceBound?.toString() ?: "N/A"}")
-        appendLine("torRunning=${torRunning?.toString() ?: "N/A"}")
+        appendLine("torRunning=${torRunning ?: "N/A"}")
         appendLine("torServiceStatus=${torServiceStatus ?: "N/A"}")
+        appendLine("effectiveStopped=${effectiveStopped?.toString() ?: "N/A"}")
         appendLine("socksProbeAfterStop=${socksProbeAfterStop ?: "N/A"}")
     }.trimEnd()
 }
