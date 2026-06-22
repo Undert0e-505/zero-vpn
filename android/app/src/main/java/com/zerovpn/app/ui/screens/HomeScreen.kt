@@ -69,6 +69,7 @@ fun HomeScreen(
     var showDestroyDialog by remember { mutableStateOf(false) }
     var destroyTarget by remember { mutableStateOf<ConfiguredExit?>(null) }
     var pendingPermissionExit by remember { mutableStateOf<ConfiguredExit?>(null) }
+    var missingExitMessage by remember { mutableStateOf<String?>(null) }
 
     val hasExit = exits.isNotEmpty()
     val activeExitId = when (val currentState = vpnState) {
@@ -145,6 +146,33 @@ fun HomeScreen(
         )
     }
 
+    missingExitMessage?.let { message ->
+        AlertDialog(
+            onDismissRequest = { missingExitMessage = null },
+            title = { Text("Set up an exit first", color = TextPrimary) },
+            text = {
+                Text(
+                    text = message,
+                    color = TextDim,
+                    fontSize = 14.sp,
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    missingExitMessage = null
+                    onAddExit()
+                }) {
+                    Text("Add Exit", color = Accent)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { missingExitMessage = null }) {
+                    Text("Cancel", color = TextDim)
+                }
+            },
+        )
+    }
+
     Column(
         modifier = modifier
             .fillMaxSize()
@@ -190,11 +218,9 @@ fun HomeScreen(
                     } else if (vpnIsActive) {
                         vpnViewModel.disconnect()
                     } else if (!hasExit) {
-                        snackbarHostState.showSnackbar("No exit configured")
+                        missingExitMessage = "No exits configured. Create an exit before connecting."
                     } else if (selectedExit == null) {
-                        val message = "WireGuard config is missing for this exit. Re-provision the exit to enable VPN connection."
-                        vpnViewModel.fail(message)
-                        snackbarHostState.showSnackbar(message)
+                        missingExitMessage = "Select an exit before connecting."
                     } else if (selectedExit.wireGuardConfig.isBlank()) {
                         val message = "WireGuard config is empty for ${selectedExit.name}. Re-provision the exit to enable VPN connection."
                         vpnViewModel.fail(message)

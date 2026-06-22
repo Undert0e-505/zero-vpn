@@ -14,6 +14,7 @@ import com.wireguard.crypto.Key
 import com.wireguard.crypto.KeyPair
 import java.io.ByteArrayInputStream
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -361,7 +362,7 @@ class WireGuardTunnelController(
                     }
                 }
             }
-            if (inspectAndroidVpnTransport().detected) {
+            if (waitForVpnTransportToClear().detected) {
                 error("Android still reports an active VPN. Disconnect from Android VPN settings if this persists.")
             }
             clearActiveState()
@@ -496,6 +497,17 @@ class WireGuardTunnelController(
             Log.w(TAG, "Unable to inspect Android VPN transport: ${e.javaClass.simpleName}: ${e.message}", e)
             AndroidVpnSnapshot(detected = false)
         }
+    }
+
+    private suspend fun waitForVpnTransportToClear(): AndroidVpnSnapshot {
+        var latest = inspectAndroidVpnTransport()
+        repeat(5) { attempt ->
+            if (!latest.detected) return latest
+            Log.d(TAG, "Android VPN transport still visible after disconnect attempt ${attempt + 1}; waiting briefly")
+            delay(200)
+            latest = inspectAndroidVpnTransport()
+        }
+        return latest
     }
 
     private data class AndroidVpnSnapshot(
