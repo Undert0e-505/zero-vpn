@@ -61,15 +61,16 @@ That path should be designed separately from public Volunteer Network mode.
 * [UX copy](05-ux-copy.md)
 * [Implementation plan](06-implementation-plan.md)
 * [Open questions](07-open-questions.md)
+* [Device test results](08-device-test-results.md)
 * [Sources](sources.md)
 
 ## Next Action
 
-Run Phase 1 as a small embedded Tor SOCKS proof of concept:
+Harden the Phase 1 embedded Tor SOCKS proof of concept:
 
-1. Add tor-android or an equivalent embedded Tor dependency.
-2. Start Tor locally and wait for bootstrap.
-3. Expose a local SOCKS port.
-4. Perform one HTTP test request through the local SOCKS proxy.
-5. Shut down cleanly.
+1. Record richer bootstrap timing, phase, and retry diagnostics.
+2. Treat cold and warm bootstrap timeouts differently.
+3. Verify Stop shuts down Tor and marks SOCKS inactive.
+4. Add developer controls to copy diagnostics and clear Tor state.
+5. Keep the feature behind Developer Mode.
 6. Do not route Android device traffic yet.
