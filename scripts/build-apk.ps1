@@ -1,231 +1,412 @@
-# ============================================================
-# ZeroVPN -- Local APK Build (Windows-native PowerShell)
-# ============================================================
-# Builds, signs, and copies the APK to the Jimothy Share folder
-# for Google Drive delivery. No GitHub release step (yet).
+# ZeroVPN GitHub release build script.
 #
-# Usage:
-#   .\build-apk.ps1                          # build current version
-#   .\build-apk.ps1 -Version 0.2.0           # bump version, build, sign, copy
-#   .\build-apk.ps1 -Clean                   # nuke gradle cache first
+# Dry run:
+#   .\scripts\build-apk.ps1 -Version 0.1 -DryRun -PreRelease -Clean
 #
-# What it does (in order):
-#   1. (Optional) Bump version in build.gradle.kts
-#   2. Gradle assembleRelease
-#   3. Sign APK with apksigner (debug keystore)
-#   4. Verify signature
-#   5. Copy to Jimothy Share folder for Drive delivery
-#
-# Requirements (all on this Windows host):
-#   - JDK 21 at C:\Program Files\Java\jdk-21
-#   - Android SDK at D:\dev\android-sdk
-#   - debug.keystore (copied to android\app\ on first run)
-# ============================================================
+# Real release, after review and signing setup:
+#   .\scripts\build-apk.ps1 -Version 0.1 -PreRelease -Clean
 
 [CmdletBinding()]
 param(
-    [string]$Version = "",
+    [Parameter(Mandatory = $true)]
+    [ValidatePattern('^\d+(\.\d+){1,3}$')]
+    [string]$Version,
 
-    [switch]$Clean
+    [switch]$DryRun,
+    [switch]$PreRelease,
+    [switch]$Clean,
+    [switch]$AllowUnsigned
 )
 
-# --- Constants ---
-$APP_NAME = "ZeroVPN"
-$REPO_DIR = Split-Path $PSScriptRoot -Parent
-if (-not (Test-Path "$REPO_DIR\android\app\build.gradle.kts")) {
-    # If script is in the repo root, REPO_DIR is the script's parent
-    $REPO_DIR = $PSScriptRoot
+$ErrorActionPreference = "Stop"
+
+$AppName = "ZeroVPN"
+$RepoDir = Split-Path $PSScriptRoot -Parent
+$AndroidDir = Join-Path $RepoDir "android"
+$GradleFile = Join-Path $AndroidDir "app\build.gradle.kts"
+$DistDir = Join-Path $RepoDir "dist"
+$TagName = "v$Version"
+$ReleaseTitle = "$AppName $TagName"
+$NotesFile = Join-Path $DistDir "release-notes-$TagName.md"
+$SecretPattern = 'BEGIN PRIVATE KEY|BEGIN OPENSSH PRIVATE KEY|ST\$eyJ|Authorization:|Bearer |session_token|security-token|PrivateKey =|PresharedKey =|ocid1\.|gmail\.com'
+
+function Write-Step([string]$Message) {
+    Write-Host ""
+    Write-Host "==> $Message" -ForegroundColor Cyan
 }
-$ANDROID_DIR = "$REPO_DIR\android"
 
-$JDK_PATH = "C:\Program Files\Java\jdk-21"
-$ANDROID_SDK = "D:\dev\android-sdk"
-$SHARE_FOLDER = "D:\AIProjects\Aaron\Jimothy Share\zero-vpn"
-$KEYSTORE = "$ANDROID_DIR\app\debug.keystore"
-
-# Try to reuse TubePulse's debug keystore if ZeroVPN doesn't have one
-$TUBEPULSE_KEYSTORE = "D:\dev\tubepulse\android\app\debug.keystore"
-
-$UTF8_NO_BOM = [System.Text.UTF8Encoding]::new($false)
-
-# --- Banner ---
-Write-Host ""
-Write-Host "==========================================" -ForegroundColor Cyan
-Write-Host "  $APP_NAME - Build APK" -ForegroundColor Cyan
-if ($Version) { Write-Host "  Version: $Version" -ForegroundColor Cyan }
-Write-Host "  JDK: $JDK_PATH" -ForegroundColor Cyan
-Write-Host "  SDK: $ANDROID_SDK" -ForegroundColor Cyan
-Write-Host "  Share: $SHARE_FOLDER" -ForegroundColor Cyan
-Write-Host "==========================================" -ForegroundColor Cyan
-Write-Host ""
-
-# --- Verify tools ---
-Write-Host "[0/5] Verifying build tools..."
-
-if (-not (Test-Path "$JDK_PATH\bin\java.exe")) {
-    Write-Error "JDK not found at $JDK_PATH"
-    exit 1
+function Fail([string]$Message) {
+    throw $Message
 }
-Write-Host "  JDK 21  OK"
 
-if (-not (Test-Path "$ANDROID_SDK\platform-tools\adb.exe")) {
-    Write-Error "Android SDK not found at $ANDROID_SDK"
-    exit 1
-}
-Write-Host "  Android SDK  OK"
-
-$buildToolsDir = Get-ChildItem "$ANDROID_SDK\build-tools" -Directory | Sort-Object Name -Descending | Select-Object -First 1
-if (-not $buildToolsDir) {
-    Write-Error "No build-tools found in $ANDROID_SDK\build-tools"
-    exit 1
-}
-$apksigner = "$($buildToolsDir.FullName)\apksigner.bat"
-$aapt2 = "$($buildToolsDir.FullName)\aapt2.exe"
-Write-Host "  Build tools: $($buildToolsDir.Name)  OK"
-
-# Ensure keystore exists
-if (-not (Test-Path $KEYSTORE)) {
-    if (Test-Path $TUBEPULSE_KEYSTORE) {
-        Copy-Item $TUBEPULSE_KEYSTORE $KEYSTORE
-        Write-Host "  Copied debug.keystore from TubePulse  OK"
-    } else {
-        Write-Error "debug.keystore not found at $KEYSTORE or $TUBEPULSE_KEYSTORE"
-        exit 1
+function Run([string]$Command, [string[]]$Arguments, [switch]$AllowDryRun) {
+    $display = "$Command $($Arguments -join ' ')".Trim()
+    if ($DryRun -and $AllowDryRun) {
+        Write-Host "[dry-run] would run: $display" -ForegroundColor Yellow
+        return
     }
-} else {
-    Write-Host "  debug.keystore  OK"
-}
-
-# Ensure share folder exists
-if (-not (Test-Path $SHARE_FOLDER)) {
-    New-Item -ItemType Directory -Force -Path $SHARE_FOLDER | Out-Null
-    Write-Host "  Created share folder  OK"
-} else {
-    Write-Host "  Share folder  OK"
-}
-
-# --- Set environment ---
-$env:JAVA_HOME = $JDK_PATH
-$env:ANDROID_HOME = $ANDROID_SDK
-$env:ANDROID_SDK_ROOT = $ANDROID_SDK
-$env:PATH = "$JDK_PATH\bin;$ANDROID_SDK\platform-tools;$env:PATH"
-
-# --- Optional: clean ---
-if ($Clean) {
-    Write-Host ""
-    Write-Host "[clean] Removing gradle caches..."
-    Remove-Item -Recurse -Force "$ANDROID_DIR\app\build", "$ANDROID_DIR\build", "$ANDROID_DIR\.gradle" -ErrorAction SilentlyContinue
-    Write-Host "  done"
-}
-
-# --- Step 1: Version bump (optional) ---
-if ($Version) {
-    Write-Host ""
-    Write-Host "[1/5] Bumping version to $Version..."
-
-    $buildGradlePath = "$ANDROID_DIR\app\build.gradle.kts"
-    $buildGradle = Get-Content $buildGradlePath -Raw
-
-    $versionCode = $Version -replace '\.', ''
-    $buildGradle = $buildGradle -replace 'versionCode = \d+', "versionCode = $versionCode"
-    $buildGradle = $buildGradle -replace 'versionName = "[^"]+"', "versionName = `"$Version`""
-
-    [System.IO.File]::WriteAllText($buildGradlePath, $buildGradle, $UTF8_NO_BOM)
-    Write-Host "  build.gradle.kts (versionCode=$versionCode, versionName=$Version)  OK"
-} else {
-    Write-Host ""
-    Write-Host "[1/5] No version bump requested, building current version..."
-    # Read current version from build.gradle.kts
-    $buildGradle = Get-Content "$ANDROID_DIR\app\build.gradle.kts" -Raw
-    if ($buildGradle -match 'versionName = "([^"]+)"') {
-        $Version = $Matches[1]
-        $versionCode = $Version -replace '\.', ''
-    } else {
-        $Version = "unknown"
-        $versionCode = 0
-    }
-    Write-Host "  Current version: $Version  OK"
-}
-
-# --- Step 2: Gradle build ---
-Write-Host ""
-Write-Host "[2/5] Building APK with Gradle..."
-Set-Location $ANDROID_DIR
-& .\gradlew.bat assembleRelease --no-daemon 2>&1 | Tee-Object -FilePath "$env:TEMP\zerovpn-gradle.log" | Select-Object -Last 8
-$gradleExit = $LASTEXITCODE
-Set-Location $REPO_DIR
-
-if ($gradleExit -ne 0) {
-    Write-Error "Gradle build failed (exit $gradleExit). Log: $env:TEMP\zerovpn-gradle.log"
-    exit 1
-}
-Write-Host "  BUILD SUCCESSFUL  OK"
-
-# --- Step 3: Sign APK ---
-Write-Host ""
-Write-Host "[3/5] Signing APK..."
-
-$unsignedApk = "$ANDROID_DIR\app\build\outputs\apk\release\app-release-unsigned.apk"
-$signedApk = "$ANDROID_DIR\app\build\outputs\apk\release\app-release.apk"
-
-if (-not (Test-Path $unsignedApk)) {
-    # Try alternate name (some Gradle versions name it differently)
-    $altApk = "$ANDROID_DIR\app\build\outputs\apk\release\app-release.apk"
-    if (Test-Path $altApk) {
-        $unsignedApk = $altApk
-    } else {
-        Write-Error "APK not found at expected path: $unsignedApk"
-        exit 1
+    Write-Host $display
+    & $Command @Arguments
+    if ($LASTEXITCODE -ne 0) {
+        Fail "Command failed ($LASTEXITCODE): $display"
     }
 }
 
-& $apksigner sign --ks $KEYSTORE --ks-pass pass:android --ks-key-alias androiddebugkey --key-pass pass:android --out $signedApk $unsignedApk *>&1 | Out-Null
-if ($LASTEXITCODE -ne 0) {
-    Write-Error "apksigner failed (exit $LASTEXITCODE)"
-    exit 1
+function GitOutput([string[]]$Arguments) {
+    $output = & git @Arguments 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        Fail "git $($Arguments -join ' ') failed: $($output -join "`n")"
+    }
+    return $output
 }
-Write-Host "  Signed  OK"
 
-# --- Step 4: Verify ---
+function Read-GradleVersion {
+    $text = Get-Content -LiteralPath $GradleFile -Raw
+    if ($text -notmatch 'versionName\s*=\s*"([^"]+)"') {
+        Fail "Could not read versionName from $GradleFile"
+    }
+    $versionName = $Matches[1]
+    if ($text -notmatch 'versionCode\s*=\s*(\d+)') {
+        Fail "Could not read versionCode from $GradleFile"
+    }
+    $versionCode = [int]$Matches[1]
+    [pscustomobject]@{
+        VersionName = $versionName
+        VersionCode = $versionCode
+    }
+}
+
+function Test-CommandAvailable([string]$Name) {
+    return [bool](Get-Command $Name -ErrorAction SilentlyContinue)
+}
+
+function Get-AndroidSdkPath {
+    $localProperties = Join-Path $AndroidDir "local.properties"
+    if (Test-Path -LiteralPath $localProperties) {
+        $line = Get-Content -LiteralPath $localProperties | Where-Object { $_ -match '^sdk\.dir=' } | Select-Object -First 1
+        if ($line) {
+            $path = ($line -replace '^sdk\.dir=', '').Trim()
+            return ($path -replace '\\:', ':' -replace '\\\\', '\')
+        }
+    }
+    if ($env:ANDROID_HOME) { return $env:ANDROID_HOME }
+    if ($env:ANDROID_SDK_ROOT) { return $env:ANDROID_SDK_ROOT }
+    return $null
+}
+
+function Find-Aapt2 {
+    $sdk = Get-AndroidSdkPath
+    if (-not $sdk -or -not (Test-Path -LiteralPath $sdk)) { return $null }
+    $buildTools = Join-Path $sdk "build-tools"
+    if (-not (Test-Path -LiteralPath $buildTools)) { return $null }
+    $tool = Get-ChildItem -LiteralPath $buildTools -Directory |
+        Sort-Object Name -Descending |
+        ForEach-Object { Join-Path $_.FullName "aapt2.exe" } |
+        Where-Object { Test-Path -LiteralPath $_ } |
+        Select-Object -First 1
+    return $tool
+}
+
+function Find-ApkSigner {
+    $sdk = Get-AndroidSdkPath
+    if (-not $sdk -or -not (Test-Path -LiteralPath $sdk)) { return $null }
+    $buildTools = Join-Path $sdk "build-tools"
+    if (-not (Test-Path -LiteralPath $buildTools)) { return $null }
+    $tool = Get-ChildItem -LiteralPath $buildTools -Directory |
+        Sort-Object Name -Descending |
+        ForEach-Object { Join-Path $_.FullName "apksigner.bat" } |
+        Where-Object { Test-Path -LiteralPath $_ } |
+        Select-Object -First 1
+    return $tool
+}
+
+function Write-SigningSetupHelp {
+    Write-Host ""
+    Write-Host "Release signing is not configured." -ForegroundColor Yellow
+    Write-Host "Create a keystore outside the repo, for example:"
+    Write-Host '  keytool -genkeypair -v -keystore "%LOCALAPPDATA%\ZeroVPN\zerovpn-release.jks" -alias zerovpn -keyalg RSA -keysize 4096 -validity 10000'
+    Write-Host ""
+    Write-Host "Then create ignored android/signing.properties:"
+    Write-Host "  storeFile=C:\Users\<user>\AppData\Local\ZeroVPN\zerovpn-release.jks"
+    Write-Host "  storePassword=<password>"
+    Write-Host "  keyAlias=zerovpn"
+    Write-Host "  keyPassword=<password>"
+    Write-Host ""
+    Write-Host "Or set environment variables:"
+    Write-Host "  ZEROVPN_KEYSTORE_FILE, ZEROVPN_KEYSTORE_PASSWORD, ZEROVPN_KEY_ALIAS, ZEROVPN_KEY_PASSWORD"
+}
+
+function Remove-GeneratedBuildDirectory([string]$Path) {
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+    Get-ChildItem -LiteralPath $Path -Recurse -Force -ErrorAction SilentlyContinue | ForEach-Object {
+        if ($_.Attributes -band [System.IO.FileAttributes]::ReadOnly) {
+            $_.Attributes = $_.Attributes -band (-bnot [System.IO.FileAttributes]::ReadOnly)
+        }
+    }
+    $root = Get-Item -LiteralPath $Path -Force
+    if ($root.Attributes -band [System.IO.FileAttributes]::ReadOnly) {
+        $root.Attributes = $root.Attributes -band (-bnot [System.IO.FileAttributes]::ReadOnly)
+    }
+    try {
+        Remove-Item -LiteralPath $Path -Recurse -Force
+    } catch {
+        Write-Host "Warning: could not fully remove generated build directory ${Path}: $($_.Exception.Message)" -ForegroundColor Yellow
+    }
+}
+
+function Test-SensitiveMaterial {
+    Write-Step "Running public-readiness guardrail scan"
+
+    $trackedMatches = & git grep -n -I -E $SecretPattern -- . 2>$null
+    $trackedExit = $LASTEXITCODE
+    if ($trackedExit -eq 0) {
+        $blocked = $trackedMatches | Where-Object { -not (Test-AllowedSecretScanMatch $_) }
+        if ($blocked) {
+            $blocked | ForEach-Object { Write-Host $_ -ForegroundColor Red }
+            Fail "Sensitive-looking material found in tracked files."
+        }
+    } elseif ($trackedExit -ne 1) {
+        Fail "git grep secret scan failed."
+    }
+
+    $diffMatches = & git diff --cached -- 2>$null | Select-String -Pattern $SecretPattern
+    $blockedDiff = $diffMatches | ForEach-Object { $_.Line } | Where-Object { -not (Test-AllowedSecretScanMatch $_) }
+    if ($blockedDiff) {
+        $blockedDiff | ForEach-Object { Write-Host $_ -ForegroundColor Red }
+        Fail "Sensitive-looking material found in staged diff."
+    }
+
+    $trackedArtifacts = GitOutput @("ls-files") | Where-Object {
+        $_ -match '\.(apk|aab)$' -or
+        $_ -match 'harness/(python_all_requests|python_post_capture|state_machine_capture|test_capture).*\.(log|json)$' -or
+        $_ -match '__pycache__|\.pyc$'
+    }
+    if ($trackedArtifacts) {
+        $trackedArtifacts | ForEach-Object { Write-Host $_ -ForegroundColor Red }
+        Fail "Forbidden generated/release artifacts are tracked."
+    }
+
+    Write-Host "Guardrail scan passed."
+}
+
+function Test-AllowedSecretScanMatch([string]$Line) {
+    if ($Line -match 'REDACTED|example|<[^>]+>|\$\{|PrivateKey = \$[A-Z_]+|PresharedKey = \$[A-Z_]+') { return $true }
+    if ($Line -match 'PrivateKey = \{|PrivateKey = \$\(|PrivateKey = \{peer_|PrivateKey = \{peer') { return $true }
+    if ($Line -match 'value\(interfaceSection, "PrivateKey"\)|sshPrivateKey|clientKeys\.privateKey|sshKeyPair\.second|onCopyPrivateKey') { return $true }
+    if ($Line -match 'SecretPattern|Test-AllowedSecretScanMatch|git grep|PrivateKey = \\') { return $true }
+    if ($Line -match 'Authorization: Signature \.\.\.|Authorization header generated|Bearer token') { return $true }
+    if ($Line -match 'security-token material|security-token auth|ST\$\.\.\.') { return $true }
+    if ($Line -match 'ocid1\.example') { return $true }
+    return $false
+}
+
+function Write-ReleaseNotes {
+    New-Item -ItemType Directory -Force -Path $DistDir | Out-Null
+    @"
+ZeroVPN v$Version is the first experimental public release.
+
+Current working path:
+
+* Create an Oracle Free Exit
+* Provision an Oracle Cloud VM
+* Configure WireGuard
+* Connect Android through the VM using Android VpnService
+* Show basic connection diagnostics
+
+Important limitations:
+
+* Oracle account signup/login/MFA is still rough.
+* Create and verify your Oracle Cloud account before using the app.
+* Volunteer Network, QR Invite, Import Config, Private Node, and Logs are not implemented yet.
+* This is experimental software.
+* Traffic exits through your own Oracle VM.
+"@ | Set-Content -LiteralPath $NotesFile -Encoding UTF8
+}
+
+Set-Location $RepoDir
+
 Write-Host ""
-Write-Host "[4/5] Verifying..."
+Write-Host "==========================================" -ForegroundColor Cyan
+Write-Host "  $AppName release build" -ForegroundColor Cyan
+Write-Host "  Version: $Version" -ForegroundColor Cyan
+Write-Host "  Tag: $TagName" -ForegroundColor Cyan
+Write-Host "  DryRun: $DryRun" -ForegroundColor Cyan
+Write-Host "  PreRelease: $PreRelease" -ForegroundColor Cyan
+Write-Host "  AllowUnsigned: $AllowUnsigned" -ForegroundColor Cyan
+Write-Host "==========================================" -ForegroundColor Cyan
 
-$verifyOutput = (& $apksigner verify --verbose $signedApk 2>&1) -join "`n"
-if (-not $verifyOutput.Contains("Verifies")) {
-    Write-Error "Signature verification failed"
-    exit 1
-}
-Write-Host "  Signature verified  OK"
-
-# Check version in APK
-$badging = (& $aapt2 dump badging $signedApk 2>&1) -join "`n"
-if ($badging -match "versionCode='(\d+)' versionName='([^']+)'") {
-    $apkVc = $Matches[1]; $apkVn = $Matches[2]
-    Write-Host "  APK version: $apkVn (code=$apkVc)  OK"
+Write-Step "Validating tools"
+Run "git" @("--version")
+if (Test-CommandAvailable "gh") {
+    Run "gh" @("--version")
+    if (-not $DryRun) {
+        Run "gh" @("auth", "status")
+    } else {
+        Write-Host "[dry-run] would run: gh auth status" -ForegroundColor Yellow
+    }
+} elseif (-not $DryRun) {
+    Fail "GitHub CLI 'gh' is required for a real release."
 } else {
-    Write-Host "  Could not read APK version (non-critical)" -ForegroundColor Yellow
+    Write-Host "gh not found; dry-run will not create a release." -ForegroundColor Yellow
 }
 
-$apkSize = [math]::Round((Get-Item $signedApk).Length / 1MB, 1)
-Write-Host ("  Size: {0:N1} MB" -f $apkSize)
+Write-Step "Validating git state"
+$branch = (GitOutput @("branch", "--show-current") | Select-Object -First 1).Trim()
+$remote = GitOutput @("remote", "get-url", "origin") | Select-Object -First 1
+Write-Host "Branch: $branch"
+Write-Host "Origin: $remote"
 
-# --- Step 5: Copy to share folder ---
+$status = GitOutput @("status", "--short")
+if ($status -and -not $DryRun) {
+    $status | ForEach-Object { Write-Host $_ -ForegroundColor Yellow }
+    Fail "Working tree must be clean for a real release."
+} elseif ($status) {
+    Write-Host "Working tree is dirty; allowed because this is a dry-run." -ForegroundColor Yellow
+}
+
+$localTag = & git rev-parse -q --verify "refs/tags/$TagName" 2>$null
+if ($LASTEXITCODE -eq 0 -and $localTag) {
+    Fail "Local tag already exists: $TagName"
+}
+
+if (-not $DryRun) {
+    $remoteTag = & git ls-remote --tags origin $TagName 2>&1
+    if ($LASTEXITCODE -ne 0) { Fail "Could not check remote tag: $($remoteTag -join "`n")" }
+    if ($remoteTag) { Fail "Remote tag already exists: $TagName" }
+
+    $releaseView = & gh release view $TagName 2>$null
+    if ($LASTEXITCODE -eq 0) { Fail "GitHub release already exists: $TagName" }
+} else {
+    Write-Host "[dry-run] would check remote tag and GitHub release existence for $TagName" -ForegroundColor Yellow
+}
+
+Test-SensitiveMaterial
+
+Write-Step "Validating Gradle version"
+$gradleVersion = Read-GradleVersion
+Write-Host "Gradle versionName=$($gradleVersion.VersionName), versionCode=$($gradleVersion.VersionCode)"
+if ($gradleVersion.VersionName -ne $Version) {
+    Fail "Version mismatch: -Version $Version but Gradle versionName is $($gradleVersion.VersionName). Update android/app/build.gradle.kts first."
+}
+if ($Version -eq "0.1" -and $gradleVersion.VersionCode -ne 1) {
+    Fail "v0.1 must use versionCode 1; found $($gradleVersion.VersionCode)."
+}
+
+Write-ReleaseNotes
+
+Write-Step "Building release APK"
+Push-Location $AndroidDir
+try {
+    if ($Clean) {
+        Run ".\gradlew.bat" @("--stop") -AllowDryRun:$false
+        Remove-GeneratedBuildDirectory (Join-Path $AndroidDir "app\build")
+        Remove-GeneratedBuildDirectory (Join-Path $AndroidDir "build")
+    }
+    Run ".\gradlew.bat" @("assembleRelease", "--no-daemon") -AllowDryRun:$false
+} finally {
+    Pop-Location
+}
+
+$releaseDir = Join-Path $AndroidDir "app\build\outputs\apk\release"
+$releaseApk = Join-Path $releaseDir "app-release.apk"
+$unsignedApk = Join-Path $releaseDir "app-release-unsigned.apk"
+$isUnsigned = $false
+if (Test-Path -LiteralPath $releaseApk) {
+    $sourceApk = $releaseApk
+} elseif (Test-Path -LiteralPath $unsignedApk) {
+    $sourceApk = $unsignedApk
+    $isUnsigned = $true
+} else {
+    Fail "Release APK not found in $releaseDir"
+}
+if ($sourceApk -match 'debug') {
+    Fail "Refusing to release a debug APK: $sourceApk"
+}
+
+New-Item -ItemType Directory -Force -Path $DistDir | Out-Null
+$artifactName = if ($isUnsigned) { "$AppName-$TagName-unsigned.apk" } else { "$AppName-$TagName.apk" }
+$artifactPath = Join-Path $DistDir $artifactName
+Copy-Item -LiteralPath $sourceApk -Destination $artifactPath -Force
+Write-Host "Artifact: $artifactPath"
+if ($isUnsigned) {
+    Write-Host "Signing status: unsigned release APK" -ForegroundColor Yellow
+} else {
+    Write-Host "Signing status: signed release APK"
+}
+
+$apksigner = Find-ApkSigner
+$signatureVerified = $false
+$debugSigned = $false
+if ($apksigner) {
+    $previousErrorActionPreference = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    $verifyLines = & $apksigner verify --verbose --print-certs $artifactPath 2>&1
+    $verifyExitCode = $LASTEXITCODE
+    $ErrorActionPreference = $previousErrorActionPreference
+    $verifyOutput = $verifyLines -join "`n"
+    if ($verifyExitCode -eq 0) {
+        $signatureVerified = $true
+        Write-Host "APK signature verification: passed"
+        if ($verifyOutput -match 'CN=Android Debug') {
+            $debugSigned = $true
+        }
+    } else {
+        Write-Host "APK signature verification: failed" -ForegroundColor Yellow
+        if ($DryRun) {
+            Write-Host $verifyOutput -ForegroundColor DarkYellow
+        }
+    }
+} else {
+    Write-Host "apksigner not found; cannot verify APK signature." -ForegroundColor Yellow
+}
+
+if ($debugSigned) {
+    Fail "Refusing to release a debug-signed APK."
+}
+
+if ($isUnsigned -or -not $signatureVerified) {
+    Write-SigningSetupHelp
+    if (-not $DryRun -and -not $AllowUnsigned) {
+        Fail "Real releases require an apksigner-verified signed APK. Configure release signing or pass -AllowUnsigned only for internal testing."
+    }
+    if ($DryRun) {
+        Write-Host "Dry-run is allowed to continue with an unsigned APK. A real release would fail without signing." -ForegroundColor Yellow
+    }
+}
+
+$aapt2 = Find-Aapt2
+if ($aapt2) {
+    $badging = (& $aapt2 dump badging $artifactPath 2>&1) -join "`n"
+    if ($badging -match "versionCode='(\d+)'\s+versionName='([^']+)'") {
+        $apkVersionCode = [int]$Matches[1]
+        $apkVersionName = $Matches[2]
+        Write-Host "APK versionName=$apkVersionName, versionCode=$apkVersionCode"
+        if ($apkVersionName -ne $Version -or $apkVersionCode -ne $gradleVersion.VersionCode) {
+            Fail "APK version does not match Gradle/release version."
+        }
+    } else {
+        Write-Host "Could not read APK badging; continuing after Gradle version validation." -ForegroundColor Yellow
+    }
+} else {
+    Write-Host "aapt2 not found; skipping APK badging audit." -ForegroundColor Yellow
+}
+
+Write-Step "Release commands"
+Run "git" @("tag", "-a", $TagName, "-m", $ReleaseTitle) -AllowDryRun
+Run "git" @("push", "origin", $TagName) -AllowDryRun
+
+$releaseArgs = @("release", "create", $TagName, $artifactPath, "--title", $ReleaseTitle, "--notes-file", $NotesFile)
+if ($PreRelease) {
+    $releaseArgs += "--prerelease"
+}
+Run "gh" $releaseArgs -AllowDryRun
+
 Write-Host ""
-Write-Host "[5/5] Copying to Jimothy Share folder..."
-
-$shareApkName = "$APP_NAME-$Version.apk"
-$shareApkPath = Join-Path $SHARE_FOLDER $shareApkName
-
-# Clean up any old .idsig files from previous apksigner runs
-Get-ChildItem $SHARE_FOLDER -Filter "*.idsig" | Remove-Item -Force -ErrorAction SilentlyContinue
-
-Copy-Item $signedApk $shareApkPath -Force
-Write-Host "  Copied to: $shareApkPath  OK"
-
-Write-Host ""
-Write-Host "==========================================" -ForegroundColor Cyan
-Write-Host "  Build complete!" -ForegroundColor Cyan
-Write-Host "  APK: $shareApkPath" -ForegroundColor Cyan
-Write-Host ("  Size: {0:N1} MB" -f $apkSize) -ForegroundColor Cyan
-Write-Host "  Drive: Jimothy Share > zero-vpn > $shareApkName" -ForegroundColor Cyan
-Write-Host "==========================================" -ForegroundColor Cyan
+Write-Host "Release build prepared successfully." -ForegroundColor Green
+Write-Host "Tag: $TagName"
+Write-Host "Title: $ReleaseTitle"
+Write-Host "APK: $artifactPath"
+Write-Host "Notes: $NotesFile"
+if ($DryRun) {
+    Write-Host "Dry-run completed: no tag, push, or GitHub release was created." -ForegroundColor Yellow
+}

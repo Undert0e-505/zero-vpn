@@ -6,7 +6,9 @@
 *.iml
 .gradle/
 build/
+dist/
 local.properties
+android/signing.properties
 *.keystore
 *.jks
 keystore.properties
