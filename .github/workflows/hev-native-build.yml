@@ -1,0 +1,44 @@
+name: hev native build
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - spike/hev-native-build
+    paths:
+      - ".github/workflows/hev-native-build.yml"
+      - ".gitmodules"
+      - "android/native/hev-socks5-tunnel"
+      - "docs/spikes/volunteer-network/**"
+
+jobs:
+  build-hev-native:
+    name: Build hev-socks5-tunnel with Android NDK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Android NDK
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;27.0.12077973"
+
+      - name: Build pinned hev-socks5-tunnel source
+        env:
+          ANDROID_NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/27.0.12077973
+        run: |
+          "$ANDROID_NDK_HOME/ndk-build" \
+            NDK_PROJECT_PATH="$GITHUB_WORKSPACE/android/native/hev-socks5-tunnel" \
+            APP_BUILD_SCRIPT="$GITHUB_WORKSPACE/android/native/hev-socks5-tunnel/Android.mk" \
+            NDK_APPLICATION_MK="$GITHUB_WORKSPACE/android/native/hev-socks5-tunnel/Application.mk" \
+            APP_ABI="arm64-v8a armeabi-v7a x86_64"
+
+      - name: Validate native library output
+        run: |
+          test -f android/native/hev-socks5-tunnel/libs/arm64-v8a/libhev-socks5-tunnel.so
+          test -f android/native/hev-socks5-tunnel/libs/armeabi-v7a/libhev-socks5-tunnel.so
+          test -f android/native/hev-socks5-tunnel/libs/x86_64/libhev-socks5-tunnel.so

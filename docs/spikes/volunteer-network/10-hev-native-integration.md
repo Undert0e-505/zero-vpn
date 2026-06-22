@@ -95,16 +95,61 @@ denied symlink creation.
 This is a host checkout/tooling blocker, not evidence that the upstream Android
 source cannot build.
 
+The pinned source was moved to a dedicated branch,
+`spike/hev-native-build`, instead of being committed to `main`. This keeps the
+main branch free of the hev submodule until the native build is validated on a
+host that can check out upstream symlinks correctly. No Gradle native build
+wiring is active on the branch, so the Android app build remains independent of
+the experiment.
+
+## Linux CI Validation
+
+Linux validation is required because the current blocker is Windows symlink
+materialization, not an Android API or C compiler error.
+
+Workflow:
+
+* file: `.github/workflows/hev-native-build.yml`
+* runner: `ubuntu-latest`
+* checkout: `actions/checkout@v4` with `submodules: recursive`
+* NDK: `27.0.12077973`
+* build system: upstream `ndk-build`
+* ABIs: `arm64-v8a`, `armeabi-v7a`, `x86_64`
+
+The workflow invokes upstream source directly:
+
+```sh
+"$ANDROID_NDK_HOME/ndk-build" \
+  NDK_PROJECT_PATH="$GITHUB_WORKSPACE/android/native/hev-socks5-tunnel" \
+  APP_BUILD_SCRIPT="$GITHUB_WORKSPACE/android/native/hev-socks5-tunnel/Android.mk" \
+  NDK_APPLICATION_MK="$GITHUB_WORKSPACE/android/native/hev-socks5-tunnel/Application.mk" \
+  APP_ABI="arm64-v8a armeabi-v7a x86_64"
+```
+
+The validation step checks for:
+
+* `android/native/hev-socks5-tunnel/libs/arm64-v8a/libhev-socks5-tunnel.so`
+* `android/native/hev-socks5-tunnel/libs/armeabi-v7a/libhev-socks5-tunnel.so`
+* `android/native/hev-socks5-tunnel/libs/x86_64/libhev-socks5-tunnel.so`
+
+The workflow does not upload release artifacts and does not commit generated
+native outputs.
+
 ## Next Options
 
 Recommended order:
 
-1. Re-run the native build on a checkout where Windows symlink creation is
-   enabled, or on Linux/CI.
-2. If Windows support is required, add a small reviewed build-prep step that
+1. If Linux CI builds cleanly, decide whether to wire the pinned source into the
+   Android Gradle build with `externalNativeBuild`.
+2. If Linux CI fails, revisit the candidate or consider a controlled source
+   patch after inspecting the CI compiler log.
+3. If Linux CI passes but Windows remains unsupported, decide whether native
+   builds only need to run in CI/Linux or whether Windows developers must enable
+   symlink support.
+4. If Windows support is required, add a small reviewed build-prep step that
    materializes upstream symlink headers into a generated ignored directory and
    points `LOCAL_C_INCLUDES` there.
-3. If neither is acceptable, evaluate vendoring a minimal reviewed source patch
+5. If neither is acceptable, evaluate vendoring a minimal reviewed source patch
    to upstream include handling before moving to another tun2socks candidate.
 
 Do not manually commit generated headers or prebuilt native libraries.
