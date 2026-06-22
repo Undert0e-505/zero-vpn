@@ -6,7 +6,7 @@ data class HevTun2SocksConfig(
     val socksHost: String,
     val socksPort: Int,
     val tunnelMtu: Int = 1500,
-    val tunnelIpv4: String = "10.111.0.2",
+    val mappedDnsAddress: String = "198.18.0.2",
     val socksUdpMode: String = "tcp",
     val logLevel: String = "info",
 ) {
@@ -18,15 +18,19 @@ data class HevTun2SocksConfig(
 
     private fun toYaml(): String = """
         tunnel:
-          name: tun0
           mtu: $tunnelMtu
-          multi-queue: false
-          ipv4: $tunnelIpv4
 
         socks5:
           port: $socksPort
-          address: $socksHost
+          address: '$socksHost'
           udp: '$socksUdpMode'
+
+        mapdns:
+          address: $mappedDnsAddress
+          port: 53
+          network: 100.64.0.0
+          netmask: 255.192.0.0
+          cache-size: 10000
 
         misc:
           task-stack-size: 86016

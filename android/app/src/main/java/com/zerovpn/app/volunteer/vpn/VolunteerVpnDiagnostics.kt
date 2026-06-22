@@ -11,15 +11,29 @@ data class VolunteerVpnDiagnostics(
     val tunFdOpen: Boolean = false,
     val tunAddress: String = "10.111.0.2/32",
     val routes: String = "0.0.0.0/0",
-    val dnsMode: String = "not-safe-yet",
+    val dnsServer: String = "198.18.0.2",
+    val dnsMode: String = "hev-map-dns-through-socks",
     val dnsLeakRisk: String = "unknown",
     val udpMode: String = "unsupported-tcp-only",
+    val zeroVpnAppIncludedInVolunteerVpn: Boolean = true,
     val hevNativeEnabled: Boolean = false,
     val hevLibraryLoaded: Boolean = false,
+    val hevStartResult: String? = null,
     val hevRunning: Boolean = false,
     val socksTarget: String = "127.0.0.1:9050",
     val torReady: Boolean = false,
     val androidVpnActiveDetected: Boolean = false,
+    val hevConfigPath: String? = null,
+    val hevConfigExists: Boolean? = null,
+    val hevConfigSizeBytes: Long? = null,
+    val hevConfigLastModified: Long? = null,
+    val hevConfigContents: String? = null,
+    val torSocksBaselineStatus: String? = null,
+    val torSocksBaselineIsTor: Boolean? = null,
+    val torSocksBaselineExitIp: String? = null,
+    val vpnDnsValidationStatus: String? = null,
+    val vpnTcpValidationStatus: String? = null,
+    val vpnTorValidationStatus: String? = null,
     val lastValidationUrl: String? = null,
     val lastValidationStatus: String? = null,
     val lastValidationIsTor: Boolean? = null,
@@ -41,15 +55,28 @@ data class VolunteerVpnDiagnostics(
         appendLine("tunFdOpen=$tunFdOpen")
         appendLine("tunAddress=$tunAddress")
         appendLine("routes=$routes")
+        appendLine("dnsServer=$dnsServer")
         appendLine("dnsMode=$dnsMode")
         appendLine("dnsLeakRisk=$dnsLeakRisk")
         appendLine("udpMode=$udpMode")
+        appendLine("zeroVpnAppIncludedInVolunteerVpn=$zeroVpnAppIncludedInVolunteerVpn")
         appendLine("hevNativeEnabled=$hevNativeEnabled")
         appendLine("hevLibraryLoaded=$hevLibraryLoaded")
+        appendLine("hevStartResult=${hevStartResult ?: "N/A"}")
         appendLine("hevRunning=$hevRunning")
         appendLine("socksTarget=$socksTarget")
         appendLine("torReady=$torReady")
         appendLine("androidVpnActiveDetected=$androidVpnActiveDetected")
+        appendLine("hevConfigPath=${hevConfigPath ?: "N/A"}")
+        appendLine("hevConfigExists=${hevConfigExists?.toString() ?: "N/A"}")
+        appendLine("hevConfigSizeBytes=${hevConfigSizeBytes ?: "N/A"}")
+        appendLine("hevConfigLastModified=${hevConfigLastModified?.toDisplayTime() ?: "N/A"}")
+        appendLine("torSocksBaselineStatus=${torSocksBaselineStatus ?: "N/A"}")
+        appendLine("torSocksBaselineIsTor=${torSocksBaselineIsTor?.toString() ?: "N/A"}")
+        appendLine("torSocksBaselineExitIp=${torSocksBaselineExitIp ?: "N/A"}")
+        appendLine("vpnDnsValidationStatus=${vpnDnsValidationStatus ?: "N/A"}")
+        appendLine("vpnTcpValidationStatus=${vpnTcpValidationStatus ?: "N/A"}")
+        appendLine("vpnTorValidationStatus=${vpnTorValidationStatus ?: "N/A"}")
         appendLine("lastValidationUrl=${lastValidationUrl ?: "N/A"}")
         appendLine("lastValidationStatus=${lastValidationStatus ?: "N/A"}")
         appendLine("lastValidationIsTor=${lastValidationIsTor?.toString() ?: "N/A"}")
@@ -62,6 +89,7 @@ data class VolunteerVpnDiagnostics(
         appendLine("startedAt=${startedAt?.toDisplayTime() ?: "N/A"}")
         appendLine("stoppedAt=${stoppedAt?.toDisplayTime() ?: "N/A"}")
         appendLine("stopDurationMs=${stopDurationMs ?: "N/A"}")
+        appendLine("hevConfigContents=${hevConfigContents ?: "N/A"}")
     }.trimEnd()
 }
 

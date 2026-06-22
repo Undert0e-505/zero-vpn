@@ -247,6 +247,86 @@ The service stops HEV first, closes the TUN fd, updates diagnostics, and leaves
 Tor running explicitly. Tor can still be stopped separately through the existing
 embedded Tor controls.
 
+## Routing Failure Diagnostic Pass
+
+Device validation after the initial `VpnService` spike passed Level 1:
+
+* HEV native loaded on `arm64-v8a`
+* embedded Tor reached `Ready`
+* Android VPN permission was granted
+* TUN was created
+* HEV was running
+* Android VPN transport was detected
+* HEV counters moved: `txPackets=5`, `txBytes=300`, `rxPackets=1`,
+  `rxBytes=44`
+
+Level 2/3 failed:
+
+* in-app validation to `https://check.torproject.org/api/ip` timed out
+* browser traffic had no internet access while the Volunteer VPN test was active
+
+The first diagnostic fix makes the generated HEV config visible in Developer
+Mode diagnostics:
+
+* config file path
+* config existence
+* file size
+* last modified time
+* full YAML contents
+* HEV start call result
+
+The current generated YAML shape is:
+
+```yaml
+tunnel:
+  mtu: 1500
+
+socks5:
+  port: 9050
+  address: '127.0.0.1'
+  udp: 'tcp'
+
+mapdns:
+  address: 198.18.0.2
+  port: 53
+  network: 100.64.0.0
+  netmask: 255.192.0.0
+  cache-size: 10000
+
+misc:
+  task-stack-size: 86016
+  connect-timeout: 10000
+  tcp-read-write-timeout: 300000
+  log-file: stderr
+  log-level: info
+```
+
+This deliberately follows the upstream/SocksTun Android shape more closely than
+the first attempt:
+
+* `VpnService.Builder.setBlocking(false)`
+* `Builder.addDnsServer(198.18.0.2)`
+* `mapdns` enabled in HEV config
+* app traffic intentionally included in the VPN for in-app validation
+
+Diagnostics now separate validation layers:
+
+* `torSocksBaselineStatus`: explicit SOCKS request through local Tor
+* `vpnDnsValidationStatus`: unproxied HTTPS request requiring DNS after VPN
+  activation
+* `vpnTcpValidationStatus`: direct TCP connect to `1.1.1.1:443` after VPN
+  activation
+* `vpnTorValidationStatus`: Tor check result over the VPN path
+
+DNS status is now `dnsMode=hev-map-dns-through-socks` and
+`dnsLeakRisk=unknown`. This is still not production leak-safe until device tests
+prove browser and app DNS behavior.
+
+UDP status remains
+`udpMode=unsupported-udp-over-tcp-requested-tor-compat-unknown`. Tor SOCKS is
+not a general UDP transport, so product Volunteer Network must still treat UDP
+as unsupported unless a separate safe design is proven.
+
 ## Next Options
 
 Recommended order:

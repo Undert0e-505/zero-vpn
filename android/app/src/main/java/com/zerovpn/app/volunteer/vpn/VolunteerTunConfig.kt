@@ -6,7 +6,7 @@ data class VolunteerTunConfig(
     val prefixLength: Int = 32,
     val route: String = "0.0.0.0",
     val routePrefixLength: Int = 0,
-    val dnsServer: String = "10.111.0.1",
+    val dnsServer: String = "198.18.0.2",
     val mtu: Int = 1500,
 ) {
     val addressDisplay: String = "$address/$prefixLength"

@@ -20,6 +20,8 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.json.JSONObject
 import java.io.File
+import java.net.InetSocketAddress
+import java.net.Socket
 import java.util.concurrent.TimeUnit
 
 class VolunteerVpnService : VpnService() {
@@ -88,31 +90,43 @@ class VolunteerVpnService : VpnService() {
         scope.launch {
             runCatching {
                 val establishedTun = Builder()
+                    .setBlocking(false)
                     .setSession(tunConfig.sessionName)
                     .setMtu(tunConfig.mtu)
                     .addAddress(tunConfig.address, tunConfig.prefixLength)
                     .addRoute(tunConfig.route, tunConfig.routePrefixLength)
+                    .addDnsServer(tunConfig.dnsServer)
                     .establish() ?: error("VpnService.Builder.establish() returned null")
                 tunFd = establishedTun
 
-                val configPath = withContext(Dispatchers.IO) {
+                val configFile = withContext(Dispatchers.IO) {
                     HevTun2SocksConfig(
                         socksHost = socksHost,
                         socksPort = socksPort,
                         tunnelMtu = tunConfig.mtu,
-                        tunnelIpv4 = tunConfig.address,
-                    ).writeTo(File(cacheDir, "volunteer-hev/hev-socks5-tunnel.yml")).absolutePath
+                        mappedDnsAddress = tunConfig.dnsServer,
+                    ).writeTo(File(cacheDir, "volunteer-hev/hev-socks5-tunnel.yml"))
                 }
+                val configContents = withContext(Dispatchers.IO) { configFile.readText() }
 
                 VolunteerVpnRuntime.updateDiagnostics {
                     it.copy(
                         tunCreated = true,
                         tunFdOpen = true,
+                        dnsServer = tunConfig.dnsServer,
+                        dnsMode = DNS_MODE,
+                        dnsLeakRisk = DNS_LEAK_RISK,
+                        zeroVpnAppIncludedInVolunteerVpn = true,
+                        hevConfigPath = configFile.absolutePath,
+                        hevConfigExists = configFile.exists(),
+                        hevConfigSizeBytes = configFile.length(),
+                        hevConfigLastModified = configFile.lastModified(),
+                        hevConfigContents = configContents,
                         androidVpnActiveDetected = isAndroidVpnActive(),
                     )
                 }
                 withContext(Dispatchers.IO) {
-                    HevNativeLoader.TProxyStartService(configPath, establishedTun.fd)
+                    HevNativeLoader.TProxyStartService(configFile.absolutePath, establishedTun.fd)
                 }
                 hevRunning = true
                 VolunteerVpnRuntime.update(
@@ -121,13 +135,17 @@ class VolunteerVpnService : VpnService() {
                         volunteerVpnState = "Running",
                         tunCreated = true,
                         tunFdOpen = true,
+                        hevStartResult = "TProxyStartService returned",
                         hevRunning = true,
                         androidVpnActiveDetected = isAndroidVpnActive(),
                         lastError = null,
                     ),
                 )
                 refreshStats()
+                runTorSocksBaseline(socksHost, socksPort)
+                refreshStats()
                 runValidation()
+                refreshStats()
             }.getOrElse { e ->
                 VolunteerVpnRuntime.update(
                     VolunteerVpnState.Failed(e.message ?: e.javaClass.simpleName),
@@ -192,41 +210,79 @@ class VolunteerVpnService : VpnService() {
     }
 
     private suspend fun runValidation() {
-        val result = withContext(Dispatchers.IO) {
-            val client = OkHttpClient.Builder()
-                .connectTimeout(20, TimeUnit.SECONDS)
-                .readTimeout(20, TimeUnit.SECONDS)
-                .callTimeout(20, TimeUnit.SECONDS)
-                .build()
-            val request = Request.Builder()
-                .url(TorSocksProbe.DEFAULT_TEST_URL)
-                .header("Accept", "application/json")
-                .build()
-
-            runCatching {
-                client.newCall(request).execute().use { response ->
-                    val body = response.body?.string().orEmpty()
-                    val json = runCatching { JSONObject(body) }.getOrNull()
-                    ValidationResult(
-                        status = "HTTP ${response.code}" + (
-                            json?.takeIf { it.has("IsTor") }?.let { " IsTor=${it.optBoolean("IsTor")}" } ?: ""
-                            ),
-                        isTor = json?.takeIf { it.has("IsTor") }?.optBoolean("IsTor"),
-                        exitIp = json?.optString("IP")?.takeIf { it.isNotBlank() },
-                    )
-                }
-            }.getOrElse { e ->
-                ValidationResult(status = "Failed: ${e.javaClass.simpleName}: ${e.message}", isTor = null, exitIp = null)
-            }
-        }
+        val dnsResult = runHttpValidation(TorSocksProbe.DEFAULT_TEST_URL)
+        val tcpResult = runTcpValidation("1.1.1.1", 443)
+        val torResult = dnsResult
         VolunteerVpnRuntime.updateDiagnostics {
             it.copy(
                 lastValidationUrl = TorSocksProbe.DEFAULT_TEST_URL,
-                lastValidationStatus = result.status,
-                lastValidationIsTor = result.isTor,
-                lastValidationExitIp = result.exitIp,
+                vpnDnsValidationStatus = dnsResult.status,
+                vpnTcpValidationStatus = tcpResult,
+                vpnTorValidationStatus = torResult.status,
+                lastValidationStatus = torResult.status,
+                lastValidationIsTor = torResult.isTor,
+                lastValidationExitIp = torResult.exitIp,
                 androidVpnActiveDetected = isAndroidVpnActive(),
             )
+        }
+    }
+
+    private suspend fun runTorSocksBaseline(socksHost: String, socksPort: Int) {
+        val result = runCatching {
+            TorSocksProbe().run(socksHost = socksHost, socksPort = socksPort)
+        }.getOrElse { e ->
+            TorSocksProbe.Result(
+                url = TorSocksProbe.DEFAULT_TEST_URL,
+                status = "Failed: ${e.javaClass.simpleName}: ${e.message}",
+                exitIp = null,
+                isTor = null,
+            )
+        }
+        VolunteerVpnRuntime.updateDiagnostics {
+            it.copy(
+                torSocksBaselineStatus = result.status,
+                torSocksBaselineIsTor = result.isTor,
+                torSocksBaselineExitIp = result.exitIp,
+            )
+        }
+    }
+
+    private suspend fun runHttpValidation(url: String): ValidationResult = withContext(Dispatchers.IO) {
+        val client = OkHttpClient.Builder()
+            .connectTimeout(20, TimeUnit.SECONDS)
+            .readTimeout(20, TimeUnit.SECONDS)
+            .callTimeout(20, TimeUnit.SECONDS)
+            .build()
+        val request = Request.Builder()
+            .url(url)
+            .header("Accept", "application/json")
+            .build()
+
+        runCatching {
+            client.newCall(request).execute().use { response ->
+                val body = response.body?.string().orEmpty()
+                val json = runCatching { JSONObject(body) }.getOrNull()
+                ValidationResult(
+                    status = "HTTP ${response.code}" + (
+                        json?.takeIf { it.has("IsTor") }?.let { " IsTor=${it.optBoolean("IsTor")}" } ?: ""
+                        ),
+                    isTor = json?.takeIf { it.has("IsTor") }?.optBoolean("IsTor"),
+                    exitIp = json?.optString("IP")?.takeIf { it.isNotBlank() },
+                )
+            }
+        }.getOrElse { e ->
+            ValidationResult(status = "Failed: ${e.javaClass.simpleName}: ${e.message}", isTor = null, exitIp = null)
+        }
+    }
+
+    private suspend fun runTcpValidation(host: String, port: Int): String = withContext(Dispatchers.IO) {
+        runCatching {
+            Socket().use { socket ->
+                socket.connect(InetSocketAddress(host, port), 20_000)
+            }
+            "TCP connect succeeded: $host:$port"
+        }.getOrElse { e ->
+            "Failed: ${e.javaClass.simpleName}: ${e.message}"
         }
     }
 
@@ -251,9 +307,9 @@ class VolunteerVpnService : VpnService() {
         private const val EXTRA_SOCKS_PORT = "socksPort"
         private const val DEFAULT_SOCKS_HOST = "127.0.0.1"
         private const val DEFAULT_SOCKS_PORT = 9050
-        private const val DNS_MODE = "not-safe-yet-system-resolver"
-        private const val DNS_LEAK_RISK = "true"
-        private const val UDP_MODE = "unsupported-socks-udp-over-tcp-configured"
+        private const val DNS_MODE = "hev-map-dns-through-socks"
+        private const val DNS_LEAK_RISK = "unknown"
+        private const val UDP_MODE = "unsupported-udp-over-tcp-requested-tor-compat-unknown"
 
         fun startIntent(context: Context, socksHost: String, socksPort: Int): Intent =
             Intent(context, VolunteerVpnService::class.java).apply {
