@@ -135,21 +135,72 @@ The validation step checks for:
 The workflow does not upload release artifacts and does not commit generated
 native outputs.
 
+The Linux source-only validation passed on run `27960996947`, proving the
+pinned submodule can build `libhev-socks5-tunnel.so` for `arm64-v8a`,
+`armeabi-v7a`, and `x86_64` on a host where upstream symlink headers check out
+correctly.
+
+## Gated Android App Integration
+
+The app build uses an explicit Gradle property gate:
+
+```sh
+./gradlew assembleDebug -PenableHevNative=true
+```
+
+Default behavior when the property is missing or false:
+
+* no `externalNativeBuild` configuration is added
+* no hev native source build is attempted
+* `BuildConfig.HEV_NATIVE_ENABLED=false`
+* Windows `assembleDebug` remains safe even when upstream symlink headers cannot
+  be materialized locally
+
+Enabled behavior when `-PenableHevNative=true`:
+
+* NDK version is pinned to `27.0.12077973`
+* Gradle uses upstream `android/native/hev-socks5-tunnel/Android.mk`
+* an app-local `Application.mk` wrapper lets Android Gradle Plugin own ABI
+  selection
+* ABIs are `arm64-v8a`, `armeabi-v7a`, and `x86_64`
+* `BuildConfig.HEV_NATIVE_ENABLED=true`
+* JNI macros target
+  `com/zerovpn/app/volunteer/tun2socks/HevNativeLoader`
+
+Developer diagnostics now include a minimal HEV native smoke block. The smoke
+path only attempts `System.loadLibrary("hev-socks5-tunnel")` when
+`HEV_NATIVE_ENABLED=true`; default builds report the native library as
+unavailable and do not load it. The current smoke test proves loadability only.
+It does not start hev, create a TUN fd, or route traffic.
+
+CI was extended to run:
+
+1. standalone upstream hev native build
+2. default Android `assembleDebug`
+3. Android `assembleDebug -PenableHevNative=true`
+4. APK inspection for `libhev-socks5-tunnel.so` under all selected ABIs
+
+The workflow update must be pushed before the hev-enabled APK packaging result
+is known.
+
 ## Next Options
 
 Recommended order:
 
-1. If Linux CI builds cleanly, decide whether to wire the pinned source into the
-   Android Gradle build with `externalNativeBuild`.
-2. If Linux CI fails, revisit the candidate or consider a controlled source
-   patch after inspecting the CI compiler log.
-3. If Linux CI passes but Windows remains unsupported, decide whether native
+1. Push the gated app integration branch and confirm CI builds the hev-enabled
+   APK with packaged native libraries.
+2. If APK packaging passes, run a device build with `enableHevNative=true` and
+   confirm Developer Mode diagnostics report `loaded=true`.
+3. Add a minimal JNI start/stop wrapper around upstream's registered methods,
+   still without `VpnService`.
+4. Then add the Developer Mode-only `VpnService` TUN fd wiring.
+5. If Linux CI passes but Windows remains unsupported, decide whether native
    builds only need to run in CI/Linux or whether Windows developers must enable
    symlink support.
-4. If Windows support is required, add a small reviewed build-prep step that
+6. If Windows support is required, add a small reviewed build-prep step that
    materializes upstream symlink headers into a generated ignored directory and
    points `LOCAL_C_INCLUDES` there.
-5. If neither is acceptable, evaluate vendoring a minimal reviewed source patch
+7. If neither is acceptable, evaluate vendoring a minimal reviewed source patch
    to upstream include handling before moving to another tun2socks candidate.
 
 Do not manually commit generated headers or prebuilt native libraries.

@@ -57,6 +57,8 @@ import com.zerovpn.app.vpn.VpnViewModel
 import com.zerovpn.app.volunteer.VolunteerNetworkController
 import com.zerovpn.app.volunteer.VolunteerNetworkDiagnostics
 import com.zerovpn.app.volunteer.VolunteerNetworkState
+import com.zerovpn.app.volunteer.tun2socks.HevNativeDiagnostics
+import com.zerovpn.app.volunteer.tun2socks.HevNativeLoader
 import java.text.DateFormat
 import java.util.Date
 
@@ -143,6 +145,7 @@ fun DiagnosticsScreen(
             VolunteerNetworkSpikeCard(
                 state = volunteerState,
                 diagnostics = volunteerDiagnostics,
+                hevNativeDiagnostics = HevNativeLoader.smokeTest(),
                 onStart = { volunteerNetworkController.startTest() },
                 onStop = { volunteerNetworkController.stopTest() },
                 onClearState = { volunteerNetworkController.clearTorState() },
@@ -176,6 +179,7 @@ fun DiagnosticsScreen(
 private fun VolunteerNetworkSpikeCard(
     state: VolunteerNetworkState,
     diagnostics: VolunteerNetworkDiagnostics,
+    hevNativeDiagnostics: HevNativeDiagnostics,
     onStart: () -> Unit,
     onStop: () -> Unit,
     onClearState: () -> Unit,
@@ -266,6 +270,7 @@ private fun VolunteerNetworkSpikeCard(
             }
         }
         DebugBlock("Diagnostics", diagnostics.toDebugText(volunteerStateText(state)))
+        DebugBlock("HEV native smoke test", hevNativeDiagnostics.toDebugText())
     }
 }
 

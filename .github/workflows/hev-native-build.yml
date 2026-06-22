@@ -8,6 +8,7 @@ on:
     paths:
       - ".github/workflows/hev-native-build.yml"
       - ".gitmodules"
+      - "android/app/**"
       - "android/native/hev-socks5-tunnel"
       - "docs/spikes/volunteer-network/**"
 
@@ -41,3 +42,17 @@ jobs:
           test -f android/native/hev-socks5-tunnel/libs/arm64-v8a/libhev-socks5-tunnel.so
           test -f android/native/hev-socks5-tunnel/libs/armeabi-v7a/libhev-socks5-tunnel.so
           test -f android/native/hev-socks5-tunnel/libs/x86_64/libhev-socks5-tunnel.so
+
+      - name: Build Android app without hev native gate
+        working-directory: android
+        run: ./gradlew assembleDebug
+
+      - name: Build Android app with hev native gate
+        working-directory: android
+        run: ./gradlew assembleDebug -PenableHevNative=true
+
+      - name: Validate hev native libraries packaged in APK
+        run: |
+          unzip -l android/app/build/outputs/apk/debug/app-debug.apk | grep 'lib/arm64-v8a/libhev-socks5-tunnel.so'
+          unzip -l android/app/build/outputs/apk/debug/app-debug.apk | grep 'lib/armeabi-v7a/libhev-socks5-tunnel.so'
+          unzip -l android/app/build/outputs/apk/debug/app-debug.apk | grep 'lib/x86_64/libhev-socks5-tunnel.so'
