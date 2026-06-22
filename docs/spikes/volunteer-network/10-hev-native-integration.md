@@ -183,6 +183,70 @@ CI was extended to run:
 The workflow update must be pushed before the hev-enabled APK packaging result
 is known.
 
+## Developer Mode VpnService Pipe Spike
+
+The next spike step adds a Developer Mode-only pipe:
+
+`Android VpnService TUN fd -> HEV tun2socks -> 127.0.0.1:9050`
+
+HEV start API found:
+
+* upstream Android JNI is in `src/hev-jni.c`
+* `JNI_OnLoad` registers methods on the class named by `PKGNAME` and `CLSNAME`
+* ZeroVPN points those macros at
+  `com/zerovpn/app/volunteer/tun2socks/HevNativeLoader`
+* registered native methods:
+  * `TProxyStartService(configPath: String, tunFd: Int)`
+  * `TProxyStopService()`
+  * `TProxyGetStats(): LongArray`
+
+No extra C glue was required for this spike.
+
+The Developer Mode flow now:
+
+1. checks that the HEV native library is loaded
+2. starts or reuses the embedded Tor SOCKS proof until it is Ready
+3. requests Android VPN permission only from the Developer Mode diagnostics card
+4. starts `VolunteerVpnService`
+5. creates a TUN interface
+6. writes a temporary HEV YAML config under app cache
+7. calls `TProxyStartService(configPath, tunFd)`
+8. exposes diagnostics and a stop button
+
+TUN config:
+
+* session: `ZeroVPN Volunteer Spike`
+* address: `10.111.0.2/32`
+* route: `0.0.0.0/0`
+* MTU: `1500`
+
+DNS mode:
+
+* `dnsMode=not-safe-yet-system-resolver`
+* `dnsLeakRisk=true`
+* HEV `mapdns` is not wired yet
+
+This means routing validation is useful as a pipe signal only. It must not be
+described as leak-safe or production-ready.
+
+UDP mode:
+
+* `udpMode=unsupported-socks-udp-over-tcp-configured`
+* Tor SOCKS is not a general UDP transport
+* ZeroVPN must still treat UDP as unsupported for product purposes
+
+Validation levels:
+
+* Level 1: native library loaded, Tor Ready, permission granted, TUN created,
+  HEV started, Android VPN active detected.
+* Level 2: in-app request without explicit SOCKS proxy to
+  `https://check.torproject.org/api/ip` returns `HTTP 200 IsTor=true`.
+* Level 3: browser check confirms traffic through the Android VPN path.
+
+The service stops HEV first, closes the TUN fd, updates diagnostics, and leaves
+Tor running explicitly. Tor can still be stopped separately through the existing
+embedded Tor controls.
+
 ## Next Options
 
 Recommended order:
