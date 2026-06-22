@@ -265,6 +265,19 @@ Level 2/3 failed:
 * in-app validation to `https://check.torproject.org/api/ip` timed out
 * browser traffic had no internet access while the Volunteer VPN test was active
 
+A subsequent device run showed a more specific failure pattern:
+
+* direct TCP over the VPN path reached `1.1.1.1:443`
+* HEV tx/rx packet counters increased
+* the explicit local Tor SOCKS baseline failed after the VPN started with
+  `SocketException: SOCKS server general failure`
+* diagnostics showed `zeroVpnAppIncludedInVolunteerVpn=true`
+
+The working hypothesis is that routing ZeroVPN's own process through the
+Volunteer VPN test path interferes with the app's embedded Tor control/data
+plane. For this spike, ZeroVPN now explicitly excludes itself from the
+Volunteer VPN route and treats browser/manual validation as the routing proof.
+
 The first diagnostic fix makes the generated HEV config visible in Developer
 Mode diagnostics:
 
@@ -284,7 +297,6 @@ tunnel:
 socks5:
   port: 9050
   address: '127.0.0.1'
-  udp: 'tcp'
 
 mapdns:
   address: 198.18.0.2
@@ -307,25 +319,55 @@ the first attempt:
 * `VpnService.Builder.setBlocking(false)`
 * `Builder.addDnsServer(198.18.0.2)`
 * `mapdns` enabled in HEV config
-* app traffic intentionally included in the VPN for in-app validation
+* ZeroVPN app traffic excluded with `Builder.addDisallowedApplication(packageName)`
+  so embedded Tor and HEV control traffic stay outside the test TUN path
+
+The exclusion is mandatory for this spike. If Android rejects
+`addDisallowedApplication`, diagnostics record `appExclusionError` and the
+Volunteer VPN test fails instead of silently pretending the app is excluded.
 
 Diagnostics now separate validation layers:
 
 * `torSocksBaselineStatus`: explicit SOCKS request through local Tor
-* `vpnDnsValidationStatus`: unproxied HTTPS request requiring DNS after VPN
-  activation
-* `vpnTcpValidationStatus`: direct TCP connect to `1.1.1.1:443` after VPN
-  activation
-* `vpnTorValidationStatus`: Tor check result over the VPN path
+* `inAppVpnValidationStatus`: skipped while ZeroVPN is excluded from the
+  Volunteer VPN route
+* `vpnDnsValidationStatus`: skipped while ZeroVPN is excluded; browser/manual
+  DNS behavior is the data-path signal
+* `vpnTcpValidationStatus`: skipped while ZeroVPN is excluded; prior success
+  only proved that some TUN TCP traffic moved, not Tor routing
+* `vpnTorValidationStatus`: skipped while ZeroVPN is excluded
+* `browserValidationInstruction`: asks the tester to open
+  `https://check.torproject.org/` in a browser; if that page says Tor, the
+  TUN -> HEV -> Tor path works for other apps
+* `zeroVpnAppIncludedInVolunteerVpn=false`
+* `zeroVpnAppExcludedFromVolunteerVpn=true`
+* `appExclusionError=N/A` when exclusion succeeds
 
 DNS status is now `dnsMode=hev-map-dns-through-socks` and
 `dnsLeakRisk=unknown`. This is still not production leak-safe until device tests
 prove browser and app DNS behavior.
 
-UDP status remains
-`udpMode=unsupported-udp-over-tcp-requested-tor-compat-unknown`. Tor SOCKS is
-not a general UDP transport, so product Volunteer Network must still treat UDP
-as unsupported unless a separate safe design is proven.
+UDP status is now `udpMode=unsupported-not-validated-tor-socks`. HEV documents
+`socks5.udp` values `tcp` and `udp`, and its README notes UDP-over-TCP support
+with `hev-socks5-server`. Tor SOCKS is not a general UDP transport and has not
+been proven compatible with HEV's UDP relay extension, so the generated config
+does not request `socks5.udp: 'tcp'`. Product Volunteer Network must still treat
+UDP as unsupported unless a separate safe design is proven.
+
+The current map-DNS shape matches HEV's README example:
+
+```yaml
+mapdns:
+  address: 198.18.0.2
+  port: 53
+  network: 100.64.0.0
+  netmask: 255.192.0.0
+  cache-size: 10000
+```
+
+`VpnService.Builder.addDnsServer(198.18.0.2)` sends app DNS queries to the fake
+DNS endpoint inside the full-route TUN. Because ZeroVPN itself is excluded, the
+next validation point is browser behavior, not in-app unproxied requests.
 
 ## Next Options
 

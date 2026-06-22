@@ -7,7 +7,6 @@ data class HevTun2SocksConfig(
     val socksPort: Int,
     val tunnelMtu: Int = 1500,
     val mappedDnsAddress: String = "198.18.0.2",
-    val socksUdpMode: String = "tcp",
     val logLevel: String = "info",
 ) {
     fun writeTo(file: File): File {
@@ -23,7 +22,6 @@ data class HevTun2SocksConfig(
         socks5:
           port: $socksPort
           address: '$socksHost'
-          udp: '$socksUdpMode'
 
         mapdns:
           address: $mappedDnsAddress

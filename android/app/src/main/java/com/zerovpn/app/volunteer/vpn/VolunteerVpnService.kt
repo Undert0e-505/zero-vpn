@@ -2,6 +2,7 @@ package com.zerovpn.app.volunteer.vpn
 
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.net.VpnService
@@ -67,6 +68,8 @@ class VolunteerVpnService : VpnService() {
             dnsMode = DNS_MODE,
             dnsLeakRisk = DNS_LEAK_RISK,
             udpMode = UDP_MODE,
+            zeroVpnAppIncludedInVolunteerVpn = false,
+            zeroVpnAppExcludedFromVolunteerVpn = true,
             hevNativeEnabled = smoke.enabled,
             hevLibraryLoaded = smoke.loaded,
             socksTarget = "$socksHost:$socksPort",
@@ -89,14 +92,27 @@ class VolunteerVpnService : VpnService() {
 
         scope.launch {
             runCatching {
-                val establishedTun = Builder()
+                val builder = Builder()
                     .setBlocking(false)
                     .setSession(tunConfig.sessionName)
                     .setMtu(tunConfig.mtu)
                     .addAddress(tunConfig.address, tunConfig.prefixLength)
                     .addRoute(tunConfig.route, tunConfig.routePrefixLength)
                     .addDnsServer(tunConfig.dnsServer)
-                    .establish() ?: error("VpnService.Builder.establish() returned null")
+
+                val appExclusionError = disallowZeroVpnApp(builder)
+                VolunteerVpnRuntime.updateDiagnostics {
+                    it.copy(
+                        zeroVpnAppIncludedInVolunteerVpn = appExclusionError != null,
+                        zeroVpnAppExcludedFromVolunteerVpn = appExclusionError == null,
+                        appExclusionError = appExclusionError,
+                    )
+                }
+                if (appExclusionError != null) {
+                    error("Failed to exclude ZeroVPN app from Volunteer VPN: $appExclusionError")
+                }
+
+                val establishedTun = builder.establish() ?: error("VpnService.Builder.establish() returned null")
                 tunFd = establishedTun
 
                 val configFile = withContext(Dispatchers.IO) {
@@ -116,7 +132,9 @@ class VolunteerVpnService : VpnService() {
                         dnsServer = tunConfig.dnsServer,
                         dnsMode = DNS_MODE,
                         dnsLeakRisk = DNS_LEAK_RISK,
-                        zeroVpnAppIncludedInVolunteerVpn = true,
+                        zeroVpnAppIncludedInVolunteerVpn = false,
+                        zeroVpnAppExcludedFromVolunteerVpn = true,
+                        appExclusionError = null,
                         hevConfigPath = configFile.absolutePath,
                         hevConfigExists = configFile.exists(),
                         hevConfigSizeBytes = configFile.length(),
@@ -210,22 +228,31 @@ class VolunteerVpnService : VpnService() {
     }
 
     private suspend fun runValidation() {
-        val dnsResult = runHttpValidation(TorSocksProbe.DEFAULT_TEST_URL)
-        val tcpResult = runTcpValidation("1.1.1.1", 443)
-        val torResult = dnsResult
+        val skipped = "Skipped: ZeroVPN app excluded from Volunteer VPN; use browser validation for the TUN data path."
         VolunteerVpnRuntime.updateDiagnostics {
             it.copy(
                 lastValidationUrl = TorSocksProbe.DEFAULT_TEST_URL,
-                vpnDnsValidationStatus = dnsResult.status,
-                vpnTcpValidationStatus = tcpResult,
-                vpnTorValidationStatus = torResult.status,
-                lastValidationStatus = torResult.status,
-                lastValidationIsTor = torResult.isTor,
-                lastValidationExitIp = torResult.exitIp,
+                inAppVpnValidationStatus = skipped,
+                vpnDnsValidationStatus = skipped,
+                vpnTcpValidationStatus = "Skipped: ZeroVPN app excluded; in-app TCP connect would bypass the Volunteer VPN.",
+                vpnTorValidationStatus = skipped,
+                lastValidationStatus = skipped,
+                lastValidationIsTor = null,
+                lastValidationExitIp = null,
                 androidVpnActiveDetected = isAndroidVpnActive(),
             )
         }
     }
+
+    private fun disallowZeroVpnApp(builder: Builder): String? =
+        try {
+            builder.addDisallowedApplication(packageName)
+            null
+        } catch (e: PackageManager.NameNotFoundException) {
+            "${e.javaClass.simpleName}: ${e.message}"
+        } catch (e: UnsupportedOperationException) {
+            "${e.javaClass.simpleName}: ${e.message}"
+        }
 
     private suspend fun runTorSocksBaseline(socksHost: String, socksPort: Int) {
         val result = runCatching {
@@ -309,7 +336,7 @@ class VolunteerVpnService : VpnService() {
         private const val DEFAULT_SOCKS_PORT = 9050
         private const val DNS_MODE = "hev-map-dns-through-socks"
         private const val DNS_LEAK_RISK = "unknown"
-        private const val UDP_MODE = "unsupported-udp-over-tcp-requested-tor-compat-unknown"
+        private const val UDP_MODE = "unsupported-not-validated-tor-socks"
 
         fun startIntent(context: Context, socksHost: String, socksPort: Int): Intent =
             Intent(context, VolunteerVpnService::class.java).apply {

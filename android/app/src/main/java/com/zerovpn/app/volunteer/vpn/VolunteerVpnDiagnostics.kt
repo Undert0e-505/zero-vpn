@@ -14,8 +14,10 @@ data class VolunteerVpnDiagnostics(
     val dnsServer: String = "198.18.0.2",
     val dnsMode: String = "hev-map-dns-through-socks",
     val dnsLeakRisk: String = "unknown",
-    val udpMode: String = "unsupported-tcp-only",
-    val zeroVpnAppIncludedInVolunteerVpn: Boolean = true,
+    val udpMode: String = "unsupported-not-validated-tor-socks",
+    val zeroVpnAppIncludedInVolunteerVpn: Boolean = false,
+    val zeroVpnAppExcludedFromVolunteerVpn: Boolean = true,
+    val appExclusionError: String? = null,
     val hevNativeEnabled: Boolean = false,
     val hevLibraryLoaded: Boolean = false,
     val hevStartResult: String? = null,
@@ -31,6 +33,8 @@ data class VolunteerVpnDiagnostics(
     val torSocksBaselineStatus: String? = null,
     val torSocksBaselineIsTor: Boolean? = null,
     val torSocksBaselineExitIp: String? = null,
+    val inAppVpnValidationStatus: String? = null,
+    val browserValidationInstruction: String = "Open browser to https://check.torproject.org/; if it says Tor, TUN -> HEV -> Tor works for other apps.",
     val vpnDnsValidationStatus: String? = null,
     val vpnTcpValidationStatus: String? = null,
     val vpnTorValidationStatus: String? = null,
@@ -60,6 +64,8 @@ data class VolunteerVpnDiagnostics(
         appendLine("dnsLeakRisk=$dnsLeakRisk")
         appendLine("udpMode=$udpMode")
         appendLine("zeroVpnAppIncludedInVolunteerVpn=$zeroVpnAppIncludedInVolunteerVpn")
+        appendLine("zeroVpnAppExcludedFromVolunteerVpn=$zeroVpnAppExcludedFromVolunteerVpn")
+        appendLine("appExclusionError=${appExclusionError ?: "N/A"}")
         appendLine("hevNativeEnabled=$hevNativeEnabled")
         appendLine("hevLibraryLoaded=$hevLibraryLoaded")
         appendLine("hevStartResult=${hevStartResult ?: "N/A"}")
@@ -74,6 +80,8 @@ data class VolunteerVpnDiagnostics(
         appendLine("torSocksBaselineStatus=${torSocksBaselineStatus ?: "N/A"}")
         appendLine("torSocksBaselineIsTor=${torSocksBaselineIsTor?.toString() ?: "N/A"}")
         appendLine("torSocksBaselineExitIp=${torSocksBaselineExitIp ?: "N/A"}")
+        appendLine("inAppVpnValidationStatus=${inAppVpnValidationStatus ?: "N/A"}")
+        appendLine("browserValidationInstruction=$browserValidationInstruction")
         appendLine("vpnDnsValidationStatus=${vpnDnsValidationStatus ?: "N/A"}")
         appendLine("vpnTcpValidationStatus=${vpnTcpValidationStatus ?: "N/A"}")
         appendLine("vpnTorValidationStatus=${vpnTorValidationStatus ?: "N/A"}")
