@@ -2,6 +2,7 @@ package com.zerovpn.app.vpn
 
 enum class ExitProvider {
     OCI,
+    VOLUNTEER,
 }
 
 enum class ExitLifecycleState {
@@ -44,4 +45,9 @@ data class ConfiguredExit(
     val serverPublicKey: String? = null,
     val serverPeerPublicKey: String? = null,
     val clientPublicKey: String? = null,
+    val transportLabel: String? = null,
+    val tcpSupported: Boolean? = null,
+    val udpSupported: Boolean? = null,
+    val dnsStatus: String? = null,
+    val destroyMeaning: String? = null,
 )

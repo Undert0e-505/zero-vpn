@@ -28,6 +28,8 @@ import com.zerovpn.app.ui.theme.*
 fun AddExitScreen(
     snackbarHostState: SnackbarHostState,
     onNavigateToProvision: () -> Unit,
+    onNavigateToVolunteer: () -> Unit,
+    showVolunteerDebug: Boolean,
     modifier: Modifier = Modifier,
 ) {
     var disabledMessage by remember { mutableStateOf<String?>(null) }
@@ -84,18 +86,17 @@ fun AddExitScreen(
 
         Spacer(modifier = Modifier.height(8.dp))
 
-        OptionButton(
-            icon = Icons.Default.VolunteerActivism,
-            label = "Volunteer Network",
-            enabled = false,
-            statusLabel = "Coming Soon",
-            onClick = {},
-            onDisabledClick = {
-                disabledMessage = "Volunteer Network is coming later. Oracle exits are available now."
-            },
-        )
+        if (showVolunteerDebug) {
+            OptionButton(
+                icon = Icons.Default.VolunteerActivism,
+                label = "Volunteer Exit",
+                statusLabel = "Experimental",
+                supportingText = "Route traffic through the Volunteer Network. Slower, web/TCP-focused, and still under validation.",
+                onClick = onNavigateToVolunteer,
+            )
 
-        Spacer(modifier = Modifier.height(8.dp))
+            Spacer(modifier = Modifier.height(8.dp))
+        }
 
         OptionButton(
             icon = Icons.Default.QrCodeScanner,

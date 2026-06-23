@@ -9,6 +9,7 @@ import androidx.compose.material.icons.filled.Cloud
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.Hub
 import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.VolunteerActivism
 import androidx.compose.material3.Icon
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
@@ -38,6 +39,7 @@ import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.zerovpn.app.oci.OciAuthReturn
+import com.zerovpn.app.BuildConfig
 import com.zerovpn.app.ui.provisioning.ProvisioningViewModel
 import com.zerovpn.app.ui.screens.*
 import com.zerovpn.app.ui.theme.*
@@ -51,6 +53,8 @@ sealed class Screen(val route: String, val label: String, val icon: ImageVector)
     data object Diagnostics : Screen("diagnostics", "Diagnostics", Icons.Default.Build)
     data object Settings : Screen("settings", "Settings", Icons.Default.Settings)
     data object OracleProvision : Screen("oracle_provision", "Provision", Icons.Default.Cloud)
+    data object VolunteerIntro : Screen("volunteer_intro", "Volunteer", Icons.Default.VolunteerActivism)
+    data object VolunteerDetails : Screen("volunteer_details", "Volunteer", Icons.Default.VolunteerActivism)
 }
 
 private val screens = listOf(
@@ -72,6 +76,7 @@ fun NavGraph() {
     val lifecycleOwner = LocalLifecycleOwner.current
     val configuredExits by provisioningViewModel.configuredExits.collectAsState()
     val selectedExitId by provisioningViewModel.selectedExitId.collectAsState()
+    val isDevMode by provisioningViewModel.isDevMode.collectAsState()
 
     val navBackStackEntry by navController.currentBackStackEntryAsState()
     val currentDestination = navBackStackEntry?.destination
@@ -177,9 +182,42 @@ fun NavGraph() {
             composable(Screen.AddExit.route) {
                 AddExitScreen(
                     snackbarHostState = snackbarHostState,
+                    showVolunteerDebug = BuildConfig.VOLUNTEER_DEBUG_ENABLED && isDevMode,
                     onNavigateToProvision = {
                         provisioningViewModel.prepareNewProvisioningFlow()
                         navController.navigate(Screen.OracleProvision.route)
+                    },
+                    onNavigateToVolunteer = {
+                        navController.navigate(Screen.VolunteerIntro.route)
+                    },
+                )
+            }
+            composable(Screen.VolunteerIntro.route) {
+                VolunteerIntroScreen(
+                    snackbarHostState = snackbarHostState,
+                    provisioningViewModel = provisioningViewModel,
+                    onCancel = { navController.popBackStack() },
+                    onCreated = {
+                        navController.navigate(Screen.VolunteerDetails.route) {
+                            launchSingleTop = true
+                        }
+                    },
+                )
+            }
+            composable(Screen.VolunteerDetails.route) {
+                VolunteerDetailsScreen(
+                    snackbarHostState = snackbarHostState,
+                    provisioningViewModel = provisioningViewModel,
+                    vpnViewModel = vpnViewModel,
+                    onBack = { navController.popBackStack() },
+                    onHome = {
+                        navController.navigate(Screen.Home.route) {
+                            popUpTo(navController.graph.findStartDestination().id) {
+                                saveState = true
+                            }
+                            launchSingleTop = true
+                            restoreState = true
+                        }
                     },
                 )
             }
