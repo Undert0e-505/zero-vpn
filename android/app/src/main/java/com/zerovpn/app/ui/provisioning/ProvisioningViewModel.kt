@@ -604,6 +604,8 @@ class ProvisioningViewModel : ViewModel() {
 
             // Phase 1: Auth
             _currentPhase.value = Phase.AUTH
+            emit(Phase.AUTH, Status.RUNNING, "Developer mode: ${_isDevMode.value}")
+            emit(Phase.AUTH, Status.RUNNING, "Developer mode affects diagnostics only: true")
             emit(
                 Phase.AUTH,
                 Status.RUNNING,
@@ -643,7 +645,7 @@ class ProvisioningViewModel : ViewModel() {
             }
 
             // UK region warning
-            if (preflightResult!!.isUkRegion && _isDevMode.value) {
+            if (preflightResult!!.isUkRegion) {
                 eventJob.cancel()
                 homeRegion = preflightResult!!.homeRegion
                 _selectedOracleRegion.value = preflightResult!!.homeRegion
