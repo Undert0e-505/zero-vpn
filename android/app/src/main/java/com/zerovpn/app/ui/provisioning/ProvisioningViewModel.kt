@@ -384,6 +384,50 @@ class ProvisioningViewModel : ViewModel() {
         persistState()
     }
 
+    fun createVolunteerExit(): ConfiguredExit {
+        _configuredExits.value.firstOrNull { it.provider == ExitProvider.VOLUNTEER }?.let { existing ->
+            selectExit(existing.id)
+            return existing
+        }
+        val exit = ConfiguredExit(
+            id = "volunteer:${UUID.randomUUID()}",
+            name = "Volunteer Exit",
+            publicIp = "Unknown",
+            wireGuardPort = 0,
+            region = "Volunteer Network",
+            wireGuardConfig = "",
+            provider = ExitProvider.VOLUNTEER,
+            endpointHost = "embedded-tor",
+            endpointPort = 0,
+            lifecycleState = ExitLifecycleState.READY,
+            createdAt = System.currentTimeMillis(),
+            transportLabel = "Volunteer Network",
+            tcpSupported = true,
+            udpSupported = false,
+            dnsStatus = "Under validation",
+            destroyMeaning = "removeLocalProfile",
+        )
+        _configuredExits.value = _configuredExits.value + exit
+        _selectedExitId.value = exit.id
+        _state.value = ProvisioningState.Success(
+            publicIp = exit.publicIp,
+            wireGuardPort = exit.wireGuardPort,
+            region = exit.region,
+            isDevMode = _isDevMode.value,
+        )
+        persistState()
+        return exit
+    }
+
+    fun removeLocalExit(exitId: String) {
+        _configuredExits.value = _configuredExits.value.filterNot { it.id == exitId }
+        if (_selectedExitId.value == exitId) {
+            _selectedExitId.value = _configuredExits.value.firstOrNull()?.id
+        }
+        restoreStateFromSelectedExitOrIdle()
+        persistState()
+    }
+
     fun startProvisioning(context: Context) {
         if (_state.value is ProvisioningState.Running) return
         _oracleOnboardingState.value = OracleOnboardingState.AuthLaunched
@@ -986,6 +1030,11 @@ class ProvisioningViewModel : ViewModel() {
         .put("serverPublicKey", serverPublicKey)
         .put("serverPeerPublicKey", serverPeerPublicKey)
         .put("clientPublicKey", clientPublicKey)
+        .put("transportLabel", transportLabel)
+        .put("tcpSupported", tcpSupported)
+        .put("udpSupported", udpSupported)
+        .put("dnsStatus", dnsStatus)
+        .put("destroyMeaning", destroyMeaning)
         .put("ociResourceIds", ociResourceIds?.toJson())
 
     private fun OciResourceIds.toJson(): JSONObject = JSONObject()
@@ -1032,6 +1081,11 @@ class ProvisioningViewModel : ViewModel() {
             serverPublicKey = optNullableString("serverPublicKey"),
             serverPeerPublicKey = optNullableString("serverPeerPublicKey"),
             clientPublicKey = optNullableString("clientPublicKey"),
+            transportLabel = optNullableString("transportLabel"),
+            tcpSupported = optBooleanOrNull("tcpSupported"),
+            udpSupported = optBooleanOrNull("udpSupported"),
+            dnsStatus = optNullableString("dnsStatus"),
+            destroyMeaning = optNullableString("destroyMeaning"),
         )
     }
 
@@ -1040,6 +1094,9 @@ class ProvisioningViewModel : ViewModel() {
 
     private fun JSONObject.optLongOrNull(name: String): Long? =
         if (has(name) && !isNull(name)) optLong(name) else null
+
+    private fun JSONObject.optBooleanOrNull(name: String): Boolean? =
+        if (has(name) && !isNull(name)) optBoolean(name) else null
 
     companion object {
         const val ORACLE_SIGNUP_URL = "https://signup.oraclecloud.com/"

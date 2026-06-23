@@ -41,8 +41,11 @@ import com.zerovpn.app.ui.provisioning.ProvisioningViewModel
 import com.zerovpn.app.ui.theme.*
 import com.zerovpn.app.vpn.ConfiguredExit
 import com.zerovpn.app.vpn.ExitLifecycleState
+import com.zerovpn.app.vpn.ExitProvider
 import com.zerovpn.app.vpn.VpnConnectionState
 import com.zerovpn.app.vpn.VpnViewModel
+import com.zerovpn.app.volunteer.VolunteerNetworkController
+import com.zerovpn.app.volunteer.vpn.VolunteerVpnState
 import kotlinx.coroutines.launch
 
 @Composable
@@ -53,6 +56,7 @@ fun HomeScreen(
     modifier: Modifier = Modifier,
     viewModel: ProvisioningViewModel = viewModel(),
     vpnViewModel: VpnViewModel = viewModel(),
+    volunteerNetworkController: VolunteerNetworkController = viewModel(),
 ) {
     val logTag = "ZeroVPN/Home"
     val context = LocalContext.current
@@ -62,6 +66,8 @@ fun HomeScreen(
     val selectedExitId by viewModel.selectedExitId.collectAsState()
     val vpnState by vpnViewModel.state.collectAsState()
     val vpnDiagnostics by vpnViewModel.diagnostics.collectAsState()
+    val volunteerState by volunteerNetworkController.volunteerVpnState.collectAsState()
+    val volunteerDiagnostics by volunteerNetworkController.volunteerVpnDiagnostics.collectAsState()
 
     // Initialize prefs on first load (restores persisted state)
     viewModel.initPrefs(context)
@@ -81,16 +87,34 @@ fun HomeScreen(
         vpnState is VpnConnectionState.ActiveUnknown
     val selectedExit = exits.firstOrNull { it.id == selectedExitId }
         ?: exits.singleOrNull()
-    val buttonBusy = vpnState is VpnConnectionState.Connecting ||
+    val selectedIsVolunteer = selectedExit?.provider == ExitProvider.VOLUNTEER
+    val volunteerConnected = volunteerState is VolunteerVpnState.Running &&
+        volunteerDiagnostics.androidVpnActiveDetected &&
+        volunteerDiagnostics.hevRunning
+    val volunteerBusy = volunteerState is VolunteerVpnState.StartingTor ||
+        volunteerState is VolunteerVpnState.StartingVpn ||
+        volunteerState is VolunteerVpnState.PermissionNeeded ||
+        volunteerState is VolunteerVpnState.Stopping
+    val buttonBusy = if (selectedIsVolunteer) volunteerBusy else vpnState is VpnConnectionState.Connecting ||
         vpnState is VpnConnectionState.Disconnecting ||
         vpnState is VpnConnectionState.PermissionRequired
-    val buttonText = when (vpnState) {
-        is VpnConnectionState.Connecting -> "Connecting"
-        is VpnConnectionState.Disconnecting -> "Disconnecting"
-        is VpnConnectionState.PermissionRequired -> "Waiting for Permission"
-        is VpnConnectionState.Connected -> "Disconnect"
-        is VpnConnectionState.ActiveUnknown -> "Disconnect"
-        else -> "Connect"
+    val buttonText = if (selectedIsVolunteer) {
+        when {
+            volunteerState is VolunteerVpnState.PermissionNeeded -> "Waiting for Permission"
+            volunteerState is VolunteerVpnState.StartingTor || volunteerState is VolunteerVpnState.StartingVpn -> "Connecting"
+            volunteerState is VolunteerVpnState.Stopping -> "Disconnecting"
+            volunteerConnected -> "Disconnect"
+            else -> "Connect"
+        }
+    } else {
+        when (vpnState) {
+            is VpnConnectionState.Connecting -> "Connecting"
+            is VpnConnectionState.Disconnecting -> "Disconnecting"
+            is VpnConnectionState.PermissionRequired -> "Waiting for Permission"
+            is VpnConnectionState.Connected -> "Disconnect"
+            is VpnConnectionState.ActiveUnknown -> "Disconnect"
+            else -> "Connect"
+        }
     }
 
     val permissionLauncher = rememberLauncherForActivityResult(
@@ -109,13 +133,35 @@ fun HomeScreen(
         }
     }
 
+    val volunteerPermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartActivityForResult(),
+    ) { result ->
+        if (result.resultCode == Activity.RESULT_OK) {
+            volunteerNetworkController.startVolunteerVpnTest()
+        } else {
+            volunteerNetworkController.markVolunteerVpnPermissionNeeded()
+            scope.launch {
+                snackbarHostState.showSnackbar("VPN permission was not granted")
+            }
+        }
+    }
+
     if (showDestroyDialog) {
         AlertDialog(
             onDismissRequest = { showDestroyDialog = false },
-            title = { Text("Destroy ${destroyTarget?.name ?: "Exit"}?", color = TextPrimary) },
+            title = {
+                Text(
+                    if (destroyTarget?.provider == ExitProvider.VOLUNTEER) "Remove Volunteer Exit?" else "Destroy ${destroyTarget?.name ?: "Exit"}?",
+                    color = TextPrimary,
+                )
+            },
             text = {
                 Text(
-                    "This will terminate only this Oracle VM, delete its API key, and remove its network resources. Other exits are preserved.",
+                    if (destroyTarget?.provider == ExitProvider.VOLUNTEER) {
+                        "This removes the local Volunteer Exit profile from ZeroVPN. No cloud server will be deleted. If it is currently connected, ZeroVPN will disconnect it first."
+                    } else {
+                        "This will terminate only this Oracle VM, delete its API key, and remove its network resources. Other exits are preserved."
+                    },
                     color = TextDim,
                     fontSize = 14.sp,
                 )
@@ -130,12 +176,17 @@ fun HomeScreen(
                             snackbarHostState.showSnackbar("Disconnect failed. Node was not destroyed.")
                             return@launch
                         }
-                        viewModel.destroyNode(context, destroyExitId)
+                        if (destroyTarget?.provider == ExitProvider.VOLUNTEER && destroyExitId != null) {
+                            volunteerNetworkController.stopVolunteerVpnTest()
+                            viewModel.removeLocalExit(destroyExitId)
+                        } else {
+                            viewModel.destroyNode(context, destroyExitId)
+                            onDestroyStarted()
+                        }
                         destroyTarget = null
-                        onDestroyStarted()
                     }
                 }) {
-                    Text("Destroy", color = Danger)
+                    Text(if (destroyTarget?.provider == ExitProvider.VOLUNTEER) "Remove exit" else "Destroy", color = Danger)
                 }
             },
             dismissButton = {
@@ -190,7 +241,18 @@ fun HomeScreen(
 
         // Status card
         StatusCard(
-            statusText = when (vpnState) {
+            statusText = if (selectedIsVolunteer) {
+                when {
+                    volunteerConnected -> "Connected"
+                    volunteerState is VolunteerVpnState.StartingTor ||
+                        volunteerState is VolunteerVpnState.StartingVpn -> "Connecting"
+                    volunteerState is VolunteerVpnState.PermissionNeeded -> "Permission Required"
+                    volunteerState is VolunteerVpnState.Stopping -> "Disconnecting"
+                    volunteerState is VolunteerVpnState.Failed -> "Connection Failed"
+                    hasExit -> "Ready"
+                    else -> "Disconnected"
+                }
+            } else when (vpnState) {
                 is VpnConnectionState.Connected -> "Connected"
                 is VpnConnectionState.Connecting -> "Connecting"
                 is VpnConnectionState.Disconnecting -> "Disconnecting"
@@ -200,7 +262,9 @@ fun HomeScreen(
                 VpnConnectionState.Disconnected -> if (hasExit) "Ready" else "Disconnected"
             },
             modeLabel = if (hasExit) {
-                selectedExit?.let { "${it.name} - WireGuard" } ?: "Select an exit below"
+                selectedExit?.let {
+                    if (it.provider == ExitProvider.VOLUNTEER) "${it.name} - Volunteer Network" else "${it.name} - WireGuard"
+                } ?: "Select an exit below"
             } else if (vpnState is VpnConnectionState.ActiveUnknown) {
                 "Active tunnel - exit metadata unavailable"
             } else {
@@ -215,12 +279,21 @@ fun HomeScreen(
                     )
                     if (buttonBusy) {
                         return@launch
-                    } else if (vpnIsActive) {
+                    } else if (selectedIsVolunteer && volunteerConnected) {
+                        volunteerNetworkController.stopVolunteerVpnTest()
+                    } else if (!selectedIsVolunteer && vpnIsActive) {
                         vpnViewModel.disconnect()
                     } else if (!hasExit) {
                         missingExitMessage = "No exits configured. Create an exit before connecting."
                     } else if (selectedExit == null) {
                         missingExitMessage = "Select an exit before connecting."
+                    } else if (selectedExit.provider == ExitProvider.VOLUNTEER) {
+                        val disconnected = vpnViewModel.disconnectIfActive(null)
+                        if (!disconnected) {
+                            snackbarHostState.showSnackbar("Could not disconnect the current exit")
+                            return@launch
+                        }
+                        connectVolunteerExit(volunteerNetworkController, volunteerPermissionLauncher::launch)
                     } else if (selectedExit.wireGuardConfig.isBlank()) {
                         val message = "WireGuard config is empty for ${selectedExit.name}. Re-provision the exit to enable VPN connection."
                         vpnViewModel.fail(message)
@@ -244,7 +317,7 @@ fun HomeScreen(
                     }
                 }
             },
-            connected = vpnIsActive,
+            connected = if (selectedIsVolunteer) volunteerConnected else vpnIsActive,
             buttonEnabled = !buttonBusy,
         )
 
@@ -258,7 +331,15 @@ fun HomeScreen(
             )
         }
 
-        if (vpnState !is VpnConnectionState.Disconnected || vpnDiagnostics.endpoint != null) {
+        if (selectedIsVolunteer) {
+            Spacer(modifier = Modifier.height(8.dp))
+            Text(
+                text = "Transport: Volunteer Network | Exit IP ${volunteerDiagnostics.torSocksBaselineExitIp ?: "Unknown"} | UDP Not supported | DNS Under validation | Experimental",
+                fontSize = 11.sp,
+                color = TextDim,
+                modifier = Modifier.fillMaxWidth(),
+            )
+        } else if (vpnState !is VpnConnectionState.Disconnected || vpnDiagnostics.endpoint != null) {
             Spacer(modifier = Modifier.height(8.dp))
             Text(
                 text = "VPN: ${vpnDiagnostics.backendState} | ${vpnDiagnostics.tunnelAddress ?: "no address"} -> ${vpnDiagnostics.endpoint ?: "no endpoint"} | DNS ${vpnDiagnostics.dns ?: "none"} | Allowed ${vpnDiagnostics.allowedIps ?: "none"}",
@@ -282,25 +363,41 @@ fun HomeScreen(
                 ExitCard(
                     exit = exit,
                     selected = exit.id == selectedExit?.id,
-                    active = exit.id == activeExitId,
-                    busy = buttonBusy || exit.lifecycleState == ExitLifecycleState.DESTROYING,
+                    active = if (exit.provider == ExitProvider.VOLUNTEER) volunteerConnected else exit.id == activeExitId,
+                    busy = (if (exit.provider == ExitProvider.VOLUNTEER) volunteerBusy else buttonBusy) ||
+                        exit.lifecycleState == ExitLifecycleState.DESTROYING,
                     onSelect = { viewModel.selectExit(exit.id) },
                     onConnect = {
                         scope.launch {
                             viewModel.selectExit(exit.id)
-                            connectExit(
-                                exit = exit,
-                                vpnViewModel = vpnViewModel,
-                                snackbarHostState = snackbarHostState,
-                                permissionLauncher = { permissionIntent ->
-                                    pendingPermissionExit = exit
-                                    vpnViewModel.markPermissionRequired(exit.id)
-                                    permissionLauncher.launch(permissionIntent)
-                                },
-                            )
+                            if (exit.provider == ExitProvider.VOLUNTEER) {
+                                val disconnected = vpnViewModel.disconnectIfActive(null)
+                                if (!disconnected) {
+                                    snackbarHostState.showSnackbar("Could not disconnect the current exit")
+                                    return@launch
+                                }
+                                connectVolunteerExit(volunteerNetworkController, volunteerPermissionLauncher::launch)
+                            } else {
+                                connectExit(
+                                    exit = exit,
+                                    vpnViewModel = vpnViewModel,
+                                    snackbarHostState = snackbarHostState,
+                                    permissionLauncher = { permissionIntent ->
+                                        pendingPermissionExit = exit
+                                        vpnViewModel.markPermissionRequired(exit.id)
+                                        permissionLauncher.launch(permissionIntent)
+                                    },
+                                )
+                            }
                         }
                     },
-                    onDisconnect = { vpnViewModel.disconnect() },
+                    onDisconnect = {
+                        if (exit.provider == ExitProvider.VOLUNTEER) {
+                            volunteerNetworkController.stopVolunteerVpnTest()
+                        } else {
+                            vpnViewModel.disconnect()
+                        }
+                    },
                     onDestroy = {
                         destroyTarget = exit
                         showDestroyDialog = true
@@ -404,7 +501,11 @@ private fun ExitCard(
                 )
                 Spacer(modifier = Modifier.height(4.dp))
                 Text(
-                    text = "${exit.publicIp}:${exit.wireGuardPort}/udp",
+                    text = if (exit.provider == ExitProvider.VOLUNTEER) {
+                        "Transport: Volunteer Network"
+                    } else {
+                        "${exit.publicIp}:${exit.wireGuardPort}/udp"
+                    },
                     fontSize = 13.sp,
                     color = TextDim,
                 )
@@ -456,7 +557,12 @@ private fun ExitCard(
                     modifier = Modifier.size(16.dp),
                 )
                 Spacer(modifier = Modifier.width(8.dp))
-                Text("Destroy", fontSize = 13.sp, fontWeight = FontWeight.Medium, color = Danger)
+                Text(
+                    if (exit.provider == ExitProvider.VOLUNTEER) "Remove" else "Destroy",
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.Medium,
+                    color = Danger,
+                )
             }
         }
     }
@@ -469,6 +575,19 @@ private fun exitStatusText(exit: ConfiguredExit, active: Boolean, selected: Bool
     exit.lifecycleState == ExitLifecycleState.FAILED -> "Failed"
     selected -> "Ready, selected"
     else -> "Ready"
+}
+
+private fun connectVolunteerExit(
+    volunteerNetworkController: VolunteerNetworkController,
+    permissionLauncher: (android.content.Intent) -> Unit,
+) {
+    val permissionIntent = volunteerNetworkController.volunteerVpnPermissionIntent()
+    if (permissionIntent != null) {
+        volunteerNetworkController.markVolunteerVpnPermissionNeeded()
+        permissionLauncher(permissionIntent)
+    } else {
+        volunteerNetworkController.startVolunteerVpnTest()
+    }
 }
 
 internal suspend fun connectExit(

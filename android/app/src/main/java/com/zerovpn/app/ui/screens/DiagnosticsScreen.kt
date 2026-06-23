@@ -275,7 +275,7 @@ private fun VolunteerNetworkSpikeCard(
                     disabledContentColor = TextDim,
                 ),
             ) {
-                Text("Start test", fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                Text("Developer test start", fontSize = 12.sp, fontWeight = FontWeight.Bold)
             }
             OutlinedButton(
                 onClick = onStop,
@@ -286,7 +286,7 @@ private fun VolunteerNetworkSpikeCard(
                     disabledContentColor = TextDim,
                 ),
             ) {
-                Text("Stop", fontSize = 13.sp, fontWeight = FontWeight.Medium)
+                Text("Developer test stop", fontSize = 12.sp, fontWeight = FontWeight.Medium)
             }
         }
         Row(
@@ -329,7 +329,7 @@ private fun VolunteerNetworkSpikeCard(
                     disabledContentColor = TextDim,
                 ),
             ) {
-                Text("Start VPN test", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                Text("Developer VPN start", fontSize = 12.sp, fontWeight = FontWeight.Bold)
             }
             OutlinedButton(
                 onClick = onStopVolunteerVpn,
@@ -340,7 +340,7 @@ private fun VolunteerNetworkSpikeCard(
                     disabledContentColor = TextDim,
                 ),
             ) {
-                Text("Stop VPN test", fontSize = 12.sp, fontWeight = FontWeight.Medium)
+                Text("Developer VPN stop", fontSize = 12.sp, fontWeight = FontWeight.Medium)
             }
         }
         DebugBlock("Embedded Tor", diagnostics.toDebugText(volunteerStateText(state)))

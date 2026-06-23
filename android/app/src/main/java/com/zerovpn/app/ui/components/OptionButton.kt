@@ -25,6 +25,7 @@ fun OptionButton(
     modifier: Modifier = Modifier,
     enabled: Boolean = true,
     statusLabel: String? = null,
+    supportingText: String? = null,
     onDisabledClick: (() -> Unit)? = null,
 ) {
     Row(
@@ -49,13 +50,23 @@ fun OptionButton(
             modifier = Modifier.size(24.dp),
         )
         Spacer(modifier = Modifier.width(16.dp))
-        Text(
-            text = label,
-            fontSize = 15.sp,
-            fontWeight = FontWeight.Medium,
-            color = if (enabled) TextPrimary else TextDim,
-        )
-        Spacer(modifier = Modifier.weight(1f))
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = label,
+                fontSize = 15.sp,
+                fontWeight = FontWeight.Medium,
+                color = if (enabled) TextPrimary else TextDim,
+            )
+            supportingText?.let {
+                Spacer(modifier = Modifier.height(4.dp))
+                Text(
+                    text = it,
+                    fontSize = 12.sp,
+                    color = TextDim,
+                    lineHeight = 16.sp,
+                )
+            }
+        }
         statusLabel?.let {
             Text(
                 text = it,
