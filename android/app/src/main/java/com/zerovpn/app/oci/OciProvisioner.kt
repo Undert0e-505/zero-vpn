@@ -1082,6 +1082,9 @@ class OciProvisioner(
         val exitCode: Int,
         val stdout: String,
         val stderr: String,
+        val commandStarted: Boolean = false,
+        val channelClosedAfterExit: Boolean = false,
+        val sessionConnectedAfterExit: Boolean = false,
     )
 
     private data class SshConnection(
@@ -1126,12 +1129,23 @@ class OciProvisioner(
                 label = "SSH readiness",
                 maxAttempts = 1,
             )
-            emit(Phase.WAIT_SSH, if (result.exitCode == 0) Status.RUNNING else Status.WARNING, "SSH readiness exit=${result.exitCode}")
-            if (result.exitCode == 0 && result.stdout.contains("ZERO_VPN_SSH_READY")) {
+            val hasReadyMarker = result.stdout.contains("ZERO_VPN_SSH_READY")
+            emit(
+                Phase.WAIT_SSH,
+                if (result.exitCode == 0 && hasReadyMarker) Status.RUNNING else Status.WARNING,
+                "SSH readiness commandStarted=${result.commandStarted} exitStatus=${result.exitCode} " +
+                    "stdoutContainsReadyMarker=$hasReadyMarker channelClosedAfterExit=${result.channelClosedAfterExit} " +
+                    "sessionConnectedAfterExit=${result.sessionConnectedAfterExit}",
+            )
+            if (result.exitCode == 0 && hasReadyMarker) {
                 emit(Phase.WAIT_SSH, Status.SUCCESS, "SSH command execution ready")
                 return
             }
-            emit(Phase.WAIT_SSH, Status.RUNNING, "SSH connected, but the VM closed the SSH command session. Retrying setup...")
+            if (result.exitCode == 0) {
+                emit(Phase.WAIT_SSH, Status.WARNING, "SSH readiness command exited 0 but did not print ZERO_VPN_SSH_READY. Retrying...")
+            } else {
+                emit(Phase.WAIT_SSH, Status.RUNNING, "SSH readiness command did not complete successfully. Reconnecting and retrying...")
+            }
             connection.session?.disconnect()
             connection.session = null
             kotlinx.coroutines.delay(10_000)
@@ -1161,8 +1175,19 @@ class OciProvisioner(
                     "SSH command '$label' attempt $attempt/$maxAttempts; sessionConnected=${connection.session?.isConnected == true}",
                 )
                 return kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-                    val (exitCode, stdout, stderr) = sshExec(connection.session!!, command)
-                    RemoteCommandResult(exitCode, stdout, stderr)
+                    sshExec(connection.session!!, command).also { result ->
+                        val status = if (result.exitCode == 0) Status.RUNNING else Status.WARNING
+                        emit(
+                            Phase.WIREGUARD,
+                            status,
+                            "SSH command '$label' completed: commandStarted=${result.commandStarted} " +
+                                "exitStatus=${result.exitCode} channelClosedAfterExit=${result.channelClosedAfterExit} " +
+                                "sessionConnectedAfterExit=${result.sessionConnectedAfterExit}",
+                        )
+                        if (result.exitCode == 0) {
+                            emit(Phase.WIREGUARD, Status.RUNNING, "SSH command '$label' succeeded")
+                        }
+                    }
                 }
             } catch (e: Exception) {
                 lastError = e
@@ -1174,7 +1199,7 @@ class OciProvisioner(
                 connection.session?.disconnect()
                 connection.session = null
                 if (attempt < maxAttempts) {
-                    emit(Phase.WIREGUARD, Status.RUNNING, "SSH connected, but the VM closed the SSH command session. Retrying setup...")
+                    emit(Phase.WIREGUARD, Status.RUNNING, "SSH command '$label' did not complete; reconnecting and retrying...")
                     kotlinx.coroutines.delay(5_000)
                 }
             }
@@ -1183,6 +1208,7 @@ class OciProvisioner(
             exitCode = 255,
             stdout = "",
             stderr = "${lastError?.javaClass?.simpleName ?: "SshCommandFailed"}: ${lastError?.message ?: "unknown SSH command failure"}",
+            commandStarted = false,
         )
     }
 
@@ -1530,40 +1556,49 @@ class OciProvisioner(
 
     // --- SSH exec helper ---
 
-    private fun sshExec(session: Session, command: String): Triple<Int, String, String> {
+    private fun sshExec(session: Session, command: String): RemoteCommandResult {
         val channel = session.openChannel("exec") as ChannelExec
         channel.setCommand(command)
         val bais = java.io.ByteArrayOutputStream()
         val baes = java.io.ByteArrayOutputStream()
-        channel.connect(30000)
-        val buf = ByteArray(4096)
-        // Read from channel output stream and err stream
         val outStream = channel.getInputStream()
         val errStream = channel.getErrStream()
-        while (channel.isConnected || outStream.available() > 0 || errStream.available() > 0) {
+        var commandStarted = false
+        return try {
+            channel.connect(30000)
+            commandStarted = true
+            val buf = ByteArray(4096)
+            while (!channel.isClosed || outStream.available() > 0 || errStream.available() > 0) {
+                while (outStream.available() > 0) {
+                    val n = outStream.read(buf)
+                    if (n > 0) bais.write(buf, 0, n)
+                }
+                while (errStream.available() > 0) {
+                    val n = errStream.read(buf)
+                    if (n > 0) baes.write(buf, 0, n)
+                }
+                if (channel.isClosed && outStream.available() == 0 && errStream.available() == 0) break
+                Thread.sleep(50)
+            }
             while (outStream.available() > 0) {
                 val n = outStream.read(buf)
-                if (n > 0) bais.write(buf, 0, n)
+                if (n > 0) bais.write(buf, 0, n) else break
             }
             while (errStream.available() > 0) {
                 val n = errStream.read(buf)
-                if (n > 0) baes.write(buf, 0, n)
+                if (n > 0) baes.write(buf, 0, n) else break
             }
-            if (channel.isClosed) break
-            Thread.sleep(50)
+            RemoteCommandResult(
+                exitCode = channel.exitStatus,
+                stdout = bais.toString(),
+                stderr = baes.toString(),
+                commandStarted = commandStarted,
+                channelClosedAfterExit = channel.isClosed,
+                sessionConnectedAfterExit = session.isConnected,
+            )
+        } finally {
+            channel.disconnect()
         }
-        // Final drain
-        while (outStream.available() > 0) {
-            val n = outStream.read(buf)
-            if (n > 0) bais.write(buf, 0, n) else break
-        }
-        while (errStream.available() > 0) {
-            val n = errStream.read(buf)
-            if (n > 0) baes.write(buf, 0, n) else break
-        }
-        val exitCode = channel.exitStatus
-        channel.disconnect()
-        return Triple(exitCode, bais.toString(), baes.toString())
     }
 
     // --- Ed25519 SSH key generation ---
