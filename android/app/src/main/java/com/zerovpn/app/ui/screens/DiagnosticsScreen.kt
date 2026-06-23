@@ -54,6 +54,7 @@ import com.zerovpn.app.ui.theme.TextPrimary
 import com.zerovpn.app.vpn.DnsLeakStatus
 import com.zerovpn.app.vpn.ExitIpStatus
 import com.zerovpn.app.vpn.LastHandshakeStatus
+import com.zerovpn.app.vpn.ProviderSwitchDiagnostics
 import com.zerovpn.app.vpn.UserDiagnosticsState
 import com.zerovpn.app.vpn.VpnConnectionState
 import com.zerovpn.app.vpn.VpnDiagnostics
@@ -83,6 +84,7 @@ fun DiagnosticsScreen(
     val sshDebugInfo by provisioningViewModel.sshDebugInfo.collectAsState()
     val exits by provisioningViewModel.configuredExits.collectAsState()
     val selectedExitId by provisioningViewModel.selectedExitId.collectAsState()
+    val providerSwitchDiagnostics by provisioningViewModel.providerSwitchDiagnostics.collectAsState()
     val vpnState by vpnViewModel.state.collectAsState()
     val vpnDiagnostics by vpnViewModel.diagnostics.collectAsState()
     val userDiagnostics by vpnViewModel.userDiagnostics.collectAsState()
@@ -158,6 +160,8 @@ fun DiagnosticsScreen(
         if (isDevMode) {
             Spacer(modifier = Modifier.height(12.dp))
             WireGuardDebugCard(vpnDiagnostics)
+            Spacer(modifier = Modifier.height(12.dp))
+            ProviderSwitchDebugCard(providerSwitchDiagnostics)
             if (BuildConfig.VOLUNTEER_DEBUG_ENABLED) {
                 Spacer(modifier = Modifier.height(12.dp))
                 VolunteerNetworkSpikeCard(
@@ -508,6 +512,33 @@ private fun WireGuardDebugCard(
 }
 
 @Composable
+private fun ProviderSwitchDebugCard(
+    diagnostics: ProviderSwitchDiagnostics,
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(Surface, RoundedCornerShape(8.dp))
+            .border(1.dp, Border, RoundedCornerShape(8.dp))
+            .padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        Text(
+            text = "PROVIDER HANDOFF",
+            style = SectionTitleStyle,
+        )
+        DebugValue("Selected exit id", diagnostics.selectedExitId ?: "N/A")
+        DebugValue("Selected provider", diagnostics.selectedProviderType ?: "N/A")
+        DebugValue("Active exit id", diagnostics.activeExitId ?: "N/A")
+        DebugValue("Active provider", diagnostics.activeProviderType ?: "N/A")
+        DebugValue("Switch target exit id", diagnostics.switchingTargetExitId ?: "N/A")
+        DebugValue("Last switch started", diagnostics.lastProviderSwitchStartedAt.formatDebugTime())
+        DebugValue("Last switch completed", diagnostics.lastProviderSwitchCompletedAt.formatDebugTime())
+        DebugBlock("Last switch error", diagnostics.lastProviderSwitchError ?: "N/A")
+    }
+}
+
+@Composable
 private fun SshDebugCard(
     sshDebugInfo: ProvisioningViewModel.SshDebugInfo?,
     onCopyPrivateKey: () -> Unit,
@@ -575,6 +606,9 @@ private fun SshDebugCard(
         }
     }
 }
+
+private fun Long?.formatDebugTime(): String =
+    this?.let { DateFormat.getDateTimeInstance().format(Date(it)) } ?: "N/A"
 
 @Composable
 private fun DebugValue(label: String, value: String) {
