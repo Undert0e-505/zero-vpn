@@ -14,6 +14,7 @@ import com.zerovpn.app.vpn.ConfiguredExit
 import com.zerovpn.app.vpn.ExitLifecycleState
 import com.zerovpn.app.vpn.ExitProvider
 import com.zerovpn.app.vpn.OciResourceIds
+import com.zerovpn.app.vpn.ProviderSwitchDiagnostics
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -68,6 +69,9 @@ class ProvisioningViewModel : ViewModel() {
 
     private val _selectedExitId = MutableStateFlow<String?>(null)
     val selectedExitId: StateFlow<String?> = _selectedExitId.asStateFlow()
+
+    private val _providerSwitchDiagnostics = MutableStateFlow(ProviderSwitchDiagnostics())
+    val providerSwitchDiagnostics: StateFlow<ProviderSwitchDiagnostics> = _providerSwitchDiagnostics.asStateFlow()
 
     private var provisioner: OciProvisioner? = null
     private var authResult: OciProvisioner.AuthResult? = null
@@ -382,6 +386,10 @@ class ProvisioningViewModel : ViewModel() {
             preflightResult = null
         }
         persistState()
+    }
+
+    fun updateProviderSwitchDiagnostics(diagnostics: ProviderSwitchDiagnostics) {
+        _providerSwitchDiagnostics.value = diagnostics
     }
 
     fun createVolunteerExit(): ConfiguredExit {
