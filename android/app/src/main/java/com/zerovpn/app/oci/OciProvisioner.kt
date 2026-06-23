@@ -335,6 +335,7 @@ class OciProvisioner(
         val identityEndpointUsed: String? = null,
         val subscribedRegions: List<String> = emptyList(),
         val error: String? = null,
+        val attemptedHosts: List<String> = emptyList(),
     )
 
     suspend fun discoverHomeRegion(
@@ -347,6 +348,9 @@ class OciProvisioner(
             emit(Phase.API_KEY, Status.RUNNING, "Token region source: ${auth.tokenRegionSource ?: "none"}")
         }
 
+        val manualRegion = preferredRegion
+            ?.takeIf { preferredRegionSource.startsWith("user-selected") }
+        val isManualDiscovery = manualRegion != null
         val candidates = buildRegionCandidates(auth, preferredRegion)
         if (isDevMode) {
             emit(Phase.API_KEY, Status.RUNNING, "Region discovery candidates: ${candidates.joinToString(", ")}")
@@ -354,12 +358,25 @@ class OciProvisioner(
 
         var sawDnsSuccess = false
         var authFailure: String? = null
+        val attemptedHosts = mutableListOf<String>()
+        var lastDnsException: Throwable? = null
         for (candidate in candidates) {
             val idHost = OciEndpoints.identityHost(candidate)
             val identityEndpoint = OciEndpoints.identityEndpoint(candidate)
+            attemptedHosts += idHost
             if (isDevMode) {
                 emit(Phase.API_KEY, Status.RUNNING, "Trying candidate region: $candidate")
                 emit(Phase.API_KEY, Status.RUNNING, "Identity host: $idHost")
+                emit(Phase.API_KEY, Status.RUNNING, "Identity URL: $identityEndpoint")
+                emit(Phase.API_KEY, Status.RUNNING, "Realm/domain suffix: ${OciEndpoints.realm(candidate)}")
+                emit(
+                    Phase.API_KEY,
+                    Status.RUNNING,
+                    "Region trace: tokenRegionId=${auth.tokenRegion ?: "none"} manualRegionId=${manualRegion ?: "none"} " +
+                        "discoveryCandidateRegionId=$candidate finalIdentityRegionId=pending finalHomeRegionId=pending " +
+                        "finalProvisioningRegionId=pending signerRegionId=$candidate identityHost=$idHost " +
+                        "identityUrl=$identityEndpoint realm=${OciEndpoints.realm(candidate)}",
+                )
             }
 
             val dnsResult = kotlinx.coroutines.withTimeoutOrNull(2500L) {
@@ -368,9 +385,28 @@ class OciProvisioner(
                 }
             } ?: Result.failure(java.net.SocketTimeoutException("DNS preflight timed out"))
             if (dnsResult.isFailure) {
+                lastDnsException = dnsResult.exceptionOrNull()
                 if (isDevMode) {
-                    val e = dnsResult.exceptionOrNull()
+                    val e = lastDnsException
                     emit(Phase.API_KEY, Status.WARNING, "DNS preflight failed for $candidate: ${e?.javaClass?.simpleName}: ${e?.message}")
+                    emit(
+                        Phase.API_KEY,
+                        Status.WARNING,
+                        "DNS attempted host count=${attemptedHosts.size}; hosts=${attemptedHosts.joinToString(", ")}; " +
+                            "lastHost=$idHost; lastDnsException=${e?.javaClass?.simpleName}: ${e?.message}; " +
+                            "manualRegionSelected=$isManualDiscovery; selectedManualHostAttempted=${manualRegion?.let { OciEndpoints.identityHost(it) in attemptedHosts } ?: false}",
+                    )
+                }
+                if (isManualDiscovery && candidate == manualRegion) {
+                    val error = "Could not resolve Oracle Identity endpoint $idHost. " +
+                        "Check network/DNS, Private DNS/adblock/VPN settings, or try another network."
+                    emit(Phase.API_KEY, Status.ERROR, error)
+                    return RegionDiscoveryResult(
+                        success = false,
+                        discoverySource = preferredRegionSource,
+                        error = error,
+                        attemptedHosts = attemptedHosts,
+                    )
                 }
                 continue
             }
@@ -412,6 +448,14 @@ class OciProvisioner(
                     emit(Phase.API_KEY, Status.RUNNING, "Region discovery source: $source")
                     emit(Phase.API_KEY, Status.RUNNING, "Identity endpoint used: $identityEndpoint")
                     emit(Phase.API_KEY, Status.RUNNING, "Subscribed regions: ${subscribed.joinToString(", ").ifBlank { "unknown" }}")
+                    emit(
+                        Phase.API_KEY,
+                        Status.RUNNING,
+                        "Region trace: tokenRegionId=${auth.tokenRegion ?: "none"} manualRegionId=${manualRegion ?: "none"} " +
+                            "discoveryCandidateRegionId=$candidate finalIdentityRegionId=$candidate finalHomeRegionId=$homeRegion " +
+                            "finalProvisioningRegionId=$homeRegion signerRegionId=$homeRegion identityHost=${OciEndpoints.identityHost(homeRegion)} " +
+                            "identityUrl=${OciEndpoints.identityEndpoint(homeRegion)} realm=${OciEndpoints.realm(homeRegion)}",
+                    )
                 }
                 return RegionDiscoveryResult(
                     success = true,
@@ -419,6 +463,7 @@ class OciProvisioner(
                     discoverySource = source,
                     identityEndpointUsed = identityEndpoint,
                     subscribedRegions = subscribed,
+                    attemptedHosts = attemptedHosts,
                 )
             }
 
@@ -429,7 +474,19 @@ class OciProvisioner(
         }
 
         val error = authFailure ?: if (!sawDnsSuccess) {
-            "Could not resolve Oracle Identity endpoints. Check network/DNS and retry."
+            val lastHost = attemptedHosts.lastOrNull() ?: "unknown"
+            val dnsDetail = lastDnsException?.let { "${it.javaClass.simpleName}: ${it.message}" } ?: "unknown"
+            if (isDevMode) {
+                emit(
+                    Phase.API_KEY,
+                    Status.ERROR,
+                    "DNS attempted host count=${attemptedHosts.size}; hosts=${attemptedHosts.joinToString(", ")}; " +
+                        "lastHost=$lastHost; lastDnsException=$dnsDetail; manualRegionSelected=$isManualDiscovery; " +
+                        "selectedManualHostAttempted=${manualRegion?.let { OciEndpoints.identityHost(it) in attemptedHosts } ?: false}",
+                )
+            }
+            "Could not resolve Oracle Identity endpoints after trying ${attemptedHosts.size} host(s). " +
+                "Last attempted host: $lastHost. Check network/DNS, Private DNS/adblock/VPN settings, or try another network."
         } else {
             "Oracle login succeeded, but ZeroVPN could not discover your home region. Choose your Oracle home region manually and retry."
         }
@@ -438,6 +495,7 @@ class OciProvisioner(
             success = false,
             discoverySource = "automatic-failed",
             error = error,
+            attemptedHosts = attemptedHosts,
         )
     }
 
@@ -526,6 +584,8 @@ class OciProvisioner(
             emit(Phase.API_KEY, Status.RUNNING, "Final provisioning region: $homeRegion")
             emit(Phase.API_KEY, Status.RUNNING, "Identity host: $idHost")
             emit(Phase.API_KEY, Status.RUNNING, "IaaS host: $iaasHost")
+            emit(Phase.API_KEY, Status.RUNNING, "Signer region: $homeRegion")
+            emit(Phase.API_KEY, Status.RUNNING, "Realm/domain suffix: ${OciEndpoints.realm(homeRegion)}")
         }
 
         if (isUk && !isDevMode) {
@@ -636,6 +696,7 @@ class OciProvisioner(
 
         // DEBUG: Show signing string and auth header on screen (dev mode only)
         if (isDevMode) {
+            emit(Phase.API_KEY, Status.RUNNING, "API key signerRegionId=$homeRegion identityHost=$idHost identityUrl=https://$idHost")
             emit(Phase.API_KEY, Status.RUNNING, "POST signing string:")
             signingStr.split("\n").forEachIndexed { i, line ->
                 emit(Phase.API_KEY, Status.RUNNING, " [$i] $line")
