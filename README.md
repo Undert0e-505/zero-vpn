@@ -3,7 +3,7 @@
 ZeroVPN is an experimental open-source Android app for creating and using
 personal VPN exits.
 
-The current v0.1 path provisions an Oracle Cloud Always Free VM, installs
+The current v0.1.1 path provisions an Oracle Cloud Always Free VM, installs
 WireGuard, and connects the Android device through that VM using Android
 `VpnService`.
 
@@ -13,7 +13,7 @@ exits through infrastructure that you control.
 
 ## Status
 
-ZeroVPN v0.1 is an experimental public pre-release.
+ZeroVPN v0.1.1 is an experimental public pre-release.
 
 Currently working:
 
@@ -36,7 +36,7 @@ Known rough edges:
 - Volunteer Network, QR Invite, Import Config, and Private Node are not
   implemented yet.
 
-## What Works In v0.1
+## What Works In v0.1.1
 
 - Creates an Oracle Free Exit using your own Oracle Cloud account.
 - Provisions a small Oracle VM intended for Oracle Always Free usage.
@@ -69,11 +69,11 @@ professionally audited security product.
 
 ## Installation
 
-Download the v0.1 pre-release APK from GitHub:
+Download the v0.1.1 pre-release APK from GitHub:
 
-https://github.com/Undert0e-505/zero-vpn/releases/tag/v0.1
+https://github.com/Undert0e-505/zero-vpn/releases/tag/v0.1.1
 
-Install `ZeroVPN-v0.1.apk`. The public release APK is signed. Android will ask
+Install `ZeroVPN-v0.1.1.apk`. The public release APK is signed. Android will ask
 you to allow installation from the browser or file manager you use to open the
 APK.
 
@@ -99,7 +99,7 @@ Useful Oracle links:
 
 ## Basic Usage
 
-1. Install the APK from the v0.1 release.
+1. Install the APK from the v0.1.1 release.
 2. Open ZeroVPN.
 3. Choose **Add Exit**.
 4. Choose **Create Oracle Free Exit**.
@@ -131,7 +131,7 @@ cd android
 Release dry-run:
 
 ```powershell
-.\scripts\build-apk.ps1 -Version 0.1 -DryRun -PreRelease -Clean
+.\scripts\build-apk.ps1 -Version 0.1.1 -DryRun -PreRelease -Clean
 ```
 
 Real release builds require local signing configuration and GitHub CLI
