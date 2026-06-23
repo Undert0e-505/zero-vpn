@@ -1,22 +1,33 @@
 package com.zerovpn.app.volunteer
 
 import android.app.Application
+import android.content.Intent
+import android.net.VpnService
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.zerovpn.app.volunteer.tun2socks.HevNativeLoader
+import com.zerovpn.app.volunteer.vpn.VolunteerVpnDiagnostics
+import com.zerovpn.app.volunteer.vpn.VolunteerVpnRuntime
+import com.zerovpn.app.volunteer.vpn.VolunteerVpnService
+import com.zerovpn.app.volunteer.vpn.VolunteerVpnState
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.flow.filter
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeout
 
 class VolunteerNetworkController(application: Application) : AndroidViewModel(application) {
     private val embeddedTorController = EmbeddedTorController(application)
     private val socksProbe = TorSocksProbe()
     private var runJob: Job? = null
+    private var vpnRunJob: Job? = null
     private var bootstrapAttempts = 0
     private var lastSuccessfulBootstrapAt: Long? = null
 
@@ -25,13 +36,15 @@ class VolunteerNetworkController(application: Application) : AndroidViewModel(ap
 
     private val _diagnostics = MutableStateFlow(VolunteerNetworkDiagnostics())
     val diagnostics: StateFlow<VolunteerNetworkDiagnostics> = _diagnostics.asStateFlow()
+    val volunteerVpnState: StateFlow<VolunteerVpnState> = VolunteerVpnRuntime.state
+    val volunteerVpnDiagnostics: StateFlow<VolunteerVpnDiagnostics> = VolunteerVpnRuntime.diagnostics
 
     fun startTest() {
         val currentState = _state.value
         if (!currentState.canStart) return
 
-        runJob?.cancel()
-        runJob = viewModelScope.launch {
+        vpnRunJob?.cancel()
+        vpnRunJob = viewModelScope.launch {
             val snapshot = embeddedTorController.snapshot()
             val coldStart = !snapshot.stateDirectoryExists
             val timeoutMs = if (coldStart) {
@@ -222,9 +235,107 @@ class VolunteerNetworkController(application: Application) : AndroidViewModel(ap
         }
     }
 
+    fun volunteerVpnPermissionIntent(): Intent? =
+        VpnService.prepare(getApplication())
+
+    fun markVolunteerVpnPermissionNeeded() {
+        VolunteerVpnRuntime.update(
+            VolunteerVpnState.PermissionNeeded,
+            VolunteerVpnRuntime.diagnostics.value.copy(
+                volunteerVpnState = "PermissionNeeded",
+                androidVpnPermission = "needed",
+            ),
+        )
+    }
+
+    fun startVolunteerVpnTest() {
+        val permissionIntent = volunteerVpnPermissionIntent()
+        if (permissionIntent != null) {
+            markVolunteerVpnPermissionNeeded()
+            return
+        }
+
+        runJob?.cancel()
+        runJob = viewModelScope.launch {
+            val smoke = HevNativeLoader.smokeTest()
+            VolunteerVpnRuntime.updateDiagnostics {
+                it.copy(
+                    androidVpnPermission = "granted",
+                    hevNativeEnabled = smoke.enabled,
+                    hevLibraryLoaded = smoke.loaded,
+                    lastError = smoke.lastLoadError,
+                )
+            }
+            if (!smoke.loaded) {
+                VolunteerVpnRuntime.update(
+                    VolunteerVpnState.Failed("HEV native library is not loaded."),
+                    VolunteerVpnRuntime.diagnostics.value.copy(
+                        volunteerVpnState = "Failed",
+                        lastError = smoke.lastLoadError ?: "HEV native library is not loaded.",
+                    ),
+                )
+                return@launch
+            }
+
+            VolunteerVpnRuntime.update(
+                VolunteerVpnState.StartingTor,
+                VolunteerVpnRuntime.diagnostics.value.copy(
+                    volunteerVpnState = "StartingTor",
+                    androidVpnPermission = "granted",
+                    hevNativeEnabled = smoke.enabled,
+                    hevLibraryLoaded = smoke.loaded,
+                ),
+            )
+            if (_state.value !is VolunteerNetworkState.Ready) {
+                startTest()
+                withTimeout(EmbeddedTorController.COLD_BOOTSTRAP_TIMEOUT_MS + 30_000L) {
+                    state.filter {
+                        it is VolunteerNetworkState.Ready || it is VolunteerNetworkState.Failed
+                    }.first()
+                }
+            }
+            if (_state.value !is VolunteerNetworkState.Ready) {
+                VolunteerVpnRuntime.update(
+                    VolunteerVpnState.Failed("Embedded Tor is not ready."),
+                    VolunteerVpnRuntime.diagnostics.value.copy(
+                        volunteerVpnState = "Failed",
+                        torReady = false,
+                        lastError = "Embedded Tor is not ready.",
+                    ),
+                )
+                return@launch
+            }
+
+            val socksPort = _diagnostics.value.socksPort ?: 9050
+            val app = getApplication<Application>()
+            VolunteerVpnRuntime.update(
+                VolunteerVpnState.StartingVpn,
+                VolunteerVpnRuntime.diagnostics.value.copy(
+                    volunteerVpnState = "StartingVpn",
+                    torReady = true,
+                    socksTarget = "${_diagnostics.value.socksHost}:$socksPort",
+                ),
+            )
+            app.startService(
+                VolunteerVpnService.startIntent(
+                    app,
+                    socksHost = _diagnostics.value.socksHost,
+                    socksPort = socksPort,
+                ),
+            )
+        }
+    }
+
+    fun stopVolunteerVpnTest() {
+        getApplication<Application>().startService(
+            VolunteerVpnService.stopIntent(getApplication()),
+        )
+    }
+
     override fun onCleared() {
         super.onCleared()
         CoroutineScope(Dispatchers.Main.immediate).launch {
+            stopVolunteerVpnTest()
             embeddedTorController.stop()
         }
     }
