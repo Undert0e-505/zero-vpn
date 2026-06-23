@@ -989,14 +989,15 @@ class OciProvisioner(
             Status.RUNNING,
             "Phase region trace: provisioningRegion=$homeRegion publicIp=$publicIp setupHost=ubuntu@$publicIp",
         )
-        if (!installWireGuardTools(sshConnection)) {
+        val installResult = runSshCommand(
+            sshConnection,
+            "sudo apt-get update -y; sudo apt-get install -y wireguard wireguard-tools; which wg || exit 1",
+            label = "install WireGuard",
+        )
+        if (installResult.exitCode != 0) {
             sshConnection.session?.disconnect()
             keyTempFile.delete()
-            throw Exception(
-                "WireGuard tools could not be installed on the Oracle VM. " +
-                    "The VM was created and SSH worked, but apt could not find or install wireguard-tools. " +
-                    "Check the setup log for apt update and sources output.",
-            )
+            throw Exception("apt install failed: ${installResult.stderr.takeLast(300)}")
         }
 
         emit(Phase.WIREGUARD, Status.RUNNING, "Generating server keys...")
@@ -1183,142 +1184,6 @@ class OciProvisioner(
             stdout = "",
             stderr = "${lastError?.javaClass?.simpleName ?: "SshCommandFailed"}: ${lastError?.message ?: "unknown SSH command failure"}",
         )
-    }
-
-    private suspend fun installWireGuardTools(connection: SshConnection): Boolean {
-        val diagnostics = listOf(
-            "cat /etc/os-release",
-            "uname -a",
-            "lsb_release -a || true",
-            "id",
-            "ip route",
-            "cat /etc/apt/sources.list || true",
-            "ls -la /etc/apt/sources.list.d || true",
-            "find /etc/apt/sources.list.d -maxdepth 1 -type f -print -exec sed -n '1,160p' {} \\; || true",
-            "apt-cache policy || true",
-            "apt-cache policy wireguard-tools || true",
-            "apt-cache search '^wireguard' || true",
-            "apt-cache search 'wireguard-tools' || true",
-            "getent hosts archive.ubuntu.com || true",
-            "getent hosts security.ubuntu.com || true",
-            "ping -c 1 1.1.1.1 || true",
-            "ping -c 1 archive.ubuntu.com || true",
-        )
-        diagnostics.forEach { command ->
-            runLoggedRemoteCommand(connection, "preinstall diagnostic", command)
-        }
-
-        val updateCommand = "sudo DEBIAN_FRONTEND=noninteractive apt-get update -o Acquire::Retries=3"
-        val updateResult = runLoggedRemoteCommand(connection, "apt update", updateCommand)
-        val policyAfterUpdate = runLoggedRemoteCommand(connection, "package policy after update", "apt-cache policy wireguard-tools || true")
-        runLoggedRemoteCommand(connection, "package search after update", "apt-cache search '^wireguard' || true")
-
-        val installCommand = "sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends " +
-            "wireguard-tools iptables iproute2 curl ca-certificates"
-        var installResult = RemoteCommandResult(255, "", "apt install was not attempted")
-        var policyForInstall = policyAfterUpdate
-        if (!hasAptCandidate(policyAfterUpdate.stdout) && isUbuntuVm(connection)) {
-            emit(Phase.WIREGUARD, Status.WARNING, "wireguard-tools has no apt candidate; trying Ubuntu universe repository fallback")
-            runLoggedRemoteCommand(connection, "Ubuntu release info", ". /etc/os-release; echo \"${'$'}ID ${'$'}VERSION_CODENAME\"")
-            runLoggedRemoteCommand(
-                connection,
-                "install add-apt-repository helper",
-                "sudo DEBIAN_FRONTEND=noninteractive apt-get install -y software-properties-common || true",
-            )
-            runLoggedRemoteCommand(
-                connection,
-                "enable Ubuntu universe",
-                "if command -v add-apt-repository >/dev/null 2>&1; then sudo add-apt-repository -y universe; else echo 'add-apt-repository not available'; exit 1; fi",
-            )
-            runLoggedRemoteCommand(connection, "apt update after universe", updateCommand)
-            policyForInstall = runLoggedRemoteCommand(connection, "package policy after universe", "apt-cache policy wireguard-tools || true")
-            runLoggedRemoteCommand(connection, "package search after universe", "apt-cache search '^wireguard' || true")
-        } else if (!hasAptCandidate(policyAfterUpdate.stdout)) {
-            emit(Phase.WIREGUARD, Status.WARNING, "wireguard-tools has no apt candidate and VM is not Ubuntu; universe fallback skipped")
-        }
-        installResult = runLoggedRemoteCommand(connection, "apt install wireguard-tools", installCommand)
-        if (installResult.exitCode != 0 && hasAptCandidate(policyForInstall.stdout) && isUbuntuVm(connection)) {
-            emit(Phase.WIREGUARD, Status.WARNING, "wireguard-tools install failed despite apt candidate; retrying after Ubuntu universe refresh")
-            runLoggedRemoteCommand(connection, "Ubuntu release info", ". /etc/os-release; echo \"${'$'}ID ${'$'}VERSION_CODENAME\"")
-            runLoggedRemoteCommand(
-                connection,
-                "install add-apt-repository helper",
-                "sudo DEBIAN_FRONTEND=noninteractive apt-get install -y software-properties-common || true",
-            )
-            runLoggedRemoteCommand(
-                connection,
-                "enable Ubuntu universe",
-                "if command -v add-apt-repository >/dev/null 2>&1; then sudo add-apt-repository -y universe; else echo 'add-apt-repository not available'; exit 1; fi",
-            )
-            runLoggedRemoteCommand(connection, "apt update after universe retry", updateCommand)
-            runLoggedRemoteCommand(connection, "package policy after universe retry", "apt-cache policy wireguard-tools || true")
-            runLoggedRemoteCommand(connection, "package search after universe retry", "apt-cache search '^wireguard' || true")
-            installResult = runLoggedRemoteCommand(connection, "apt install wireguard-tools after universe retry", installCommand)
-        }
-
-        runLoggedRemoteCommand(connection, "kernel module check", "sudo modprobe wireguard || true")
-        runLoggedRemoteCommand(connection, "loaded module check", "lsmod | grep wireguard || true")
-        runLoggedRemoteCommand(connection, "verify wg", "command -v wg && wg --version || true")
-        runLoggedRemoteCommand(connection, "verify wg-quick", "command -v wg-quick")
-        runLoggedRemoteCommand(connection, "verify iptables", "command -v iptables && iptables --version || true")
-        runLoggedRemoteCommand(connection, "verify ip", "command -v ip && ip -V || true")
-        runLoggedRemoteCommand(connection, "verify curl", "command -v curl && curl --version | head -n 1 || true")
-
-        val wgCheck = runLoggedRemoteCommand(connection, "required wg check", "command -v wg")
-        val wgQuickCheck = runLoggedRemoteCommand(connection, "required wg-quick check", "command -v wg-quick")
-        if (installResult.exitCode != 0 || updateResult.exitCode != 0 || wgCheck.exitCode != 0 || wgQuickCheck.exitCode != 0) {
-            emit(Phase.WIREGUARD, Status.ERROR, "WireGuard tools were not installed. See apt source and package policy output above.")
-            return false
-        }
-        return true
-    }
-
-    private fun hasAptCandidate(policyOutput: String): Boolean =
-        policyOutput.lineSequence().any { line ->
-            val trimmed = line.trim()
-            trimmed.startsWith("Candidate:") &&
-                !trimmed.endsWith("(none)") &&
-                !trimmed.endsWith("none")
-        }
-
-    private suspend fun isUbuntuVm(connection: SshConnection): Boolean {
-        val result = runLoggedRemoteCommand(
-            connection,
-            "detect Ubuntu",
-            "grep -E '^ID=ubuntu$|^ID=\"ubuntu\"$' /etc/os-release",
-        )
-        return result.exitCode == 0
-    }
-
-    private suspend fun runLoggedRemoteCommand(
-        connection: SshConnection,
-        label: String,
-        command: String,
-    ): RemoteCommandResult {
-        emit(Phase.WIREGUARD, Status.RUNNING, "VM $label command: $command")
-        val result = runSshCommand(connection, command, label)
-        emit(Phase.WIREGUARD, if (result.exitCode == 0) Status.RUNNING else Status.WARNING, "VM $label exit=${result.exitCode}")
-        emitRemoteOutput(label, "stdout", result.stdout)
-        emitRemoteOutput(label, "stderr", result.stderr)
-        return result
-    }
-
-    private suspend fun emitRemoteOutput(label: String, stream: String, output: String) {
-        if (output.isBlank()) {
-            emit(Phase.WIREGUARD, Status.RUNNING, "VM $label $stream: <empty>")
-            return
-        }
-        output.lineSequence()
-            .flatMap { line -> splitRemoteLogLine(line).asSequence() }
-            .forEach { line ->
-                emit(Phase.WIREGUARD, Status.RUNNING, "VM $label $stream: $line")
-            }
-    }
-
-    private fun splitRemoteLogLine(line: String): List<String> {
-        val maxLength = 700
-        if (line.length <= maxLength) return listOf(line)
-        return line.chunked(maxLength)
     }
 
     // --- Full provisioning pipeline ---
