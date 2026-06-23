@@ -984,14 +984,14 @@ class OciProvisioner(
 
         // Phase 6: WireGuard
         emit(Phase.WIREGUARD, Status.RUNNING, "Installing WireGuard...")
-        val installResult = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-            sshExec(session,
-                "sudo apt-get update -y; sudo apt-get install -y wireguard wireguard-tools; which wg || exit 1")
-        }
-        if (installResult.first != 0) {
+        if (!installWireGuardTools(session)) {
             session.disconnect()
             keyTempFile.delete()
-            throw Exception("apt install failed: ${installResult.third.takeLast(300)}")
+            throw Exception(
+                "WireGuard tools could not be installed on the Oracle VM. " +
+                    "The VM was created and SSH worked, but apt could not find or install wireguard-tools. " +
+                    "Check the setup log for apt update and sources output.",
+            )
         }
 
         emit(Phase.WIREGUARD, Status.RUNNING, "Generating server keys...")
@@ -1069,6 +1069,116 @@ class OciProvisioner(
             sshUsername = "ubuntu",
             sshPrivateKey = sshPrivateKey,
         )
+    }
+
+    private data class RemoteCommandResult(
+        val exitCode: Int,
+        val stdout: String,
+        val stderr: String,
+    )
+
+    private suspend fun installWireGuardTools(session: Session): Boolean {
+        val diagnostics = listOf(
+            "cat /etc/os-release",
+            "uname -a",
+            "id",
+            "ip route",
+            "cat /etc/apt/sources.list || true",
+            "ls -la /etc/apt/sources.list.d || true",
+            "find /etc/apt/sources.list.d -maxdepth 1 -type f -print -exec sed -n '1,120p' {} \\; || true",
+            "getent hosts archive.ubuntu.com || true",
+            "getent hosts security.ubuntu.com || true",
+            "ping -c 1 1.1.1.1 || true",
+            "ping -c 1 archive.ubuntu.com || true",
+        )
+        diagnostics.forEach { command ->
+            runLoggedRemoteCommand(session, "preinstall diagnostic", command)
+        }
+
+        val updateCommand = "sudo DEBIAN_FRONTEND=noninteractive apt-get update -o Acquire::Retries=3"
+        val updateResult = runLoggedRemoteCommand(session, "apt update", updateCommand)
+        runLoggedRemoteCommand(session, "package policy", "apt-cache policy wireguard-tools || true")
+        runLoggedRemoteCommand(session, "package search", "apt-cache search '^wireguard' || true")
+
+        val installCommand = "sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends " +
+            "wireguard-tools iptables iproute2 curl ca-certificates"
+        var installResult = runLoggedRemoteCommand(session, "apt install wireguard-tools", installCommand)
+
+        if (installResult.exitCode != 0 && isUbuntuVm(session)) {
+            emit(Phase.WIREGUARD, Status.WARNING, "wireguard-tools install failed; trying Ubuntu universe repository fallback")
+            runLoggedRemoteCommand(
+                session,
+                "install add-apt-repository helper",
+                "sudo DEBIAN_FRONTEND=noninteractive apt-get install -y software-properties-common || true",
+            )
+            runLoggedRemoteCommand(
+                session,
+                "enable Ubuntu universe",
+                "if command -v add-apt-repository >/dev/null 2>&1; then sudo add-apt-repository -y universe; else echo 'add-apt-repository not available'; exit 1; fi",
+            )
+            runLoggedRemoteCommand(session, "apt update after universe", updateCommand)
+            runLoggedRemoteCommand(session, "package policy after universe", "apt-cache policy wireguard-tools || true")
+            runLoggedRemoteCommand(session, "package search after universe", "apt-cache search '^wireguard' || true")
+            installResult = runLoggedRemoteCommand(session, "apt install wireguard-tools after universe", installCommand)
+        } else if (installResult.exitCode != 0) {
+            emit(Phase.WIREGUARD, Status.WARNING, "wireguard-tools install failed and VM is not Ubuntu; universe fallback skipped")
+        }
+
+        runLoggedRemoteCommand(session, "kernel module check", "sudo modprobe wireguard || true")
+        runLoggedRemoteCommand(session, "loaded module check", "lsmod | grep wireguard || true")
+        runLoggedRemoteCommand(session, "verify wg", "command -v wg && wg --version || true")
+        runLoggedRemoteCommand(session, "verify iptables", "command -v iptables && iptables --version || true")
+        runLoggedRemoteCommand(session, "verify ip", "command -v ip && ip -V || true")
+
+        val wgCheck = runLoggedRemoteCommand(session, "required wg check", "command -v wg")
+        if (installResult.exitCode != 0 || updateResult.exitCode != 0 || wgCheck.exitCode != 0) {
+            emit(Phase.WIREGUARD, Status.ERROR, "WireGuard tools were not installed. apt update/install output is shown above.")
+            return false
+        }
+        return true
+    }
+
+    private suspend fun isUbuntuVm(session: Session): Boolean {
+        val result = runLoggedRemoteCommand(
+            session,
+            "detect Ubuntu",
+            "grep -E '^ID=ubuntu$|^ID=\"ubuntu\"$' /etc/os-release",
+        )
+        return result.exitCode == 0
+    }
+
+    private suspend fun runLoggedRemoteCommand(
+        session: Session,
+        label: String,
+        command: String,
+    ): RemoteCommandResult {
+        emit(Phase.WIREGUARD, Status.RUNNING, "VM $label command: $command")
+        val result = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            val (exitCode, stdout, stderr) = sshExec(session, command)
+            RemoteCommandResult(exitCode, stdout, stderr)
+        }
+        emit(Phase.WIREGUARD, if (result.exitCode == 0) Status.RUNNING else Status.WARNING, "VM $label exit=${result.exitCode}")
+        emitRemoteOutput(label, "stdout", result.stdout)
+        emitRemoteOutput(label, "stderr", result.stderr)
+        return result
+    }
+
+    private suspend fun emitRemoteOutput(label: String, stream: String, output: String) {
+        if (output.isBlank()) {
+            emit(Phase.WIREGUARD, Status.RUNNING, "VM $label $stream: <empty>")
+            return
+        }
+        output.lineSequence()
+            .flatMap { line -> splitRemoteLogLine(line).asSequence() }
+            .forEach { line ->
+                emit(Phase.WIREGUARD, Status.RUNNING, "VM $label $stream: $line")
+            }
+    }
+
+    private fun splitRemoteLogLine(line: String): List<String> {
+        val maxLength = 700
+        if (line.length <= maxLength) return listOf(line)
+        return line.chunked(maxLength)
     }
 
     // --- Full provisioning pipeline ---
