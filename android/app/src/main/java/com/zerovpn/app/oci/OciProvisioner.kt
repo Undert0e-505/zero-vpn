@@ -37,7 +37,7 @@ import java.util.concurrent.TimeUnit
 class OciProvisioner(
     private val context: Context,
     private val region: String,
-    private val isDevMode: Boolean = true,
+    private val isDevMode: Boolean = false,
 ) {
     // When isDevMode is false, wire tap and signing string debug output are suppressed.
     // Only user-facing progress messages are emitted.
@@ -399,7 +399,8 @@ class OciProvisioner(
                 }
                 if (isManualDiscovery && candidate == manualRegion) {
                     val error = "Could not resolve Oracle Identity endpoint $idHost. " +
-                        "Check network/DNS, Private DNS/adblock/VPN settings, or try another network."
+                        "Check network/DNS, try mobile data instead of Wi-Fi, temporarily disable Android Private DNS, " +
+                        "adblock/firewall/VPN settings, then retry."
                     emit(Phase.API_KEY, Status.ERROR, error)
                     return RegionDiscoveryResult(
                         success = false,
@@ -486,7 +487,8 @@ class OciProvisioner(
                 )
             }
             "Could not resolve Oracle Identity endpoints after trying ${attemptedHosts.size} host(s). " +
-                "Last attempted host: $lastHost. Check network/DNS, Private DNS/adblock/VPN settings, or try another network."
+                "Last attempted host: $lastHost. Check network/DNS, try mobile data instead of Wi-Fi, " +
+                "temporarily disable Android Private DNS, adblock/firewall/VPN settings, then retry."
         } else {
             "Oracle login succeeded, but ZeroVPN could not discover your home region. Choose your Oracle home region manually and retry."
         }
@@ -586,23 +588,6 @@ class OciProvisioner(
             emit(Phase.API_KEY, Status.RUNNING, "IaaS host: $iaasHost")
             emit(Phase.API_KEY, Status.RUNNING, "Signer region: $homeRegion")
             emit(Phase.API_KEY, Status.RUNNING, "Realm/domain suffix: ${OciEndpoints.realm(homeRegion)}")
-        }
-
-        if (isUk && !isDevMode) {
-            val error = "Your Oracle home region is $homeRegion (UK). " +
-                "This account can be used for development/testing, but not as a non-UK " +
-                "Always Free exit. Create an Oracle account with a non-UK home region."
-            emit(Phase.API_KEY, Status.ERROR, error)
-            return PreflightResult(
-                success = false,
-                homeRegion = homeRegion,
-                isUkRegion = true,
-                error = error,
-                initialRegion = auth.selectedRegion,
-                regionDiscoverySource = discovery.discoverySource,
-                identityHost = idHost,
-                iaasHost = iaasHost,
-            )
         }
 
         if (isUk) {
@@ -950,7 +935,7 @@ class OciProvisioner(
         keyTempFile.deleteOnExit()
         jsch.addIdentity(keyTempFile.absolutePath)
 
-        var session: Session? = null
+        val sshConnection = SshConnection(jsch = jsch, username = "ubuntu", host = publicIp)
         val sshTimeoutMs = 10 * 60 * 1000L
         val sshStart = System.currentTimeMillis()
         var sshAttempt = 0
@@ -960,32 +945,30 @@ class OciProvisioner(
             try {
                 emit(Phase.WAIT_SSH, Status.RUNNING, "SSH attempt $sshAttempt to ubuntu@$publicIp...")
                 kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-                    session = jsch.getSession("ubuntu", publicIp, 22)
-                    session.setConfig("StrictHostKeyChecking", "no")
-                    session.setConfig("UserKnownHostsFile", "/dev/null")
-                    session.setConfig("PreferredAuthentications", "publickey")
-                    session.timeout = 15000
-                    session.connect(15000)
+                    sshConnection.session?.disconnect()
+                    sshConnection.session = newSshSession(sshConnection)
+                    sshConnection.session!!.connect(15000)
                 }
                 break
             } catch (e: Exception) {
                 sshLastError = e
-                session?.disconnect()
-                session = null
+                sshConnection.session?.disconnect()
+                sshConnection.session = null
                 emit(Phase.WAIT_SSH, Status.RUNNING, "SSH not ready: ${e.javaClass.simpleName}: ${e.message}")
                 kotlinx.coroutines.delay(10_000)
             }
         }
-        if (session == null || !session.isConnected) {
+        if (sshConnection.session == null || sshConnection.session?.isConnected != true) {
             keyTempFile.delete()
             throw Exception("SSH did not become ready after ${sshTimeoutMs / 1000}s. Last error: ${sshLastError?.javaClass?.simpleName}: ${sshLastError?.message}")
         }
         emit(Phase.WAIT_SSH, Status.SUCCESS, "SSH connected")
+        waitForSshCommandReady(sshConnection)
 
         // Phase 6: WireGuard
         emit(Phase.WIREGUARD, Status.RUNNING, "Installing WireGuard...")
-        if (!installWireGuardTools(session)) {
-            session.disconnect()
+        if (!installWireGuardTools(sshConnection)) {
+            sshConnection.session?.disconnect()
             keyTempFile.delete()
             throw Exception(
                 "WireGuard tools could not be installed on the Oracle VM. " +
@@ -997,41 +980,42 @@ class OciProvisioner(
         emit(Phase.WIREGUARD, Status.RUNNING, "Generating server keys...")
         val keygenCmd = "sudo sh -c \"umask 077; wg genkey > /etc/wireguard/server.key; " +
             "wg pubkey < /etc/wireguard/server.key > /etc/wireguard/server.pub\""
-        val keygenResult = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-            sshExec(session, keygenCmd)
-        }
-        if (keygenResult.first != 0) {
-            session.disconnect()
+        val keygenResult = runSshCommand(sshConnection, keygenCmd, label = "generate WireGuard server keys")
+        if (keygenResult.exitCode != 0) {
+            sshConnection.session?.disconnect()
             keyTempFile.delete()
-            throw Exception("keygen failed: ${keygenResult.third.takeLast(200)}")
+            throw Exception("keygen failed: ${keygenResult.stderr.takeLast(200)}")
         }
 
         emit(Phase.WIREGUARD, Status.RUNNING, "Configuring WireGuard...")
         // Write setup script to VM via cat heredoc
         val writeCmd = "cat > /tmp/setup-wg.sh << 'ENDOFSCRIPT'\n" + SETUP_WG_SCRIPT + "\nENDOFSCRIPT"
-        val writeResult = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-            sshExec(session, writeCmd)
-        }
-        if (writeResult.first != 0) {
-            session.disconnect()
+        val writeResult = runSshCommand(sshConnection, writeCmd, label = "write WireGuard setup script")
+        if (writeResult.exitCode != 0) {
+            sshConnection.session?.disconnect()
             keyTempFile.delete()
-            throw Exception("Failed to write setup script: ${writeResult.third}")
+            throw Exception("Failed to write setup script: ${writeResult.stderr}")
         }
 
         // Fix line endings and run
-        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-            sshExec(session, "sed -i 's/\\r\$//' /tmp/setup-wg.sh")
-        }
-        val runResult = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-            sshExec(session, "CLIENT_PUBLIC_KEY='${clientKeys.publicKey}' bash /tmp/setup-wg.sh")
-        }
-        if (runResult.first != 0) {
-            session.disconnect()
+        runSshCommand(sshConnection, "sed -i 's/\\r\$//' /tmp/setup-wg.sh", label = "normalize WireGuard setup script")
+        val runResult = runSshCommand(
+            sshConnection,
+            "CLIENT_PUBLIC_KEY='${clientKeys.publicKey}' bash /tmp/setup-wg.sh",
+            label = "run WireGuard setup script",
+            maxAttempts = 1,
+        )
+        if (runResult.exitCode != 0) {
+            sshConnection.session?.disconnect()
             keyTempFile.delete()
-            throw Exception("setup-wg.sh failed: ${runResult.third.takeLast(300)}")
+            throw Exception(
+                "WireGuard setup failed because the SSH session dropped during VM setup. " +
+                    "The VM was created and SSH became reachable, but setup commands could not complete. " +
+                    runResult.stderr.takeLast(300),
+            )
         }
 
-        val stdout = runResult.second
+        val stdout = runResult.stdout
         var serverPub: String? = null
         var serverPeerPub: String? = null
         for (line in stdout.split("\n")) {
@@ -1042,7 +1026,7 @@ class OciProvisioner(
             }
         }
 
-        session.disconnect()
+        sshConnection.session?.disconnect()
         keyTempFile.delete()
 
         if (serverPub == null || serverPeerPub == null) {
@@ -1077,7 +1061,109 @@ class OciProvisioner(
         val stderr: String,
     )
 
-    private suspend fun installWireGuardTools(session: Session): Boolean {
+    private data class SshConnection(
+        val jsch: JSch,
+        val username: String,
+        val host: String,
+        var session: Session? = null,
+    )
+
+    private fun newSshSession(connection: SshConnection): Session {
+        val session = connection.jsch.getSession(connection.username, connection.host, 22)
+        session.setConfig("StrictHostKeyChecking", "no")
+        session.setConfig("UserKnownHostsFile", "/dev/null")
+        session.setConfig("PreferredAuthentications", "publickey")
+        session.timeout = 15000
+        session.setServerAliveInterval(15_000)
+        session.setServerAliveCountMax(4)
+        return session
+    }
+
+    private suspend fun reconnectSsh(connection: SshConnection, reason: String) {
+        emit(Phase.WAIT_SSH, Status.RUNNING, "Reconnecting SSH after $reason...")
+        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            connection.session?.disconnect()
+            connection.session = newSshSession(connection)
+            connection.session!!.connect(15000)
+        }
+    }
+
+    private suspend fun waitForSshCommandReady(connection: SshConnection) {
+        val maxAttempts = 12
+        repeat(maxAttempts) { index ->
+            val attempt = index + 1
+            emit(
+                Phase.WAIT_SSH,
+                Status.RUNNING,
+                "SSH command readiness attempt $attempt/$maxAttempts; sessionConnected=${connection.session?.isConnected == true}",
+            )
+            val result = runSshCommand(
+                connection = connection,
+                command = "echo ZERO_VPN_SSH_READY && whoami && uname -a",
+                label = "SSH readiness",
+                maxAttempts = 1,
+            )
+            emit(Phase.WAIT_SSH, if (result.exitCode == 0) Status.RUNNING else Status.WARNING, "SSH readiness exit=${result.exitCode}")
+            if (result.exitCode == 0 && result.stdout.contains("ZERO_VPN_SSH_READY")) {
+                emit(Phase.WAIT_SSH, Status.SUCCESS, "SSH command execution ready")
+                return
+            }
+            emit(Phase.WAIT_SSH, Status.RUNNING, "SSH connected, but the VM closed the SSH command session. Retrying setup...")
+            connection.session?.disconnect()
+            connection.session = null
+            kotlinx.coroutines.delay(10_000)
+        }
+        throw Exception(
+            "WireGuard setup failed because the SSH session dropped during VM setup. " +
+                "The VM was created and SSH became reachable, but setup commands could not complete.",
+        )
+    }
+
+    private suspend fun runSshCommand(
+        connection: SshConnection,
+        command: String,
+        label: String,
+        maxAttempts: Int = 3,
+    ): RemoteCommandResult {
+        var lastError: Exception? = null
+        repeat(maxAttempts) { index ->
+            val attempt = index + 1
+            try {
+                if (connection.session?.isConnected != true) {
+                    reconnectSsh(connection, "$label command start")
+                }
+                emit(
+                    Phase.WIREGUARD,
+                    Status.RUNNING,
+                    "SSH command '$label' attempt $attempt/$maxAttempts; sessionConnected=${connection.session?.isConnected == true}",
+                )
+                return kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                    val (exitCode, stdout, stderr) = sshExec(connection.session!!, command)
+                    RemoteCommandResult(exitCode, stdout, stderr)
+                }
+            } catch (e: Exception) {
+                lastError = e
+                emit(
+                    Phase.WIREGUARD,
+                    Status.WARNING,
+                    "SSH command '$label' failed: ${e.javaClass.simpleName}: ${e.message}",
+                )
+                connection.session?.disconnect()
+                connection.session = null
+                if (attempt < maxAttempts) {
+                    emit(Phase.WIREGUARD, Status.RUNNING, "SSH connected, but the VM closed the SSH command session. Retrying setup...")
+                    kotlinx.coroutines.delay(5_000)
+                }
+            }
+        }
+        return RemoteCommandResult(
+            exitCode = 255,
+            stdout = "",
+            stderr = "${lastError?.javaClass?.simpleName ?: "SshCommandFailed"}: ${lastError?.message ?: "unknown SSH command failure"}",
+        )
+    }
+
+    private suspend fun installWireGuardTools(connection: SshConnection): Boolean {
         val diagnostics = listOf(
             "cat /etc/os-release",
             "uname -a",
@@ -1092,45 +1178,45 @@ class OciProvisioner(
             "ping -c 1 archive.ubuntu.com || true",
         )
         diagnostics.forEach { command ->
-            runLoggedRemoteCommand(session, "preinstall diagnostic", command)
+            runLoggedRemoteCommand(connection, "preinstall diagnostic", command)
         }
 
         val updateCommand = "sudo DEBIAN_FRONTEND=noninteractive apt-get update -o Acquire::Retries=3"
-        val updateResult = runLoggedRemoteCommand(session, "apt update", updateCommand)
-        runLoggedRemoteCommand(session, "package policy", "apt-cache policy wireguard-tools || true")
-        runLoggedRemoteCommand(session, "package search", "apt-cache search '^wireguard' || true")
+        val updateResult = runLoggedRemoteCommand(connection, "apt update", updateCommand)
+        runLoggedRemoteCommand(connection, "package policy", "apt-cache policy wireguard-tools || true")
+        runLoggedRemoteCommand(connection, "package search", "apt-cache search '^wireguard' || true")
 
         val installCommand = "sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends " +
             "wireguard-tools iptables iproute2 curl ca-certificates"
-        var installResult = runLoggedRemoteCommand(session, "apt install wireguard-tools", installCommand)
+        var installResult = runLoggedRemoteCommand(connection, "apt install wireguard-tools", installCommand)
 
-        if (installResult.exitCode != 0 && isUbuntuVm(session)) {
+        if (installResult.exitCode != 0 && isUbuntuVm(connection)) {
             emit(Phase.WIREGUARD, Status.WARNING, "wireguard-tools install failed; trying Ubuntu universe repository fallback")
             runLoggedRemoteCommand(
-                session,
+                connection,
                 "install add-apt-repository helper",
                 "sudo DEBIAN_FRONTEND=noninteractive apt-get install -y software-properties-common || true",
             )
             runLoggedRemoteCommand(
-                session,
+                connection,
                 "enable Ubuntu universe",
                 "if command -v add-apt-repository >/dev/null 2>&1; then sudo add-apt-repository -y universe; else echo 'add-apt-repository not available'; exit 1; fi",
             )
-            runLoggedRemoteCommand(session, "apt update after universe", updateCommand)
-            runLoggedRemoteCommand(session, "package policy after universe", "apt-cache policy wireguard-tools || true")
-            runLoggedRemoteCommand(session, "package search after universe", "apt-cache search '^wireguard' || true")
-            installResult = runLoggedRemoteCommand(session, "apt install wireguard-tools after universe", installCommand)
+            runLoggedRemoteCommand(connection, "apt update after universe", updateCommand)
+            runLoggedRemoteCommand(connection, "package policy after universe", "apt-cache policy wireguard-tools || true")
+            runLoggedRemoteCommand(connection, "package search after universe", "apt-cache search '^wireguard' || true")
+            installResult = runLoggedRemoteCommand(connection, "apt install wireguard-tools after universe", installCommand)
         } else if (installResult.exitCode != 0) {
             emit(Phase.WIREGUARD, Status.WARNING, "wireguard-tools install failed and VM is not Ubuntu; universe fallback skipped")
         }
 
-        runLoggedRemoteCommand(session, "kernel module check", "sudo modprobe wireguard || true")
-        runLoggedRemoteCommand(session, "loaded module check", "lsmod | grep wireguard || true")
-        runLoggedRemoteCommand(session, "verify wg", "command -v wg && wg --version || true")
-        runLoggedRemoteCommand(session, "verify iptables", "command -v iptables && iptables --version || true")
-        runLoggedRemoteCommand(session, "verify ip", "command -v ip && ip -V || true")
+        runLoggedRemoteCommand(connection, "kernel module check", "sudo modprobe wireguard || true")
+        runLoggedRemoteCommand(connection, "loaded module check", "lsmod | grep wireguard || true")
+        runLoggedRemoteCommand(connection, "verify wg", "command -v wg && wg --version || true")
+        runLoggedRemoteCommand(connection, "verify iptables", "command -v iptables && iptables --version || true")
+        runLoggedRemoteCommand(connection, "verify ip", "command -v ip && ip -V || true")
 
-        val wgCheck = runLoggedRemoteCommand(session, "required wg check", "command -v wg")
+        val wgCheck = runLoggedRemoteCommand(connection, "required wg check", "command -v wg")
         if (installResult.exitCode != 0 || updateResult.exitCode != 0 || wgCheck.exitCode != 0) {
             emit(Phase.WIREGUARD, Status.ERROR, "WireGuard tools were not installed. apt update/install output is shown above.")
             return false
@@ -1138,9 +1224,9 @@ class OciProvisioner(
         return true
     }
 
-    private suspend fun isUbuntuVm(session: Session): Boolean {
+    private suspend fun isUbuntuVm(connection: SshConnection): Boolean {
         val result = runLoggedRemoteCommand(
-            session,
+            connection,
             "detect Ubuntu",
             "grep -E '^ID=ubuntu$|^ID=\"ubuntu\"$' /etc/os-release",
         )
@@ -1148,15 +1234,12 @@ class OciProvisioner(
     }
 
     private suspend fun runLoggedRemoteCommand(
-        session: Session,
+        connection: SshConnection,
         label: String,
         command: String,
     ): RemoteCommandResult {
         emit(Phase.WIREGUARD, Status.RUNNING, "VM $label command: $command")
-        val result = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-            val (exitCode, stdout, stderr) = sshExec(session, command)
-            RemoteCommandResult(exitCode, stdout, stderr)
-        }
+        val result = runSshCommand(connection, command, label)
         emit(Phase.WIREGUARD, if (result.exitCode == 0) Status.RUNNING else Status.WARNING, "VM $label exit=${result.exitCode}")
         emitRemoteOutput(label, "stdout", result.stdout)
         emitRemoteOutput(label, "stderr", result.stderr)
