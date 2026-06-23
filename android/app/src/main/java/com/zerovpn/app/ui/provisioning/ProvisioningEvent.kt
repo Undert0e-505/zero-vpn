@@ -10,6 +10,7 @@ data class ProvisioningEvent(
     val status: Status,            // enum: RUNNING, SUCCESS, WARNING, ERROR
     val message: String,           // user-safe message (no secrets)
     val technicalDetail: String? = null,  // redacted technical detail (no secrets)
+    val developerOnly: Boolean = false,
 )
 
 enum class Phase(val number: Int, val label: String) {
