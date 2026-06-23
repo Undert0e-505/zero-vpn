@@ -471,7 +471,7 @@ private fun exitStatusText(exit: ConfiguredExit, active: Boolean, selected: Bool
     else -> "Ready"
 }
 
-private suspend fun connectExit(
+internal suspend fun connectExit(
     exit: ConfiguredExit,
     vpnViewModel: VpnViewModel,
     snackbarHostState: SnackbarHostState,

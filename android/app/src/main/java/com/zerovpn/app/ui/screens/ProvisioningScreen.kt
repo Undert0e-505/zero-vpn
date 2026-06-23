@@ -1,5 +1,8 @@
 package com.zerovpn.app.ui.screens
 
+import android.app.Activity
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
@@ -13,6 +16,7 @@ import androidx.compose.material.icons.filled.Cloud
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Warning
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.DropdownMenu
@@ -21,12 +25,14 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -46,6 +52,9 @@ import com.zerovpn.app.ui.provisioning.Status
 import com.zerovpn.app.ui.theme.*
 import com.zerovpn.app.oci.OciRegion
 import com.zerovpn.app.oci.OciRegions
+import com.zerovpn.app.vpn.VpnConnectionState
+import com.zerovpn.app.vpn.VpnViewModel
+import kotlinx.coroutines.launch
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -60,6 +69,8 @@ fun ProvisioningScreen(
     onBack: () -> Unit,
     modifier: Modifier = Modifier,
     viewModel: ProvisioningViewModel = viewModel(),
+    vpnViewModel: VpnViewModel = viewModel(),
+    onConnectedHome: () -> Unit = {},
     onDestroy: (() -> Unit)? = null,
 ) {
     val state by viewModel.state.collectAsState()
@@ -70,11 +81,72 @@ fun ProvisioningScreen(
     val isDevMode by viewModel.isDevMode.collectAsState()
     val onboardingState by viewModel.oracleOnboardingState.collectAsState()
     val selectedOracleRegion by viewModel.selectedOracleRegion.collectAsState()
+    val exits by viewModel.configuredExits.collectAsState()
+    val selectedExitId by viewModel.selectedExitId.collectAsState()
+    val vpnState by vpnViewModel.state.collectAsState()
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val visibleEvents = remember(events, isDevMode) {
+        if (isDevMode) events else events.filterNot { it.developerOnly }
+    }
+    var showDestroyDialog by remember { mutableStateOf(false) }
+    var pendingPermissionExitId by remember { mutableStateOf<String?>(null) }
+    var successConnectTargetId by remember { mutableStateOf<String?>(null) }
+
+    val permissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartActivityForResult(),
+    ) { result ->
+        val exit = pendingPermissionExitId?.let { id -> exits.firstOrNull { it.id == id } }
+        pendingPermissionExitId = null
+        if (result.resultCode == Activity.RESULT_OK && exit != null) {
+            vpnViewModel.connect(exit)
+        } else {
+            vpnViewModel.onPermissionDenied()
+            scope.launch {
+                snackbarHostState.showSnackbar("VPN permission was not granted")
+            }
+        }
+    }
 
     // Initialize prefs on first composition
     LaunchedEffect(Unit) {
         viewModel.initPrefs(context)
+    }
+
+    LaunchedEffect(vpnState, successConnectTargetId) {
+        val targetId = successConnectTargetId ?: return@LaunchedEffect
+        val connected = vpnState as? VpnConnectionState.Connected ?: return@LaunchedEffect
+        if (connected.exitId == targetId) {
+            successConnectTargetId = null
+            onConnectedHome()
+        }
+    }
+
+    if (showDestroyDialog) {
+        AlertDialog(
+            onDismissRequest = { showDestroyDialog = false },
+            title = { Text("Destroy this exit?", color = TextPrimary) },
+            text = {
+                Text(
+                    "This will delete the Oracle VM and remove this exit from ZeroVPN. You cannot undo this action.",
+                    color = TextDim,
+                    fontSize = 14.sp,
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    showDestroyDialog = false
+                    onDestroy?.invoke() ?: viewModel.destroyNode(context)
+                }) {
+                    Text("Destroy exit", color = Danger)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showDestroyDialog = false }) {
+                    Text("Cancel", color = TextDim)
+                }
+            },
+        )
     }
 
     Column(
@@ -141,7 +213,7 @@ fun ProvisioningScreen(
             is ProvisioningState.Running -> {
                 if (currentPhase == Phase.AUTH) {
                     AuthWaitingContent(
-                        events = events,
+                        events = visibleEvents,
                         onboardingState = onboardingState,
                         onContinue = { viewModel.onAppResumed() },
                         onRetry = { viewModel.retry(context) },
@@ -149,7 +221,7 @@ fun ProvisioningScreen(
                     )
                 } else {
                     ProgressContent(
-                        events = events,
+                        events = visibleEvents,
                         currentPhase = currentPhase,
                     )
                 }
@@ -169,14 +241,29 @@ fun ProvisioningScreen(
                     wireGuardPort = s.wireGuardPort,
                     region = s.region,
                     isDevMode = s.isDevMode,
+                    vpnState = vpnState,
                     onConnect = {
-                        android.widget.Toast.makeText(
-                            context,
-                            "WireGuard connection coming soon",
-                            android.widget.Toast.LENGTH_SHORT,
-                        ).show()
+                        scope.launch {
+                            val exit = exits.firstOrNull { it.id == selectedExitId } ?: exits.lastOrNull()
+                            if (exit == null) {
+                                snackbarHostState.showSnackbar("No configured exit was found.")
+                                return@launch
+                            }
+                            viewModel.selectExit(exit.id)
+                            successConnectTargetId = exit.id
+                            connectExit(
+                                exit = exit,
+                                vpnViewModel = vpnViewModel,
+                                snackbarHostState = snackbarHostState,
+                                permissionLauncher = { permissionIntent ->
+                                    pendingPermissionExitId = exit.id
+                                    vpnViewModel.markPermissionRequired(exit.id)
+                                    permissionLauncher.launch(permissionIntent)
+                                },
+                            )
+                        }
                     },
-                    onDestroy = { onDestroy?.invoke() ?: viewModel.destroyNode(context) },
+                    onDestroy = { showDestroyDialog = true },
                 )
             }
 
@@ -185,7 +272,7 @@ fun ProvisioningScreen(
                     failedPhase = s.failedPhase,
                     lastSuccessPhase = s.lastSuccessPhase,
                     errorMessage = s.errorMessage,
-                    events = events,
+                    events = visibleEvents,
                     selectedRegion = selectedOracleRegion,
                     regions = viewModel.oracleRegions,
                     onSelectRegion = viewModel::selectOracleRegion,
@@ -196,7 +283,7 @@ fun ProvisioningScreen(
 
             is ProvisioningState.Destroying -> {
                 ProgressContent(
-                    events = events,
+                    events = visibleEvents,
                     currentPhase = currentPhase,
                 )
             }
@@ -659,9 +746,13 @@ private fun SuccessContent(
     wireGuardPort: Int,
     region: String,
     isDevMode: Boolean,
+    vpnState: VpnConnectionState,
     onConnect: () -> Unit,
     onDestroy: () -> Unit,
 ) {
+    val connecting = vpnState is VpnConnectionState.Connecting ||
+        vpnState is VpnConnectionState.PermissionRequired
+    val connectionError = (vpnState as? VpnConnectionState.Failed)?.message
     Column(
         modifier = Modifier.fillMaxWidth(),
         verticalArrangement = Arrangement.spacedBy(16.dp),
@@ -699,17 +790,29 @@ private fun SuccessContent(
 
         Spacer(modifier = Modifier.height(8.dp))
 
+        if (connectionError != null) {
+            Text(
+                text = connectionError,
+                fontSize = 12.sp,
+                color = Danger,
+                modifier = Modifier.fillMaxWidth(),
+            )
+        }
+
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(12.dp),
         ) {
             Button(
                 onClick = onConnect,
+                enabled = !connecting,
                 modifier = Modifier.weight(1f).height(48.dp),
                 shape = RoundedCornerShape(8.dp),
                 colors = ButtonDefaults.buttonColors(
                     containerColor = Accent,
                     contentColor = Bg,
+                    disabledContainerColor = Border,
+                    disabledContentColor = TextDim,
                 ),
             ) {
                 Icon(
@@ -718,14 +821,24 @@ private fun SuccessContent(
                     modifier = Modifier.size(20.dp),
                 )
                 Spacer(modifier = Modifier.width(8.dp))
-                Text("Connect Now", fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                Text(
+                    text = when (vpnState) {
+                        is VpnConnectionState.PermissionRequired -> "Waiting for Permission"
+                        is VpnConnectionState.Connecting -> "Connecting"
+                        else -> "Connect Now"
+                    },
+                    fontSize = 14.sp,
+                    fontWeight = FontWeight.Bold,
+                )
             }
             OutlinedButton(
                 onClick = onDestroy,
+                enabled = !connecting,
                 modifier = Modifier.weight(1f).height(48.dp),
                 shape = RoundedCornerShape(8.dp),
                 colors = ButtonDefaults.outlinedButtonColors(
                     contentColor = Danger,
+                    disabledContentColor = TextDim,
                 ),
             ) {
                 Icon(

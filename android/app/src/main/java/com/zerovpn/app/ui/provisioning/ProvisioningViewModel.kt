@@ -479,7 +479,7 @@ class ProvisioningViewModel : ViewModel() {
             val prov = provisioner ?: OciProvisioner(context, currentRegion, _isDevMode.value).also { provisioner = it }
             val eventJob = viewModelScope.launch {
                 prov.events.collect { event ->
-                    _events.value = _events.value + event
+                    _events.value = _events.value + classifyEvent(event)
                     if (event.phase != Phase.DONE) {
                         _currentPhase.value = event.phase
                     }
@@ -605,7 +605,7 @@ class ProvisioningViewModel : ViewModel() {
             val prov = provisioner!!
             val eventJob = viewModelScope.launch {
                 prov.events.collect { event ->
-                    _events.value = _events.value + event
+                    _events.value = _events.value + classifyEvent(event)
                     if (event.phase != Phase.DONE) {
                         _currentPhase.value = event.phase
                     }
@@ -698,7 +698,7 @@ class ProvisioningViewModel : ViewModel() {
 
             val eventJob = viewModelScope.launch {
                 prov.events.collect { event ->
-                    _events.value = _events.value + event
+                    _events.value = _events.value + classifyEvent(event)
                     if (event.phase != Phase.DONE) {
                         _currentPhase.value = event.phase
                     }
@@ -797,8 +797,62 @@ class ProvisioningViewModel : ViewModel() {
             phase = phase,
             status = status,
             message = message,
+            developerOnly = isDeveloperDiagnostic(message, status),
         )
         _events.value = _events.value + event
+    }
+
+    private fun classifyEvent(event: ProvisioningEvent): ProvisioningEvent =
+        if (event.developerOnly || isDeveloperDiagnostic(event.message, event.status)) {
+            event.copy(developerOnly = true)
+        } else {
+            event
+        }
+
+    private fun isDeveloperDiagnostic(message: String, status: Status): Boolean {
+        if (status == Status.ERROR) return false
+        val text = message.lowercase()
+        return text.contains("[wire tap]") ||
+            text.contains("region trace:") ||
+            text.contains("phase region trace:") ||
+            text.contains("auth bootstrap region:") ||
+            text.contains("token region source:") ||
+            text.contains("region discovery candidates:") ||
+            text.contains("trying candidate region:") ||
+            text.contains("identity host:") ||
+            text.contains("identity url:") ||
+            text.contains("identity endpoint used:") ||
+            text.contains("iaas host:") ||
+            text.contains("signer region:") ||
+            text.contains("realm/domain suffix:") ||
+            text.contains("subscribed regions:") ||
+            text.contains("dns attempted") ||
+            text.contains("dns preflight") ||
+            text.contains("unknownhostexception") ||
+            text.contains("regionsubscriptions") ||
+            text.contains("developer mode:") ||
+            text.contains("developer mode affects diagnostics only") ||
+            text.contains("api keys on account:") ||
+            text.contains("post signing string") ||
+            text.contains("authorization header generated") ||
+            text.matches(Regex("^\\s*\\[\\d+] .*")) ||
+            text.contains("upload response:") ||
+            text.contains("availability domain selected:") ||
+            text.contains("ssh attempt") ||
+            text.contains("ssh not ready:") ||
+            text.contains("ssh command") ||
+            text.contains("sessionconnected") ||
+            text.contains("commandstarted") ||
+            text.contains("reconnecting ssh") ||
+            text.contains("preinstall diagnostic") ||
+            text.contains("apt-cache") ||
+            text.contains("apt source") ||
+            text.contains("package policy") ||
+            text.contains("stdout") ||
+            text.contains("stderr") ||
+            text.contains("iptables") ||
+            text.contains("wg-quick") ||
+            text.contains("setup script")
     }
 
     private fun buildConfiguredExit(

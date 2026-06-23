@@ -188,6 +188,16 @@ fun NavGraph() {
                     snackbarHostState = snackbarHostState,
                     onBack = { navController.popBackStack() },
                     viewModel = provisioningViewModel,
+                    vpnViewModel = vpnViewModel,
+                    onConnectedHome = {
+                        navController.navigate(Screen.Home.route) {
+                            popUpTo(navController.graph.findStartDestination().id) {
+                                saveState = true
+                            }
+                            launchSingleTop = true
+                            restoreState = true
+                        }
+                    },
                     onDestroy = {
                         scope.launch {
                             val exitId = provisioningViewModel.selectedExitId.value

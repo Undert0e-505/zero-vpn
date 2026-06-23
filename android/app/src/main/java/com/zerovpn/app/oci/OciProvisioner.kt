@@ -84,6 +84,7 @@ class OciProvisioner(
                                 phase = Phase.API_KEY,
                                 status = Status.RUNNING,
                                 message = line,
+                                developerOnly = true,
                             ))
                         }
                     }
@@ -94,6 +95,7 @@ class OciProvisioner(
                             phase = Phase.API_KEY,
                             status = Status.RUNNING,
                             message = "[WIRE TAP] Error: ${e.message}",
+                            developerOnly = true,
                         ))
                     }
                 }
