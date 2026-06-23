@@ -3,6 +3,8 @@ package com.zerovpn.app.ui.screens
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.app.Activity
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
@@ -26,6 +28,7 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -39,6 +42,7 @@ import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.zerovpn.app.ui.provisioning.ProvisioningViewModel
+import com.zerovpn.app.BuildConfig
 import com.zerovpn.app.ui.theme.Accent
 import com.zerovpn.app.ui.theme.Bg
 import com.zerovpn.app.ui.theme.Border
@@ -57,6 +61,10 @@ import com.zerovpn.app.vpn.VpnViewModel
 import com.zerovpn.app.volunteer.VolunteerNetworkController
 import com.zerovpn.app.volunteer.VolunteerNetworkDiagnostics
 import com.zerovpn.app.volunteer.VolunteerNetworkState
+import com.zerovpn.app.volunteer.tun2socks.HevNativeDiagnostics
+import com.zerovpn.app.volunteer.tun2socks.HevNativeLoader
+import com.zerovpn.app.volunteer.vpn.VolunteerVpnDiagnostics
+import com.zerovpn.app.volunteer.vpn.VolunteerVpnState
 import java.text.DateFormat
 import java.util.Date
 
@@ -80,6 +88,17 @@ fun DiagnosticsScreen(
     val userDiagnostics by vpnViewModel.userDiagnostics.collectAsState()
     val volunteerState by volunteerNetworkController.state.collectAsState()
     val volunteerDiagnostics by volunteerNetworkController.diagnostics.collectAsState()
+    val volunteerVpnState by volunteerNetworkController.volunteerVpnState.collectAsState()
+    val volunteerVpnDiagnostics by volunteerNetworkController.volunteerVpnDiagnostics.collectAsState()
+    val vpnPermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartActivityForResult(),
+    ) { result ->
+        if (result.resultCode == Activity.RESULT_OK) {
+            volunteerNetworkController.startVolunteerVpnTest()
+        } else {
+            volunteerNetworkController.markVolunteerVpnPermissionNeeded()
+        }
+    }
     val scrollState = rememberScrollState()
     val activeExitId = when (val currentState = vpnState) {
         is VpnConnectionState.Connected -> currentState.exitId
@@ -139,21 +158,39 @@ fun DiagnosticsScreen(
         if (isDevMode) {
             Spacer(modifier = Modifier.height(12.dp))
             WireGuardDebugCard(vpnDiagnostics)
-            Spacer(modifier = Modifier.height(12.dp))
-            VolunteerNetworkSpikeCard(
-                state = volunteerState,
-                diagnostics = volunteerDiagnostics,
-                onStart = { volunteerNetworkController.startTest() },
-                onStop = { volunteerNetworkController.stopTest() },
-                onClearState = { volunteerNetworkController.clearTorState() },
-                onCopyDiagnostics = {
-                    copyToClipboard(
-                        context,
-                        "ZeroVPN Volunteer Network diagnostics",
-                        volunteerDiagnostics.copyText(volunteerStateText(volunteerState)),
-                    )
-                },
-            )
+            if (BuildConfig.VOLUNTEER_DEBUG_ENABLED) {
+                Spacer(modifier = Modifier.height(12.dp))
+                VolunteerNetworkSpikeCard(
+                    state = volunteerState,
+                    diagnostics = volunteerDiagnostics,
+                    vpnState = volunteerVpnState,
+                    vpnDiagnostics = volunteerVpnDiagnostics,
+                    hevNativeDiagnostics = HevNativeLoader.smokeTest(),
+                    onStart = { volunteerNetworkController.startTest() },
+                    onStop = { volunteerNetworkController.stopTest() },
+                    onStartVolunteerVpn = {
+                        val permissionIntent = volunteerNetworkController.volunteerVpnPermissionIntent()
+                        if (permissionIntent != null) {
+                            volunteerNetworkController.markVolunteerVpnPermissionNeeded()
+                            vpnPermissionLauncher.launch(permissionIntent)
+                        } else {
+                            volunteerNetworkController.startVolunteerVpnTest()
+                        }
+                    },
+                    onStopVolunteerVpn = { volunteerNetworkController.stopVolunteerVpnTest() },
+                    onClearState = { volunteerNetworkController.clearTorState() },
+                    onCopyDiagnostics = {
+                        copyToClipboard(
+                            context,
+                            "ZeroVPN Volunteer Network diagnostics",
+                            volunteerDiagnostics.copyText(
+                                stateText = volunteerStateText(volunteerState),
+                                vpnDiagnostics = volunteerVpnDiagnostics,
+                            ),
+                        )
+                    },
+                )
+            }
             Spacer(modifier = Modifier.height(12.dp))
             SshDebugCard(
                 sshDebugInfo = sshDebugInfo,
@@ -176,8 +213,13 @@ fun DiagnosticsScreen(
 private fun VolunteerNetworkSpikeCard(
     state: VolunteerNetworkState,
     diagnostics: VolunteerNetworkDiagnostics,
+    vpnState: VolunteerVpnState,
+    vpnDiagnostics: VolunteerVpnDiagnostics,
+    hevNativeDiagnostics: HevNativeDiagnostics,
     onStart: () -> Unit,
     onStop: () -> Unit,
+    onStartVolunteerVpn: () -> Unit,
+    onStopVolunteerVpn: () -> Unit,
     onClearState: () -> Unit,
     onCopyDiagnostics: () -> Unit,
 ) {
@@ -191,6 +233,13 @@ private fun VolunteerNetworkSpikeCard(
         state is VolunteerNetworkState.Stopped ||
         state is VolunteerNetworkState.Failed ||
         state is VolunteerNetworkState.Ready
+    val vpnStartEnabled = vpnState is VolunteerVpnState.Idle ||
+        vpnState is VolunteerVpnState.PermissionNeeded ||
+        vpnState is VolunteerVpnState.Stopped ||
+        vpnState is VolunteerVpnState.Failed
+    val vpnStopEnabled = vpnState is VolunteerVpnState.StartingTor ||
+        vpnState is VolunteerVpnState.StartingVpn ||
+        vpnState is VolunteerVpnState.Running
 
     Column(
         modifier = Modifier
@@ -201,11 +250,11 @@ private fun VolunteerNetworkSpikeCard(
         verticalArrangement = Arrangement.spacedBy(10.dp),
     ) {
         Text(
-            text = "VOLUNTEER NETWORK SPIKE",
+            text = "VOLUNTEER NETWORK DEBUG",
             style = SectionTitleStyle,
         )
         Text(
-            text = "Embedded Tor SOCKS proof of concept. Developer diagnostics only; this does not route Android device traffic.",
+            text = "Experimental developer-only test. This routes other apps through embedded Tor using Android VpnService and HEV. Not product-ready.",
             fontSize = 13.sp,
             color = TextDim,
             lineHeight = 18.sp,
@@ -265,7 +314,77 @@ private fun VolunteerNetworkSpikeCard(
                 Text("Clear Tor state", fontSize = 12.sp, fontWeight = FontWeight.Medium)
             }
         }
-        DebugBlock("Diagnostics", diagnostics.toDebugText(volunteerStateText(state)))
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            Button(
+                onClick = onStartVolunteerVpn,
+                enabled = vpnStartEnabled,
+                modifier = Modifier.weight(1f),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = Accent,
+                    contentColor = Bg,
+                    disabledContainerColor = Border,
+                    disabledContentColor = TextDim,
+                ),
+            ) {
+                Text("Start VPN test", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+            }
+            OutlinedButton(
+                onClick = onStopVolunteerVpn,
+                enabled = vpnStopEnabled,
+                modifier = Modifier.weight(1f),
+                colors = ButtonDefaults.outlinedButtonColors(
+                    contentColor = TextPrimary,
+                    disabledContentColor = TextDim,
+                ),
+            ) {
+                Text("Stop VPN test", fontSize = 12.sp, fontWeight = FontWeight.Medium)
+            }
+        }
+        DebugBlock("Embedded Tor", diagnostics.toDebugText(volunteerStateText(state)))
+        DebugBlock("HEV Native", hevNativeDiagnostics.toDebugText())
+        DebugBlock("Volunteer VPN", vpnDiagnostics.toDebugText())
+        DebugBlock(
+            "DNS caveats",
+            "dnsMode=${vpnDiagnostics.dnsMode}\n" +
+                "dnsServer=${vpnDiagnostics.dnsServer}\n" +
+                "mapDnsAddress=198.18.0.2\n" +
+                "mapDnsNetwork=100.64.0.0/10\n" +
+                "dnsLeakRisk=${vpnDiagnostics.dnsLeakRisk}\n" +
+                "dnsValidationMethod=manual-browser-check\n" +
+                "browserValidationRequired=true\n" +
+                "ZeroVPN app is excluded from the VPN, so in-app DNS tests do not prove the TUN path.",
+        )
+        DebugBlock(
+            "UDP caveats",
+            "udpMode=${vpnDiagnostics.udpMode}\n" +
+                "udpRisk=udp-traffic-may-fail-or-be-dropped\n" +
+                "udpProductStatus=not-supported\n" +
+                "Tor SOCKS is TCP-stream oriented; arbitrary UDP is not validated.",
+        )
+        DebugBlock(
+            "Lifecycle known unknowns",
+            "appKilledWhileVolunteerVpnRunning=not-solved\n" +
+                "appReopenedWhileAndroidVpnActive=diagnostic-only\n" +
+                "torRunningButHevStopped=diagnostic-only\n" +
+                "hevRunningButTorStopped=diagnostic-only\n" +
+                "androidVpnActiveButAppStateLost=diagnostic-only\n" +
+                "stopPressedTwice=idempotent-best-effort\n" +
+                "startPressedTwice=guarded-by-state\n" +
+                "permissionDenied=visible-state\n" +
+                "serviceDestroyedByOs=best-effort-stop",
+        )
+        DebugBlock(
+            "Browser validation",
+            "1. Start test until embedded Tor is Ready.\n" +
+                "2. Start VPN test and allow Android VPN permission.\n" +
+                "3. Open Chrome to https://check.torproject.org/ and verify it reports Tor.\n" +
+                "4. Browse a normal DNS-heavy site.\n" +
+                "5. Optionally run a browser DNS leak test manually.\n" +
+                "6. Stop VPN test and verify the Android VPN key clears.",
+        )
     }
 }
 
@@ -521,8 +640,10 @@ private fun volunteerStateText(state: VolunteerNetworkState): String = when (sta
     ).joinToString(": ")
 }
 
-private fun VolunteerNetworkDiagnostics.copyText(stateText: String): String =
-    "Volunteer Network Spike\n${toDebugText(stateText)}"
+private fun VolunteerNetworkDiagnostics.copyText(
+    stateText: String,
+    vpnDiagnostics: VolunteerVpnDiagnostics,
+): String = "Volunteer Network Spike\n${toDebugText(stateText)}\n\n${vpnDiagnostics.toDebugText()}"
 
 private fun exitIpText(state: UserDiagnosticsState): String = when (state.exitIpStatus) {
     ExitIpStatus.Idle -> "Not checked"

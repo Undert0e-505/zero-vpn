@@ -26,10 +26,19 @@ val hasReleaseSigningConfig = listOf(
     releaseKeyAlias,
     releaseKeyPassword,
 ).all { !it.isNullOrBlank() }
+val enableHevNative = providers.gradleProperty("enableHevNative")
+    .map { it.equals("true", ignoreCase = true) }
+    .getOrElse(false)
+val enableVolunteerDebug = providers.gradleProperty("enableVolunteerDebug")
+    .map { it.equals("true", ignoreCase = true) }
+    .getOrElse(false)
 
 android {
     namespace = "com.zerovpn.app"
     compileSdk = 36
+    if (enableHevNative) {
+        ndkVersion = "27.0.12077973"
+    }
 
     defaultConfig {
         applicationId = "com.zerovpn.app"
@@ -39,6 +48,22 @@ android {
         versionName = "0.1.1"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+        buildConfigField("boolean", "HEV_NATIVE_ENABLED", enableHevNative.toString())
+
+        if (enableHevNative) {
+            ndk {
+                abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64")
+            }
+
+            externalNativeBuild {
+                ndkBuild {
+                    arguments += listOf(
+                        "NDK_APPLICATION_MK=${file("src/main/jni/hev/Application.mk").absolutePath}",
+                        "APP_CFLAGS+=-DPKGNAME=com/zerovpn/app/volunteer/tun2socks -DCLSNAME=HevNativeLoader",
+                    )
+                }
+            }
+        }
     }
 
     signingConfigs {
@@ -55,10 +80,12 @@ android {
     buildTypes {
         debug {
             isMinifyEnabled = false
+            buildConfigField("boolean", "VOLUNTEER_DEBUG_ENABLED", enableVolunteerDebug.toString())
         }
         release {
             isMinifyEnabled = false
             isShrinkResources = false
+            buildConfigField("boolean", "VOLUNTEER_DEBUG_ENABLED", "false")
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
@@ -92,6 +119,14 @@ android {
             excludes += "/META-INF/versions/**"
             excludes += "/META-INF/maven/**"
             excludes += "/THIRD_PARTY_LICENSES.txt"
+        }
+    }
+
+    if (enableHevNative) {
+        externalNativeBuild {
+            ndkBuild {
+                path = file("../native/hev-socks5-tunnel/Android.mk")
+            }
         }
     }
 }

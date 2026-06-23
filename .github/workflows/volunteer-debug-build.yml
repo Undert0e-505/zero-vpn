@@ -1,0 +1,53 @@
+name: volunteer debug build
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - feature/volunteer-debug-integration
+    paths:
+      - ".github/workflows/volunteer-debug-build.yml"
+      - ".gitmodules"
+      - "android/app/**"
+      - "android/native/hev-socks5-tunnel"
+      - "docs/spikes/volunteer-network/**"
+
+jobs:
+  build-volunteer-debug:
+    name: Build gated Volunteer debug APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Android NDK
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;27.0.12077973"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.0.12077973" >> "$GITHUB_ENV"
+
+      - name: Build default debug APK
+        working-directory: android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug
+
+      - name: Build HEV and Volunteer debug APK
+        working-directory: android
+        run: ./gradlew assembleDebug -PenableHevNative=true -PenableVolunteerDebug=true
+
+      - name: Inspect HEV native libraries in APK
+        run: |
+          unzip -l android/app/build/outputs/apk/debug/app-debug.apk | grep 'lib/arm64-v8a/libhev-socks5-tunnel.so'
+          unzip -l android/app/build/outputs/apk/debug/app-debug.apk | grep 'lib/armeabi-v7a/libhev-socks5-tunnel.so'
+          unzip -l android/app/build/outputs/apk/debug/app-debug.apk | grep 'lib/x86_64/libhev-socks5-tunnel.so'
+
+      - name: Upload Volunteer debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: ZeroVPN-volunteer-debug.apk
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
