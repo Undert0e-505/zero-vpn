@@ -487,6 +487,11 @@ class ProvisioningViewModel : ViewModel() {
             }
 
             try {
+                emit(
+                    Phase.DONE,
+                    Status.RUNNING,
+                    "Phase region trace: cleanupRegion=$currentRegion storedExitRegion=${targetExit?.region ?: "none"}",
+                )
                 val currentAuth = authResult ?: run {
                     _currentPhase.value = Phase.AUTH
                     emit(Phase.AUTH, Status.RUNNING, "Authentication required before destroy...")
@@ -552,6 +557,11 @@ class ProvisioningViewModel : ViewModel() {
             val currentRegion = homeRegion ?: _selectedOracleRegion.value
 
             if (currentRids != null && currentAuth != null && currentRegion != null) {
+                emit(
+                    Phase.DONE,
+                    Status.RUNNING,
+                    "Phase region trace: cleanupRegion=$currentRegion storedExitRegion=${_configuredExits.value.firstOrNull { it.id == _selectedExitId.value }?.region ?: "none"}",
+                )
                 emit(Phase.DONE, Status.RUNNING, "Cleaning up partial resources...")
                 try {
                     provisioner?.destroy(
