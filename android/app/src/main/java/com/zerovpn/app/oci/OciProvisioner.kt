@@ -251,7 +251,7 @@ class OciProvisioner(
 
         emit(Phase.AUTH, Status.SUCCESS, "Authenticated")
         if (isDevMode) {
-            emit(Phase.AUTH, Status.RUNNING, "Selected OCI region: $region")
+            emit(Phase.AUTH, Status.RUNNING, "Auth bootstrap region: $region")
             emit(Phase.AUTH, Status.RUNNING, "Token region source: ${tokenRegionSource ?: "none"}")
         }
         return AuthResult(
@@ -582,6 +582,11 @@ class OciProvisioner(
         val idHost = OciEndpoints.identityHost(homeRegion)
         val iaasHost = OciEndpoints.iaasHost(homeRegion)
         val isUk = homeRegion in listOf("uk-london-1", "uk-cardiff-1")
+        emit(
+            Phase.API_KEY,
+            Status.RUNNING,
+            "Phase region trace: identityRegion=$homeRegion identityHost=$idHost finalHomeRegion=$homeRegion",
+        )
         if (isDevMode) {
             emit(Phase.API_KEY, Status.RUNNING, "Final provisioning region: $homeRegion")
             emit(Phase.API_KEY, Status.RUNNING, "Identity host: $idHost")
@@ -730,6 +735,11 @@ class OciProvisioner(
         val rids = ResourceIds()
         val cid = auth.tenancyOcid
         val iaasHost = OciEndpoints.iaasHost(homeRegion)
+        emit(
+            Phase.NETWORK,
+            Status.RUNNING,
+            "Phase region trace: provisioningRegion=$homeRegion iaasHost=$iaasHost",
+        )
 
         // Create VCN
         emit(Phase.NETWORK, Status.RUNNING, "Creating VCN...")
@@ -827,11 +837,17 @@ class OciProvisioner(
         val cid = auth.tenancyOcid
         val idHost = OciEndpoints.identityHost(homeRegion)
         val iaasHost = OciEndpoints.iaasHost(homeRegion)
+        emit(
+            Phase.VM_LAUNCH,
+            Status.RUNNING,
+            "Phase region trace: provisioningRegion=$homeRegion iaasHost=$iaasHost imageRegion=$homeRegion instanceLaunchRegion=$homeRegion",
+        )
 
         // Get availability domain (returns a JSON array, not an object with "items")
         emit(Phase.VM_LAUNCH, Status.RUNNING, "Finding availability domain...")
         val adResp = ociGetArray(auth, idHost, "/20160918/availabilityDomains?compartmentId=$cid")
         val adName = adResp.getJSONObject(0).getString("name")
+        emit(Phase.VM_LAUNCH, Status.RUNNING, "Availability domain selected: $adName (region=$homeRegion)")
 
         // Find Ubuntu image
         emit(Phase.VM_LAUNCH, Status.RUNNING, "Finding Ubuntu 22.04 image...")
@@ -929,6 +945,7 @@ class OciProvisioner(
 
         // Phase 5: Wait for SSH (OCI reports RUNNING before cloud-init/sshd are ready)
         emit(Phase.WAIT_SSH, Status.RUNNING, "Waiting for SSH...")
+        emit(Phase.WAIT_SSH, Status.RUNNING, "Phase region trace: provisioningRegion=$homeRegion publicIp=$publicIp")
         val jsch = JSch()
         val keyTempFile = java.io.File(context.cacheDir, "ssh_key_${System.currentTimeMillis()}")
         keyTempFile.writeText(sshPrivateKey)
@@ -967,6 +984,11 @@ class OciProvisioner(
 
         // Phase 6: WireGuard
         emit(Phase.WIREGUARD, Status.RUNNING, "Installing WireGuard...")
+        emit(
+            Phase.WIREGUARD,
+            Status.RUNNING,
+            "Phase region trace: provisioningRegion=$homeRegion publicIp=$publicIp setupHost=ubuntu@$publicIp",
+        )
         if (!installWireGuardTools(sshConnection)) {
             sshConnection.session?.disconnect()
             keyTempFile.delete()
@@ -1167,11 +1189,16 @@ class OciProvisioner(
         val diagnostics = listOf(
             "cat /etc/os-release",
             "uname -a",
+            "lsb_release -a || true",
             "id",
             "ip route",
             "cat /etc/apt/sources.list || true",
             "ls -la /etc/apt/sources.list.d || true",
-            "find /etc/apt/sources.list.d -maxdepth 1 -type f -print -exec sed -n '1,120p' {} \\; || true",
+            "find /etc/apt/sources.list.d -maxdepth 1 -type f -print -exec sed -n '1,160p' {} \\; || true",
+            "apt-cache policy || true",
+            "apt-cache policy wireguard-tools || true",
+            "apt-cache search '^wireguard' || true",
+            "apt-cache search 'wireguard-tools' || true",
             "getent hosts archive.ubuntu.com || true",
             "getent hosts security.ubuntu.com || true",
             "ping -c 1 1.1.1.1 || true",
@@ -1183,15 +1210,16 @@ class OciProvisioner(
 
         val updateCommand = "sudo DEBIAN_FRONTEND=noninteractive apt-get update -o Acquire::Retries=3"
         val updateResult = runLoggedRemoteCommand(connection, "apt update", updateCommand)
-        runLoggedRemoteCommand(connection, "package policy", "apt-cache policy wireguard-tools || true")
-        runLoggedRemoteCommand(connection, "package search", "apt-cache search '^wireguard' || true")
+        val policyAfterUpdate = runLoggedRemoteCommand(connection, "package policy after update", "apt-cache policy wireguard-tools || true")
+        runLoggedRemoteCommand(connection, "package search after update", "apt-cache search '^wireguard' || true")
 
         val installCommand = "sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends " +
             "wireguard-tools iptables iproute2 curl ca-certificates"
-        var installResult = runLoggedRemoteCommand(connection, "apt install wireguard-tools", installCommand)
-
-        if (installResult.exitCode != 0 && isUbuntuVm(connection)) {
-            emit(Phase.WIREGUARD, Status.WARNING, "wireguard-tools install failed; trying Ubuntu universe repository fallback")
+        var installResult = RemoteCommandResult(255, "", "apt install was not attempted")
+        var policyForInstall = policyAfterUpdate
+        if (!hasAptCandidate(policyAfterUpdate.stdout) && isUbuntuVm(connection)) {
+            emit(Phase.WIREGUARD, Status.WARNING, "wireguard-tools has no apt candidate; trying Ubuntu universe repository fallback")
+            runLoggedRemoteCommand(connection, "Ubuntu release info", ". /etc/os-release; echo \"${'$'}ID ${'$'}VERSION_CODENAME\"")
             runLoggedRemoteCommand(
                 connection,
                 "install add-apt-repository helper",
@@ -1203,26 +1231,55 @@ class OciProvisioner(
                 "if command -v add-apt-repository >/dev/null 2>&1; then sudo add-apt-repository -y universe; else echo 'add-apt-repository not available'; exit 1; fi",
             )
             runLoggedRemoteCommand(connection, "apt update after universe", updateCommand)
-            runLoggedRemoteCommand(connection, "package policy after universe", "apt-cache policy wireguard-tools || true")
+            policyForInstall = runLoggedRemoteCommand(connection, "package policy after universe", "apt-cache policy wireguard-tools || true")
             runLoggedRemoteCommand(connection, "package search after universe", "apt-cache search '^wireguard' || true")
-            installResult = runLoggedRemoteCommand(connection, "apt install wireguard-tools after universe", installCommand)
-        } else if (installResult.exitCode != 0) {
-            emit(Phase.WIREGUARD, Status.WARNING, "wireguard-tools install failed and VM is not Ubuntu; universe fallback skipped")
+        } else if (!hasAptCandidate(policyAfterUpdate.stdout)) {
+            emit(Phase.WIREGUARD, Status.WARNING, "wireguard-tools has no apt candidate and VM is not Ubuntu; universe fallback skipped")
+        }
+        installResult = runLoggedRemoteCommand(connection, "apt install wireguard-tools", installCommand)
+        if (installResult.exitCode != 0 && hasAptCandidate(policyForInstall.stdout) && isUbuntuVm(connection)) {
+            emit(Phase.WIREGUARD, Status.WARNING, "wireguard-tools install failed despite apt candidate; retrying after Ubuntu universe refresh")
+            runLoggedRemoteCommand(connection, "Ubuntu release info", ". /etc/os-release; echo \"${'$'}ID ${'$'}VERSION_CODENAME\"")
+            runLoggedRemoteCommand(
+                connection,
+                "install add-apt-repository helper",
+                "sudo DEBIAN_FRONTEND=noninteractive apt-get install -y software-properties-common || true",
+            )
+            runLoggedRemoteCommand(
+                connection,
+                "enable Ubuntu universe",
+                "if command -v add-apt-repository >/dev/null 2>&1; then sudo add-apt-repository -y universe; else echo 'add-apt-repository not available'; exit 1; fi",
+            )
+            runLoggedRemoteCommand(connection, "apt update after universe retry", updateCommand)
+            runLoggedRemoteCommand(connection, "package policy after universe retry", "apt-cache policy wireguard-tools || true")
+            runLoggedRemoteCommand(connection, "package search after universe retry", "apt-cache search '^wireguard' || true")
+            installResult = runLoggedRemoteCommand(connection, "apt install wireguard-tools after universe retry", installCommand)
         }
 
         runLoggedRemoteCommand(connection, "kernel module check", "sudo modprobe wireguard || true")
         runLoggedRemoteCommand(connection, "loaded module check", "lsmod | grep wireguard || true")
         runLoggedRemoteCommand(connection, "verify wg", "command -v wg && wg --version || true")
+        runLoggedRemoteCommand(connection, "verify wg-quick", "command -v wg-quick")
         runLoggedRemoteCommand(connection, "verify iptables", "command -v iptables && iptables --version || true")
         runLoggedRemoteCommand(connection, "verify ip", "command -v ip && ip -V || true")
+        runLoggedRemoteCommand(connection, "verify curl", "command -v curl && curl --version | head -n 1 || true")
 
         val wgCheck = runLoggedRemoteCommand(connection, "required wg check", "command -v wg")
-        if (installResult.exitCode != 0 || updateResult.exitCode != 0 || wgCheck.exitCode != 0) {
-            emit(Phase.WIREGUARD, Status.ERROR, "WireGuard tools were not installed. apt update/install output is shown above.")
+        val wgQuickCheck = runLoggedRemoteCommand(connection, "required wg-quick check", "command -v wg-quick")
+        if (installResult.exitCode != 0 || updateResult.exitCode != 0 || wgCheck.exitCode != 0 || wgQuickCheck.exitCode != 0) {
+            emit(Phase.WIREGUARD, Status.ERROR, "WireGuard tools were not installed. See apt source and package policy output above.")
             return false
         }
         return true
     }
+
+    private fun hasAptCandidate(policyOutput: String): Boolean =
+        policyOutput.lineSequence().any { line ->
+            val trimmed = line.trim()
+            trimmed.startsWith("Candidate:") &&
+                !trimmed.endsWith("(none)") &&
+                !trimmed.endsWith("none")
+        }
 
     private suspend fun isUbuntuVm(connection: SshConnection): Boolean {
         val result = runLoggedRemoteCommand(
@@ -1315,6 +1372,11 @@ class OciProvisioner(
     ): Boolean {
         val iaasHost = OciEndpoints.iaasHost(homeRegion)
         val idHost = OciEndpoints.identityHost(homeRegion)
+        emit(
+            Phase.DONE,
+            Status.RUNNING,
+            "Phase region trace: cleanupRegion=$homeRegion storedExitRegion=$homeRegion iaasHost=$iaasHost",
+        )
 
         // Terminate instance
         if (rids.instanceId != null) {
