@@ -552,8 +552,10 @@ class WireGuardTunnelController(
         if (diagnostics.endpoint != expectedEndpoint) {
             failures += "runtime endpoint ${diagnostics.endpoint ?: "missing"} != selected endpoint $expectedEndpoint"
         }
-        if (diagnostics.tunnelAddress != "10.66.66.2/32") {
+        if (exit.provider == ExitProvider.OCI && diagnostics.tunnelAddress != "10.66.66.2/32") {
             failures += "runtime address ${diagnostics.tunnelAddress ?: "missing"} != 10.66.66.2/32"
+        } else if (exit.provider == ExitProvider.SHARED_WIREGUARD && diagnostics.tunnelAddress.isNullOrBlank()) {
+            failures += "runtime address missing"
         }
 
         if (failures.isNotEmpty()) {

@@ -330,6 +330,17 @@ private fun OracleOnboardingContent(
             lineHeight = 20.sp,
         )
 
+        Text(
+            text = "First-time setup takes about 5 minutes. ZeroVPN has to create an Oracle VM, configure networking, wait for SSH, install WireGuard, and create your owner and friend invite keys. Once this exit exists, reconnecting is fast.",
+            fontSize = 14.sp,
+            color = TextPrimary,
+            lineHeight = 20.sp,
+            modifier = Modifier
+                .fillMaxWidth()
+                .background(Surface, RoundedCornerShape(8.dp))
+                .padding(12.dp),
+        )
+
         Column(
             modifier = Modifier.fillMaxWidth(),
             verticalArrangement = Arrangement.spacedBy(8.dp),
@@ -452,6 +463,7 @@ private fun OracleOnboardingContent(
                 BulletPoint("Complete those steps in Oracle.")
                 BulletPoint("Return to ZeroVPN.")
                 BulletPoint("ZeroVPN will then create the API key and provision the Always Free VM exit.")
+                BulletPoint("The first provisioning run usually takes several minutes; later reconnects use the existing WireGuard tunnel and are fast.")
             }
         }
 
@@ -671,6 +683,14 @@ private fun ProgressContent(
     }
 
     // Terminal-style console
+    Text(
+        text = "First setup can take several minutes on a fresh Oracle VM. This is normal; future reconnects are fast once the exit exists.",
+        fontSize = 13.sp,
+        color = TextDim,
+        lineHeight = 18.sp,
+        modifier = Modifier.padding(bottom = 10.dp),
+    )
+
     Column(
         modifier = Modifier
             .fillMaxWidth()

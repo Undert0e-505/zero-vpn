@@ -3,6 +3,8 @@ package com.zerovpn.app.ui.screens
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.app.Activity
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
@@ -26,6 +28,7 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -39,6 +42,10 @@ import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.zerovpn.app.ui.provisioning.ProvisioningViewModel
+import com.zerovpn.app.ui.provisioning.OracleOperationDiagnostics
+import com.zerovpn.app.BuildConfig
+import com.zerovpn.app.friends.InviteSlot
+import com.zerovpn.app.friends.SharedExitProfile
 import com.zerovpn.app.ui.theme.Accent
 import com.zerovpn.app.ui.theme.Bg
 import com.zerovpn.app.ui.theme.Border
@@ -50,6 +57,7 @@ import com.zerovpn.app.ui.theme.TextPrimary
 import com.zerovpn.app.vpn.DnsLeakStatus
 import com.zerovpn.app.vpn.ExitIpStatus
 import com.zerovpn.app.vpn.LastHandshakeStatus
+import com.zerovpn.app.vpn.ProviderSwitchDiagnostics
 import com.zerovpn.app.vpn.UserDiagnosticsState
 import com.zerovpn.app.vpn.VpnConnectionState
 import com.zerovpn.app.vpn.VpnDiagnostics
@@ -57,6 +65,10 @@ import com.zerovpn.app.vpn.VpnViewModel
 import com.zerovpn.app.volunteer.VolunteerNetworkController
 import com.zerovpn.app.volunteer.VolunteerNetworkDiagnostics
 import com.zerovpn.app.volunteer.VolunteerNetworkState
+import com.zerovpn.app.volunteer.tun2socks.HevNativeDiagnostics
+import com.zerovpn.app.volunteer.tun2socks.HevNativeLoader
+import com.zerovpn.app.volunteer.vpn.VolunteerVpnDiagnostics
+import com.zerovpn.app.volunteer.vpn.VolunteerVpnState
 import java.text.DateFormat
 import java.util.Date
 
@@ -74,12 +86,28 @@ fun DiagnosticsScreen(
     val isDevMode by provisioningViewModel.isDevMode.collectAsState()
     val sshDebugInfo by provisioningViewModel.sshDebugInfo.collectAsState()
     val exits by provisioningViewModel.configuredExits.collectAsState()
+    val inviteSlots by provisioningViewModel.inviteSlots.collectAsState()
+    val sharedExitProfiles by provisioningViewModel.sharedExitProfiles.collectAsState()
+    val lastInviteOperationError by provisioningViewModel.lastInviteOperationError.collectAsState()
+    val oracleOperationDiagnostics by provisioningViewModel.oracleOperationDiagnostics.collectAsState()
     val selectedExitId by provisioningViewModel.selectedExitId.collectAsState()
+    val providerSwitchDiagnostics by provisioningViewModel.providerSwitchDiagnostics.collectAsState()
     val vpnState by vpnViewModel.state.collectAsState()
     val vpnDiagnostics by vpnViewModel.diagnostics.collectAsState()
     val userDiagnostics by vpnViewModel.userDiagnostics.collectAsState()
     val volunteerState by volunteerNetworkController.state.collectAsState()
     val volunteerDiagnostics by volunteerNetworkController.diagnostics.collectAsState()
+    val volunteerVpnState by volunteerNetworkController.volunteerVpnState.collectAsState()
+    val volunteerVpnDiagnostics by volunteerNetworkController.volunteerVpnDiagnostics.collectAsState()
+    val vpnPermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartActivityForResult(),
+    ) { result ->
+        if (result.resultCode == Activity.RESULT_OK) {
+            volunteerNetworkController.startVolunteerVpnTest()
+        } else {
+            volunteerNetworkController.markVolunteerVpnPermissionNeeded()
+        }
+    }
     val scrollState = rememberScrollState()
     val activeExitId = when (val currentState = vpnState) {
         is VpnConnectionState.Connected -> currentState.exitId
@@ -140,28 +168,56 @@ fun DiagnosticsScreen(
             Spacer(modifier = Modifier.height(12.dp))
             WireGuardDebugCard(vpnDiagnostics)
             Spacer(modifier = Modifier.height(12.dp))
-            VolunteerNetworkSpikeCard(
-                state = volunteerState,
-                diagnostics = volunteerDiagnostics,
-                onStart = { volunteerNetworkController.startTest() },
-                onStop = { volunteerNetworkController.stopTest() },
-                onClearState = { volunteerNetworkController.clearTorState() },
-                onCopyDiagnostics = {
-                    copyToClipboard(
-                        context,
-                        "ZeroVPN Volunteer Network diagnostics",
-                        volunteerDiagnostics.copyText(volunteerStateText(volunteerState)),
-                    )
-                },
+            ProviderSwitchDebugCard(providerSwitchDiagnostics)
+            Spacer(modifier = Modifier.height(12.dp))
+            FriendsShareDebugCard(
+                inviteSlots = inviteSlots,
+                sharedExitProfiles = sharedExitProfiles,
+                exits = exits,
+                hasInviteMaterial = provisioningViewModel::hasInviteSlotPrivateMaterial,
+                hasSharedConfig = provisioningViewModel::hasSharedExitConfig,
+                hasExitWireGuardConfig = provisioningViewModel::hasExitWireGuardConfig,
+                hasExitSshPrivateKey = provisioningViewModel::hasExitSshPrivateKey,
+                lastInviteOperationError = lastInviteOperationError,
             )
+            Spacer(modifier = Modifier.height(12.dp))
+            OracleOperationDebugCard(oracleOperationDiagnostics)
+            if (BuildConfig.VOLUNTEER_DEBUG_ENABLED) {
+                Spacer(modifier = Modifier.height(12.dp))
+                VolunteerNetworkSpikeCard(
+                    state = volunteerState,
+                    diagnostics = volunteerDiagnostics,
+                    vpnState = volunteerVpnState,
+                    vpnDiagnostics = volunteerVpnDiagnostics,
+                    hevNativeDiagnostics = HevNativeLoader.smokeTest(),
+                    onStart = { volunteerNetworkController.startTest() },
+                    onStop = { volunteerNetworkController.stopTest() },
+                    onStartVolunteerVpn = {
+                        val permissionIntent = volunteerNetworkController.volunteerVpnPermissionIntent()
+                        if (permissionIntent != null) {
+                            volunteerNetworkController.markVolunteerVpnPermissionNeeded()
+                            vpnPermissionLauncher.launch(permissionIntent)
+                        } else {
+                            volunteerNetworkController.startVolunteerVpnTest()
+                        }
+                    },
+                    onStopVolunteerVpn = { volunteerNetworkController.stopVolunteerVpnTest() },
+                    onClearState = { volunteerNetworkController.clearTorState() },
+                    onCopyDiagnostics = {
+                        copyToClipboard(
+                            context,
+                            "ZeroVPN Volunteer Network diagnostics",
+                            volunteerDiagnostics.copyText(
+                                stateText = volunteerStateText(volunteerState),
+                                vpnDiagnostics = volunteerVpnDiagnostics,
+                            ),
+                        )
+                    },
+                )
+            }
             Spacer(modifier = Modifier.height(12.dp))
             SshDebugCard(
                 sshDebugInfo = sshDebugInfo,
-                onCopyPrivateKey = {
-                    sshDebugInfo?.privateKey?.let { key ->
-                        copyToClipboard(context, "ZeroVPN VM SSH private key", key)
-                    }
-                },
                 onCopyCommand = {
                     sshDebugInfo?.windowsSshCommand?.let { command ->
                         copyToClipboard(context, "ZeroVPN VM SSH command", command)
@@ -173,11 +229,143 @@ fun DiagnosticsScreen(
 }
 
 @Composable
+private fun FriendsShareDebugCard(
+    inviteSlots: List<InviteSlot>,
+    sharedExitProfiles: List<SharedExitProfile>,
+    exits: List<com.zerovpn.app.vpn.ConfiguredExit>,
+    hasInviteMaterial: (InviteSlot) -> Boolean,
+    hasSharedConfig: (SharedExitProfile) -> Boolean,
+    hasExitWireGuardConfig: (com.zerovpn.app.vpn.ConfiguredExit) -> Boolean,
+    hasExitSshPrivateKey: (com.zerovpn.app.vpn.ConfiguredExit) -> Boolean,
+    lastInviteOperationError: String?,
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(Surface, RoundedCornerShape(8.dp))
+            .border(1.dp, Border, RoundedCornerShape(8.dp))
+            .padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        Text(
+            text = "FRIENDS / SHARED EXIT STATE",
+            style = SectionTitleStyle,
+        )
+        Text(
+            text = "Developer-mode metadata only. Private keys, configs, and QR payloads are not displayed.",
+            fontSize = 13.sp,
+            color = TextDim,
+            lineHeight = 18.sp,
+        )
+        DebugValue("Configured exit count", exits.size.toString())
+        DebugValue("Owner Oracle exit count", exits.count { it.provider == com.zerovpn.app.vpn.ExitProvider.OCI }.toString())
+        DebugValue(
+            "Imported shared exit count",
+            exits.count { it.provider == com.zerovpn.app.vpn.ExitProvider.SHARED_WIREGUARD }.toString(),
+        )
+        DebugValue("Invite slot count", inviteSlots.size.toString())
+        DebugValue("Owner exit count with slots", inviteSlots.map { it.ownerExitId }.distinct().size.toString())
+        DebugValue("Shared exit profile count", sharedExitProfiles.size.toString())
+        DebugBlock("Last invite operation error", lastInviteOperationError ?: "N/A")
+        DebugBlock(
+            "Invite slots by owner",
+            inviteSlots
+                .groupingBy { it.ownerExitId }
+                .eachCount()
+                .entries
+                .sortedBy { it.key }
+                .joinToString("\n") { "owner=${it.key} slots=${it.value}" }
+                .ifBlank { "N/A" },
+        )
+        DebugBlock(
+            "Invite slot states",
+            inviteSlots
+                .sortedWith(compareBy<InviteSlot>({ it.ownerExitId }, { it.slotIndex }, { it.slotId }))
+                .joinToString("\n") { slot ->
+                    "owner=${slot.ownerExitId} slot=${slot.slotIndex} state=${slot.state.name} " +
+                        "ip=${slot.tunnelIp ?: "N/A"} peer=${slot.peerPublicKey.prefixForDiagnostics()} " +
+                        "firstHandshakeAt=${slot.firstHandshakeAt.formatDebugTime()} " +
+                        "lastHandshakeAt=${slot.lastHandshakeAt.formatDebugTime()} " +
+                        "revokedAt=${slot.revokedAt.formatDebugTime()} " +
+                        "resetAt=${slot.resetAt.formatDebugTime()} " +
+                        "secretKey=${slot.clientConfigSecretKey ?: "N/A"} " +
+                        "privateShareMaterialPresent=${if (hasInviteMaterial(slot)) "yes" else "no"}"
+                }
+                .ifBlank { "N/A" },
+        )
+        DebugBlock(
+            "Owner exit secrets",
+            exits
+                .filter { it.provider == com.zerovpn.app.vpn.ExitProvider.OCI }
+                .sortedBy { it.createdAt }
+                .joinToString("\n") { exit ->
+                    "id=${exit.id} name=${exit.name} wgSecretKey=${exit.wireGuardConfigSecretKey ?: "N/A"} " +
+                        "ownerWireGuardConfigPresent=${if (hasExitWireGuardConfig(exit)) "yes" else "no"} " +
+                        "sshSecretKey=${exit.sshPrivateKeySecretKey ?: "N/A"} " +
+                        "sshPrivateKeyPresent=${if (hasExitSshPrivateKey(exit)) "yes" else "no"}"
+                }
+                .ifBlank { "N/A" },
+        )
+        DebugBlock(
+            "Shared exit profiles",
+            sharedExitProfiles
+                .sortedBy { it.importedAt }
+                .joinToString("\n") { profile ->
+                    "id=${profile.id} name=${profile.displayName} source=${profile.source.name} " +
+                        "provider=${profile.providerType.name} endpoint=${profile.endpointHost ?: "N/A"} " +
+                        "secretKey=${profile.wireGuardConfigSecretKey ?: "N/A"} " +
+                        "configPresent=${if (hasSharedConfig(profile)) "yes" else "no"} " +
+                        "importedAt=${profile.importedAt.formatDebugTime()}"
+                }
+                .ifBlank { "N/A" },
+        )
+    }
+}
+
+@Composable
+private fun OracleOperationDebugCard(
+    diagnostics: OracleOperationDiagnostics,
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(Surface, RoundedCornerShape(8.dp))
+            .border(1.dp, Border, RoundedCornerShape(8.dp))
+            .padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        Text(
+            text = "ORACLE OPERATION STATE",
+            style = SectionTitleStyle,
+        )
+        Text(
+            text = "Developer-mode operation metadata only. Tokens, API key material, SSH keys, and VPN configs are not displayed.",
+            fontSize = 13.sp,
+            color = TextDim,
+            lineHeight = 18.sp,
+        )
+        DebugValue("Pending operation", diagnostics.pendingOperation.name)
+        DebugValue("Failed operation", diagnostics.failedOperation.name)
+        DebugValue("Target exit id", diagnostics.targetExitId ?: "N/A")
+        DebugValue("Target display name", diagnostics.targetDisplayName ?: "N/A")
+        DebugValue("Target region", diagnostics.targetRegion ?: "N/A")
+        DebugValue("Target instance prefix", diagnostics.targetInstanceIdPrefix ?: "N/A")
+        DebugValue("Auth state", diagnostics.authState)
+        DebugBlock("Last Oracle operation error", diagnostics.lastError ?: "N/A")
+    }
+}
+
+@Composable
 private fun VolunteerNetworkSpikeCard(
     state: VolunteerNetworkState,
     diagnostics: VolunteerNetworkDiagnostics,
+    vpnState: VolunteerVpnState,
+    vpnDiagnostics: VolunteerVpnDiagnostics,
+    hevNativeDiagnostics: HevNativeDiagnostics,
     onStart: () -> Unit,
     onStop: () -> Unit,
+    onStartVolunteerVpn: () -> Unit,
+    onStopVolunteerVpn: () -> Unit,
     onClearState: () -> Unit,
     onCopyDiagnostics: () -> Unit,
 ) {
@@ -191,6 +379,13 @@ private fun VolunteerNetworkSpikeCard(
         state is VolunteerNetworkState.Stopped ||
         state is VolunteerNetworkState.Failed ||
         state is VolunteerNetworkState.Ready
+    val vpnStartEnabled = vpnState is VolunteerVpnState.Idle ||
+        vpnState is VolunteerVpnState.PermissionNeeded ||
+        vpnState is VolunteerVpnState.Stopped ||
+        vpnState is VolunteerVpnState.Failed
+    val vpnStopEnabled = vpnState is VolunteerVpnState.StartingTor ||
+        vpnState is VolunteerVpnState.StartingVpn ||
+        vpnState is VolunteerVpnState.Running
 
     Column(
         modifier = Modifier
@@ -201,11 +396,11 @@ private fun VolunteerNetworkSpikeCard(
         verticalArrangement = Arrangement.spacedBy(10.dp),
     ) {
         Text(
-            text = "VOLUNTEER NETWORK SPIKE",
+            text = "VOLUNTEER NETWORK DEBUG",
             style = SectionTitleStyle,
         )
         Text(
-            text = "Embedded Tor SOCKS proof of concept. Developer diagnostics only; this does not route Android device traffic.",
+            text = "Experimental developer-only test. This routes other apps through embedded Tor using Android VpnService and HEV. Not product-ready.",
             fontSize = 13.sp,
             color = TextDim,
             lineHeight = 18.sp,
@@ -226,7 +421,7 @@ private fun VolunteerNetworkSpikeCard(
                     disabledContentColor = TextDim,
                 ),
             ) {
-                Text("Start test", fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                Text("Developer test start", fontSize = 12.sp, fontWeight = FontWeight.Bold)
             }
             OutlinedButton(
                 onClick = onStop,
@@ -237,7 +432,7 @@ private fun VolunteerNetworkSpikeCard(
                     disabledContentColor = TextDim,
                 ),
             ) {
-                Text("Stop", fontSize = 13.sp, fontWeight = FontWeight.Medium)
+                Text("Developer test stop", fontSize = 12.sp, fontWeight = FontWeight.Medium)
             }
         }
         Row(
@@ -265,7 +460,77 @@ private fun VolunteerNetworkSpikeCard(
                 Text("Clear Tor state", fontSize = 12.sp, fontWeight = FontWeight.Medium)
             }
         }
-        DebugBlock("Diagnostics", diagnostics.toDebugText(volunteerStateText(state)))
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            Button(
+                onClick = onStartVolunteerVpn,
+                enabled = vpnStartEnabled,
+                modifier = Modifier.weight(1f),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = Accent,
+                    contentColor = Bg,
+                    disabledContainerColor = Border,
+                    disabledContentColor = TextDim,
+                ),
+            ) {
+                Text("Developer VPN start", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+            }
+            OutlinedButton(
+                onClick = onStopVolunteerVpn,
+                enabled = vpnStopEnabled,
+                modifier = Modifier.weight(1f),
+                colors = ButtonDefaults.outlinedButtonColors(
+                    contentColor = TextPrimary,
+                    disabledContentColor = TextDim,
+                ),
+            ) {
+                Text("Developer VPN stop", fontSize = 12.sp, fontWeight = FontWeight.Medium)
+            }
+        }
+        DebugBlock("Embedded Tor", diagnostics.toDebugText(volunteerStateText(state)))
+        DebugBlock("HEV Native", hevNativeDiagnostics.toDebugText())
+        DebugBlock("Volunteer VPN", vpnDiagnostics.toDebugText())
+        DebugBlock(
+            "DNS caveats",
+            "dnsMode=${vpnDiagnostics.dnsMode}\n" +
+                "dnsServer=${vpnDiagnostics.dnsServer}\n" +
+                "mapDnsAddress=198.18.0.2\n" +
+                "mapDnsNetwork=100.64.0.0/10\n" +
+                "dnsLeakRisk=${vpnDiagnostics.dnsLeakRisk}\n" +
+                "dnsValidationMethod=manual-browser-check\n" +
+                "browserValidationRequired=true\n" +
+                "ZeroVPN app is excluded from the VPN, so in-app DNS tests do not prove the TUN path.",
+        )
+        DebugBlock(
+            "UDP caveats",
+            "udpMode=${vpnDiagnostics.udpMode}\n" +
+                "udpRisk=udp-traffic-may-fail-or-be-dropped\n" +
+                "udpProductStatus=not-supported\n" +
+                "Tor SOCKS is TCP-stream oriented; arbitrary UDP is not validated.",
+        )
+        DebugBlock(
+            "Lifecycle known unknowns",
+            "appKilledWhileVolunteerVpnRunning=not-solved\n" +
+                "appReopenedWhileAndroidVpnActive=diagnostic-only\n" +
+                "torRunningButHevStopped=diagnostic-only\n" +
+                "hevRunningButTorStopped=diagnostic-only\n" +
+                "androidVpnActiveButAppStateLost=diagnostic-only\n" +
+                "stopPressedTwice=idempotent-best-effort\n" +
+                "startPressedTwice=guarded-by-state\n" +
+                "permissionDenied=visible-state\n" +
+                "serviceDestroyedByOs=best-effort-stop",
+        )
+        DebugBlock(
+            "Browser validation",
+            "1. Start test until embedded Tor is Ready.\n" +
+                "2. Start VPN test and allow Android VPN permission.\n" +
+                "3. Open Chrome to https://check.torproject.org/ and verify it reports Tor.\n" +
+                "4. Browse a normal DNS-heavy site.\n" +
+                "5. Optionally run a browser DNS leak test manually.\n" +
+                "6. Stop VPN test and verify the Android VPN key clears.",
+        )
     }
 }
 
@@ -389,9 +654,35 @@ private fun WireGuardDebugCard(
 }
 
 @Composable
+private fun ProviderSwitchDebugCard(
+    diagnostics: ProviderSwitchDiagnostics,
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(Surface, RoundedCornerShape(8.dp))
+            .border(1.dp, Border, RoundedCornerShape(8.dp))
+            .padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        Text(
+            text = "PROVIDER HANDOFF",
+            style = SectionTitleStyle,
+        )
+        DebugValue("Selected exit id", diagnostics.selectedExitId ?: "N/A")
+        DebugValue("Selected provider", diagnostics.selectedProviderType ?: "N/A")
+        DebugValue("Active exit id", diagnostics.activeExitId ?: "N/A")
+        DebugValue("Active provider", diagnostics.activeProviderType ?: "N/A")
+        DebugValue("Switch target exit id", diagnostics.switchingTargetExitId ?: "N/A")
+        DebugValue("Last switch started", diagnostics.lastProviderSwitchStartedAt.formatDebugTime())
+        DebugValue("Last switch completed", diagnostics.lastProviderSwitchCompletedAt.formatDebugTime())
+        DebugBlock("Last switch error", diagnostics.lastProviderSwitchError ?: "N/A")
+    }
+}
+
+@Composable
 private fun SshDebugCard(
     sshDebugInfo: ProvisioningViewModel.SshDebugInfo?,
-    onCopyPrivateKey: () -> Unit,
     onCopyCommand: () -> Unit,
 ) {
     Column(
@@ -408,16 +699,16 @@ private fun SshDebugCard(
             color = Danger,
         )
         Text(
-            text = "Temporary debug only. Anyone with this key can SSH into this VM. Destroy this node after debugging.",
+            text = "Developer metadata only. The SSH private key is not displayed or copied.",
             fontSize = 13.sp,
             fontWeight = FontWeight.SemiBold,
-            color = Danger,
+            color = TextDim,
             lineHeight = 18.sp,
         )
 
         if (sshDebugInfo == null) {
             Text(
-                text = "No generated VM SSH private key is available in memory. Provision a node in this app session, then return here.",
+                text = "No SSH metadata is available for the selected exit.",
                 fontSize = 13.sp,
                 color = TextDim,
                 lineHeight = 18.sp,
@@ -427,26 +718,16 @@ private fun SshDebugCard(
 
         DebugValue("VM IP", sshDebugInfo.publicIp)
         DebugValue("SSH user", sshDebugInfo.username)
+        DebugValue("SSH key present", if (sshDebugInfo.privateKeyPresent) "yes" else "no")
         DebugBlock("SSH command", sshDebugInfo.windowsSshCommand)
-        DebugBlock("Private key", sshDebugInfo.privateKey)
 
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(12.dp),
         ) {
-            Button(
-                onClick = onCopyPrivateKey,
-                modifier = Modifier.weight(1f),
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = Danger,
-                    contentColor = Bg,
-                ),
-            ) {
-                Text("Copy Key", fontSize = 13.sp, fontWeight = FontWeight.Bold)
-            }
             OutlinedButton(
                 onClick = onCopyCommand,
-                modifier = Modifier.weight(1f),
+                modifier = Modifier.fillMaxWidth(),
                 colors = ButtonDefaults.outlinedButtonColors(
                     contentColor = TextPrimary,
                 ),
@@ -456,6 +737,12 @@ private fun SshDebugCard(
         }
     }
 }
+
+private fun Long?.formatDebugTime(): String =
+    this?.let { DateFormat.getDateTimeInstance().format(Date(it)) } ?: "N/A"
+
+private fun String?.prefixForDiagnostics(): String =
+    this?.take(8)?.takeIf { it.isNotBlank() } ?: "N/A"
 
 @Composable
 private fun DebugValue(label: String, value: String) {
@@ -521,8 +808,10 @@ private fun volunteerStateText(state: VolunteerNetworkState): String = when (sta
     ).joinToString(": ")
 }
 
-private fun VolunteerNetworkDiagnostics.copyText(stateText: String): String =
-    "Volunteer Network Spike\n${toDebugText(stateText)}"
+private fun VolunteerNetworkDiagnostics.copyText(
+    stateText: String,
+    vpnDiagnostics: VolunteerVpnDiagnostics,
+): String = "Volunteer Network Spike\n${toDebugText(stateText)}\n\n${vpnDiagnostics.toDebugText()}"
 
 private fun exitIpText(state: UserDiagnosticsState): String = when (state.exitIpStatus) {
     ExitIpStatus.Idle -> "Not checked"

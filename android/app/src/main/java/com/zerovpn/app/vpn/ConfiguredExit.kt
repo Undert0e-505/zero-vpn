@@ -2,6 +2,8 @@ package com.zerovpn.app.vpn
 
 enum class ExitProvider {
     OCI,
+    VOLUNTEER,
+    SHARED_WIREGUARD,
 }
 
 enum class ExitLifecycleState {
@@ -26,12 +28,14 @@ data class ConfiguredExit(
     val wireGuardPort: Int,
     val region: String,
     val wireGuardConfig: String,
+    val wireGuardConfigSecretKey: String? = null,
     val provider: ExitProvider = ExitProvider.OCI,
     val endpointHost: String = publicIp,
     val endpointPort: Int = wireGuardPort,
     val compartmentId: String? = null,
     val instanceId: String? = null,
     val sshUsername: String? = null,
+    val sshPrivateKeySecretKey: String? = null,
     val sshPrivateKey: String? = null,
     val apiKeyUserOcid: String? = null,
     val apiKeyTenancyOcid: String? = null,
@@ -44,4 +48,9 @@ data class ConfiguredExit(
     val serverPublicKey: String? = null,
     val serverPeerPublicKey: String? = null,
     val clientPublicKey: String? = null,
+    val transportLabel: String? = null,
+    val tcpSupported: Boolean? = null,
+    val udpSupported: Boolean? = null,
+    val dnsStatus: String? = null,
+    val destroyMeaning: String? = null,
 )

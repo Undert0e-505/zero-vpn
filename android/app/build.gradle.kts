@@ -26,19 +26,44 @@ val hasReleaseSigningConfig = listOf(
     releaseKeyAlias,
     releaseKeyPassword,
 ).all { !it.isNullOrBlank() }
+val enableHevNative = providers.gradleProperty("enableHevNative")
+    .map { it.equals("true", ignoreCase = true) }
+    .getOrElse(false)
+val enableVolunteerDebug = providers.gradleProperty("enableVolunteerDebug")
+    .map { it.equals("true", ignoreCase = true) }
+    .getOrElse(false)
 
 android {
     namespace = "com.zerovpn.app"
     compileSdk = 36
+    if (enableHevNative) {
+        ndkVersion = "27.0.12077973"
+    }
 
     defaultConfig {
         applicationId = "com.zerovpn.app"
         minSdk = 29
         targetSdk = 36
-        versionCode = 2
-        versionName = "0.1.1"
+        versionCode = 4
+        versionName = "0.2.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+        buildConfigField("boolean", "HEV_NATIVE_ENABLED", enableHevNative.toString())
+
+        if (enableHevNative) {
+            ndk {
+                abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64")
+            }
+
+            externalNativeBuild {
+                ndkBuild {
+                    arguments += listOf(
+                        "NDK_APPLICATION_MK=${file("src/main/jni/hev/Application.mk").absolutePath}",
+                        "APP_CFLAGS+=-DPKGNAME=com/zerovpn/app/volunteer/tun2socks -DCLSNAME=HevNativeLoader",
+                    )
+                }
+            }
+        }
     }
 
     signingConfigs {
@@ -55,10 +80,12 @@ android {
     buildTypes {
         debug {
             isMinifyEnabled = false
+            buildConfigField("boolean", "VOLUNTEER_DEBUG_ENABLED", enableVolunteerDebug.toString())
         }
         release {
             isMinifyEnabled = false
             isShrinkResources = false
+            buildConfigField("boolean", "VOLUNTEER_DEBUG_ENABLED", "false")
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
@@ -94,6 +121,14 @@ android {
             excludes += "/THIRD_PARTY_LICENSES.txt"
         }
     }
+
+    if (enableHevNative) {
+        externalNativeBuild {
+            ndkBuild {
+                path = file("../native/hev-socks5-tunnel/Android.mk")
+            }
+        }
+    }
 }
 
 dependencies {
@@ -111,11 +146,15 @@ dependencies {
     implementation(libs.androidx.compose.material.icons.extended)
     implementation(libs.androidx.navigation.compose)
     implementation(libs.androidx.lifecycle.viewmodel.compose)
+    implementation(libs.androidx.camera.camera2)
+    implementation(libs.androidx.camera.lifecycle)
+    implementation(libs.androidx.camera.view)
     implementation(libs.okhttp)
     implementation(libs.nanohttpd)
     implementation(libs.jsch)
     implementation(libs.androidx.browser)
     implementation(libs.wireguard.tunnel)
     implementation(libs.tor.android)
+    implementation(libs.zxing.core)
     debugImplementation(libs.androidx.compose.ui.tooling)
 }
