@@ -23,9 +23,9 @@ infrastructure that you control or explicitly accept.
 - Not a hosted ZeroVPN network.
 - Not a way to bypass Oracle account, billing, capacity, or MFA requirements.
 
-## Current Status: v0.2 Candidate
+## Current Status: v0.2.0
 
-ZeroVPN v0.2 is a release candidate for hardware-tested Oracle, Friends, Shared
+ZeroVPN v0.2.0 is a release for hardware-tested Oracle, Friends, Shared
 Exit, and Volunteer workflows. The app is still experimental and should not be
 treated as a polished or professionally audited security product.
 
@@ -34,7 +34,7 @@ while Oracle creates the VM, networking comes up, SSH becomes available, and
 WireGuard is installed. Once the exit exists, reconnecting is fast because
 ZeroVPN is just bringing up an existing WireGuard tunnel.
 
-## What Works In v0.2
+## What Works In v0.2.0
 
 ### Oracle Free Exit
 
@@ -85,7 +85,7 @@ ZeroVPN is just bringing up an existing WireGuard tunnel.
 
 - Shows connection state, selected exit details, exit IP, DNS status, and
   handshake information.
-- Shows Friends/share metadata useful for v0.2 testing.
+- Shows Friends/share metadata useful for v0.2.0 testing.
 - Does not display private keys, raw WireGuard configs, QR payloads, PSKs, or
   SSH private keys.
 
@@ -114,7 +114,7 @@ signals still matter.
 
 ## Installation
 
-Install the latest v0.2 candidate APK from GitHub Releases when it is published.
+Install the latest v0.2.0 APK from GitHub Releases.
 Android will ask you to allow installation from the browser or file manager you
 use to open the APK.
 
@@ -204,7 +204,7 @@ cd android
 .\gradlew.bat assembleDebug -PenableVolunteerDebug=true
 ```
 
-v0.2 HEV-native candidate APKs should be produced on Linux/GitHub Actions:
+v0.2.0 HEV-native APKs should be produced on Linux/GitHub Actions:
 
 ```bash
 cd android

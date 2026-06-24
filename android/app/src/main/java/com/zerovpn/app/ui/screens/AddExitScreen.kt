@@ -35,7 +35,7 @@ fun AddExitScreen(
     modifier: Modifier = Modifier,
 ) {
     var disabledMessage by remember { mutableStateOf<String?>(null) }
-    val optionCardModifier = Modifier.height(112.dp)
+    val optionCardModifier = Modifier.height(80.dp)
     val scrollState = rememberScrollState()
 
     disabledMessage?.let { message ->
