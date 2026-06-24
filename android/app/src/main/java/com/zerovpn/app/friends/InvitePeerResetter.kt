@@ -10,6 +10,27 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
 
+enum class InvitePeerResetPhase {
+    PRECHECK_MISSING_OWNER_EXIT,
+    PRECHECK_MISSING_SLOT,
+    PRECHECK_MISSING_SSH_KEY,
+    PRECHECK_MISSING_ENDPOINT,
+    GENERATE_NEW_KEYS_FAILED,
+    TEMP_SECRET_STORE_FAILED,
+    SSH_CONNECT_FAILED,
+    RUNTIME_REMOVE_OLD_PEER_FAILED,
+    READ_WG_CONF_FAILED,
+    UPDATE_WG_CONF_FAILED,
+    RESTART_WG_FAILED,
+    VERIFY_NEW_PEER_FAILED,
+    VERIFY_OLD_PEER_ABSENT_FAILED,
+    VERIFY_LATEST_HANDSHAKES_FAILED,
+    FINAL_SECRET_STORE_FAILED,
+    LOCAL_METADATA_UPDATE_FAILED,
+    CLEANUP_TEMP_SECRET_FAILED,
+    UNKNOWN,
+}
+
 class InvitePeerResetter(
     private val context: Context,
 ) {
@@ -20,17 +41,37 @@ class InvitePeerResetter(
         beforeServerMutation: (String) -> Unit = {},
     ): InvitePeerResetResult = withContext(Dispatchers.IO) {
         val oldPublicKey = slot.peerPublicKey?.takeIf { it.isNotBlank() }
-            ?: return@withContext InvitePeerResetResult.Failed("This invite slot does not have an old peer public key.")
+            ?: return@withContext InvitePeerResetResult.Failed(
+                phase = InvitePeerResetPhase.PRECHECK_MISSING_SLOT,
+                message = "This invite slot does not have an old peer public key.",
+            )
         val tunnelIp = slot.tunnelIp?.takeIf { it.matches(Regex("""\d{1,3}(\.\d{1,3}){3}""")) }
-            ?: return@withContext InvitePeerResetResult.Failed("This invite slot does not have a valid tunnel IP.")
+            ?: return@withContext InvitePeerResetResult.Failed(
+                phase = InvitePeerResetPhase.PRECHECK_MISSING_SLOT,
+                message = "This invite slot does not have a valid tunnel IP.",
+            )
         val username = ownerExit.sshUsername?.takeIf { it.isNotBlank() }
-            ?: return@withContext InvitePeerResetResult.Failed("This exit is missing its SSH username.")
+            ?: return@withContext InvitePeerResetResult.Failed(
+                phase = InvitePeerResetPhase.PRECHECK_MISSING_ENDPOINT,
+                message = "This exit is missing its SSH username.",
+            )
         val serverPublicKey = ownerExit.serverPublicKey?.takeIf { it.isNotBlank() }
             ?: parseWireGuardValue(ownerExit.wireGuardConfig, "Peer", "PublicKey")
-            ?: return@withContext InvitePeerResetResult.Failed("This exit is missing its WireGuard server public key.")
+            ?: return@withContext InvitePeerResetResult.Failed(
+                phase = InvitePeerResetPhase.PRECHECK_MISSING_OWNER_EXIT,
+                message = "This exit is missing its WireGuard server public key.",
+            )
         val host = ownerExit.publicIp.takeIf { it.isNotBlank() }
-            ?: return@withContext InvitePeerResetResult.Failed("This exit is missing its public IP.")
-        val keyPair = KeyPair()
+            ?: return@withContext InvitePeerResetResult.Failed(
+                phase = InvitePeerResetPhase.PRECHECK_MISSING_ENDPOINT,
+                message = "This exit is missing its public IP.",
+            )
+        val keyPair = runCatching { KeyPair() }.getOrElse { e ->
+            return@withContext InvitePeerResetResult.Failed(
+                phase = InvitePeerResetPhase.GENERATE_NEW_KEYS_FAILED,
+                message = e.message ?: "Could not generate a fresh invite keypair.",
+            )
+        }
         val newPrivateKey = keyPair.privateKey.toBase64()
         val newPublicKey = keyPair.publicKey.toBase64()
         val clientConfig = buildClientConfig(
@@ -41,7 +82,10 @@ class InvitePeerResetter(
             endpointPort = ownerExit.endpointPort.takeIf { it > 0 } ?: ownerExit.wireGuardPort,
         )
         runCatching { beforeServerMutation(clientConfig) }.getOrElse {
-            return@withContext InvitePeerResetResult.Failed("Could not prepare local secure storage for the new invite.")
+            return@withContext InvitePeerResetResult.Failed(
+                phase = InvitePeerResetPhase.TEMP_SECRET_STORE_FAILED,
+                message = "Could not prepare local secure storage for the new invite.",
+            )
         }
 
         val keyFile = File(context.cacheDir, "zerovpn_invite_reset_${System.currentTimeMillis()}.key")
@@ -61,8 +105,15 @@ class InvitePeerResetter(
             }
             val command = runCommand(session, resetCommand(oldPublicKey, newPublicKey, tunnelIp))
             if (command.exitCode != 0) {
+                val phase = parsePhase(command.stderr) ?: parsePhase(command.stdout) ?: InvitePeerResetPhase.UNKNOWN
                 return@withContext InvitePeerResetResult.Failed(
-                    command.stderr.ifBlank { "Could not reset the invite peer on the exit." },
+                    phase = phase,
+                    message = command.stderr
+                        .withoutPhaseMarkers()
+                        .ifBlank { command.stdout.withoutPhaseMarkers() }
+                        .ifBlank { "Could not reset the invite peer on the exit." },
+                    exitCode = command.exitCode,
+                    commandStderr = command.stderr.withoutPhaseMarkers(),
                 )
             }
             InvitePeerResetResult.Success(
@@ -71,7 +122,10 @@ class InvitePeerResetter(
                 clientConfig = clientConfig,
             )
         } catch (e: Exception) {
-            InvitePeerResetResult.Failed(e.message ?: "Could not reset the invite peer on the exit.")
+            InvitePeerResetResult.Failed(
+                phase = InvitePeerResetPhase.SSH_CONNECT_FAILED,
+                message = e.message ?: "Could not connect to the exit over SSH.",
+            )
         } finally {
             session?.disconnect()
             runCatching { keyFile.delete() }
@@ -145,6 +199,20 @@ class InvitePeerResetter(
 
     private fun String.shellQuote(): String = "'${replace("'", "'\"'\"'")}'"
 
+    private fun parsePhase(output: String): InvitePeerResetPhase? =
+        Regex("""ZEROVPN_PHASE=([A-Z0-9_]+)""")
+            .findAll(output)
+            .lastOrNull()
+            ?.groupValues
+            ?.getOrNull(1)
+            ?.let { value -> runCatching { InvitePeerResetPhase.valueOf(value) }.getOrNull() }
+
+    private fun String.withoutPhaseMarkers(): String =
+        lineSequence()
+            .filterNot { it.startsWith("ZEROVPN_PHASE=") }
+            .joinToString("\n")
+            .trim()
+
     private data class SshCommandResult(
         val exitCode: Int,
         val stdout: String,
@@ -162,8 +230,10 @@ cleanup() {
 }
 trap cleanup EXIT
 
+echo "ZEROVPN_PHASE=READ_WG_CONF_FAILED" >&2
 sudo test -f "${'$'}CONF"
 sudo cat "${'$'}CONF" > "${'$'}TMP_IN"
+echo "ZEROVPN_PHASE=UPDATE_WG_CONF_FAILED" >&2
 python3 - "${'$'}TMP_IN" "${'$'}TMP_OUT" <<'PY'
 import os
 import re
@@ -223,15 +293,21 @@ with open(dst, "w", encoding="utf-8") as fh:
     fh.write("\n".join(out_lines).rstrip() + "\n")
 PY
 
+echo "ZEROVPN_PHASE=UPDATE_WG_CONF_FAILED" >&2
 sudo install -m 600 -o root -g root "${'$'}TMP_OUT" "${'$'}CONF"
+echo "ZEROVPN_PHASE=RUNTIME_REMOVE_OLD_PEER_FAILED" >&2
 sudo wg set wg0 peer "${'$'}OLD_PUBLIC_KEY" remove || true
+echo "ZEROVPN_PHASE=RESTART_WG_FAILED" >&2
 sudo systemctl restart wg-quick@wg0
+echo "ZEROVPN_PHASE=VERIFY_NEW_PEER_FAILED" >&2
 sudo wg set wg0 peer "${'$'}NEW_PUBLIC_KEY" allowed-ips "${'$'}TUNNEL_IP/32"
 sudo wg show wg0 peers | grep -Fx "${'$'}NEW_PUBLIC_KEY" >/dev/null
+echo "ZEROVPN_PHASE=VERIFY_OLD_PEER_ABSENT_FAILED" >&2
 if sudo wg show wg0 peers | grep -Fx "${'$'}OLD_PUBLIC_KEY" >/dev/null; then
   echo "old invite peer is still active after reset" >&2
   exit 1
 fi
+echo "ZEROVPN_PHASE=VERIFY_LATEST_HANDSHAKES_FAILED" >&2
 sudo wg show wg0 latest-handshakes >/dev/null
 """.trimIndent()
     }
@@ -244,5 +320,10 @@ sealed interface InvitePeerResetResult {
         val clientConfig: String,
     ) : InvitePeerResetResult
 
-    data class Failed(val message: String) : InvitePeerResetResult
+    data class Failed(
+        val phase: InvitePeerResetPhase,
+        val message: String,
+        val exitCode: Int? = null,
+        val commandStderr: String = "",
+    ) : InvitePeerResetResult
 }

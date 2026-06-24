@@ -130,9 +130,17 @@ fun NavGraph() {
         }
     }
 
-    val navigateToTopLevel: (Screen) -> Unit = { screen ->
+    val navigateToTopLevel: (Screen) -> Unit = navigateToTopLevel@{ screen ->
         if (screen == Screen.AddExit) {
             provisioningViewModel.prepareNewProvisioningFlow()
+            navController.navigate(Screen.AddExit.route) {
+                popUpTo(navController.graph.findStartDestination().id) {
+                    saveState = false
+                }
+                launchSingleTop = true
+                restoreState = false
+            }
+            return@navigateToTopLevel
         }
         navController.navigate(screen.route) {
             popUpTo(navController.graph.findStartDestination().id) {

@@ -4,12 +4,14 @@ import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
 import android.net.Uri
+import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.browser.customtabs.CustomTabsIntent
 import com.zerovpn.app.friends.FriendsRepository
 import com.zerovpn.app.friends.HandshakeQueryResult
 import com.zerovpn.app.friends.InviteHandshakeChecker
+import com.zerovpn.app.friends.InvitePeerResetPhase
 import com.zerovpn.app.friends.InvitePeerResetResult
 import com.zerovpn.app.friends.InvitePeerResetter
 import com.zerovpn.app.friends.InviteSlot
@@ -103,6 +105,9 @@ class ProvisioningViewModel : ViewModel() {
     private val _sharedExitProfiles = MutableStateFlow<List<SharedExitProfile>>(emptyList())
     val sharedExitProfiles: StateFlow<List<SharedExitProfile>> = _sharedExitProfiles.asStateFlow()
 
+    private val _lastInviteOperationError = MutableStateFlow<String?>(null)
+    val lastInviteOperationError: StateFlow<String?> = _lastInviteOperationError.asStateFlow()
+
     private var provisioner: OciProvisioner? = null
     private var authResult: OciProvisioner.AuthResult? = null
     private var preflightResult: OciProvisioner.PreflightResult? = null
@@ -185,6 +190,7 @@ class ProvisioningViewModel : ViewModel() {
         apiKeyUserOcid = prefs.getString("api_key_user_ocid", null)
         apiKeyTenancyOcid = prefs.getString("api_key_tenancy_ocid", null)
         apiKeyFingerprint = prefs.getString("api_key_fingerprint", null)
+        _lastInviteOperationError.value = prefs.getString("last_invite_operation_error", null)
 
         val exits = loadConfiguredExits()
         if (exits.isNotEmpty()) {
@@ -259,6 +265,7 @@ class ProvisioningViewModel : ViewModel() {
                 "resource_subnet_id",
                 "resource_igw_id",
                 "resource_instance_id",
+                "last_invite_operation_error",
             ).forEach { remove(it) }
             putString("state", _state.value::class.simpleName)
             putString("oracle_onboarding_state", _oracleOnboardingState.value.name)
@@ -274,6 +281,7 @@ class ProvisioningViewModel : ViewModel() {
             wireGuardServerPublicKey?.let { putString("wireguard_server_public_key", it) }
             wireGuardServerPeerPublicKey?.let { putString("wireguard_server_peer_public_key", it) }
             _selectedExitId.value?.let { putString("selected_exit_id", it) }
+            _lastInviteOperationError.value?.let { putString("last_invite_operation_error", it) }
             putString("configured_exits_json", serializeConfiguredExits(_configuredExits.value))
             resourceIds?.let { rids ->
                 rids.vcnId?.let { putString("resource_vcn_id", it) }
@@ -508,6 +516,9 @@ class ProvisioningViewModel : ViewModel() {
     }
 
     fun markInviteSlotClaimed(slotId: String, firstHandshakeAt: Long, lastHandshakeAt: Long) {
+        _inviteSlots.value.firstOrNull { it.slotId == slotId }?.clientConfigSecretKey?.let {
+            secretStore.removeSecret(it)
+        }
         friendsRepository?.let { repository ->
             _inviteSlots.value = repository.markInviteSlotClaimed(slotId, firstHandshakeAt, lastHandshakeAt)
         }
@@ -608,15 +619,26 @@ class ProvisioningViewModel : ViewModel() {
     ) {
         val slot = _inviteSlots.value.firstOrNull { it.slotId == slotId }
         if (slot == null) {
+            recordInviteOperationError("reset phase=${InvitePeerResetPhase.PRECHECK_MISSING_SLOT.name} slotId=$slotId message=This invite slot was not found.")
             onComplete(InviteResetResult.Error("This invite slot was not found."))
             return
         }
         if (slot.state != InviteSlotState.PENDING_CLAIM && slot.state != InviteSlotState.CLAIMED) {
+            recordInviteOperationError(
+                "reset phase=${InvitePeerResetPhase.PRECHECK_MISSING_SLOT.name} " +
+                    "ownerExitId=${slot.ownerExitId} slotId=${slot.slotId} slotIndex=${slot.slotIndex} " +
+                    "state=${slot.state.name} message=Only pending or claimed invite slots can be reset.",
+            )
             onComplete(InviteResetResult.Error("Only pending or claimed invite slots can be reset."))
             return
         }
         val ownerExit = _configuredExits.value.firstOrNull { it.id == slot.ownerExitId }
         if (ownerExit == null) {
+            recordInviteOperationError(
+                "reset phase=${InvitePeerResetPhase.PRECHECK_MISSING_OWNER_EXIT.name} " +
+                    "ownerExitId=${slot.ownerExitId} slotId=${slot.slotId} slotIndex=${slot.slotIndex} " +
+                    "message=The owner exit for this invite was not found.",
+            )
             onComplete(InviteResetResult.Error("The owner exit for this invite was not found."))
             return
         }
@@ -624,11 +646,21 @@ class ProvisioningViewModel : ViewModel() {
             ?.let { secretStore.getSecret(it) }
             ?: ownerExit.sshPrivateKey
         if (sshPrivateKey.isNullOrBlank()) {
+            recordInviteOperationError(
+                buildInviteResetErrorDetail(
+                    phase = InvitePeerResetPhase.PRECHECK_MISSING_SSH_KEY,
+                    ownerExit = ownerExit,
+                    slot = slot,
+                    message = "Owner key is missing for this exit.",
+                ),
+            )
             onComplete(InviteResetResult.Error("Owner key is missing for this exit. Recreate the exit or use a future recovery flow."))
             return
         }
         val finalSecretKey = SecureSecretStore.inviteClientConfig(slot.slotId)
         val tempSecretKey = "$finalSecretKey:pendingReset"
+        _lastInviteOperationError.value = null
+        persistState()
         viewModelScope.launch {
             when (
                 val result = InvitePeerResetter(context.applicationContext).resetPeer(
@@ -641,18 +673,47 @@ class ProvisioningViewModel : ViewModel() {
                 )
             ) {
                 is InvitePeerResetResult.Failed -> {
-                    secretStore.removeSecret(tempSecretKey)
+                    val cleanupError = runCatching { secretStore.removeSecret(tempSecretKey) }.exceptionOrNull()
+                    val serverMayHaveInvalidatedOldInvite = result.phase.mayHaveInvalidatedOldInvite()
+                    if (serverMayHaveInvalidatedOldInvite) {
+                        slot.clientConfigSecretKey?.let { runCatching { secretStore.removeSecret(it) } }
+                        friendsRepository?.let { repository ->
+                            _inviteSlots.value = repository.markInviteSlotRevoked(slot.slotId, System.currentTimeMillis())
+                        }
+                    }
+                    val detail = buildInviteResetErrorDetail(
+                        phase = result.phase,
+                        ownerExit = ownerExit,
+                        slot = slot,
+                        message = result.message,
+                        exitCode = result.exitCode,
+                        commandStderr = result.commandStderr,
+                        cleanupError = cleanupError?.message,
+                        oldInviteInvalidated = serverMayHaveInvalidatedOldInvite,
+                    )
+                    recordInviteOperationError(detail)
                     onComplete(
                         InviteResetResult.Error(
-                            result.message.takeIf { it.isNotBlank() }
-                                ?: "Could not reset this invite. Please try again.",
+                            "Could not reset this invite. Open Diagnostics for details.",
                         ),
                     )
                 }
                 is InvitePeerResetResult.Success -> {
                     try {
-                        secretStore.putSecret(finalSecretKey, result.clientConfig)
-                        friendsRepository?.let { repository ->
+                        runCatching { secretStore.putSecret(finalSecretKey, result.clientConfig) }.getOrElse { e ->
+                            val detail = buildInviteResetErrorDetail(
+                                phase = InvitePeerResetPhase.FINAL_SECRET_STORE_FAILED,
+                                ownerExit = ownerExit,
+                                slot = slot,
+                                message = e.message ?: "Secure-store write failed after server reset.",
+                            )
+                            recordInviteOperationError(detail)
+                            secretStore.removeSecret(tempSecretKey)
+                            onComplete(InviteResetResult.Error("Could not reset this invite. Open Diagnostics for details."))
+                            return@launch
+                        }
+                        runCatching {
+                            val repository = friendsRepository ?: error("Friends repository is not available.")
                             _inviteSlots.value = repository.resetInviteSlotAfterRevoke(
                                 slotId = slot.slotId,
                                 newPeerPublicKey = result.newPeerPublicKey,
@@ -660,14 +721,49 @@ class ProvisioningViewModel : ViewModel() {
                                 clientConfigSecretKey = finalSecretKey,
                                 resetAt = System.currentTimeMillis(),
                             )
+                        }.getOrElse { e ->
+                            val detail = buildInviteResetErrorDetail(
+                                phase = InvitePeerResetPhase.LOCAL_METADATA_UPDATE_FAILED,
+                                ownerExit = ownerExit,
+                                slot = slot,
+                                message = e.message ?: "Local invite metadata update failed after server reset.",
+                            )
+                            recordInviteOperationError(detail)
+                            secretStore.removeSecret(tempSecretKey)
+                            onComplete(InviteResetResult.Error("Could not reset this invite. Open Diagnostics for details."))
+                            return@launch
                         }
-                        secretStore.removeSecret(tempSecretKey)
+                        slot.clientConfigSecretKey
+                            ?.takeIf { it != finalSecretKey }
+                            ?.let { secretStore.removeSecret(it) }
+                        val cleanupError = runCatching { secretStore.removeSecret(tempSecretKey) }.exceptionOrNull()
+                        if (cleanupError != null) {
+                            recordInviteOperationError(
+                                buildInviteResetErrorDetail(
+                                    phase = InvitePeerResetPhase.CLEANUP_TEMP_SECRET_FAILED,
+                                    ownerExit = ownerExit,
+                                    slot = slot,
+                                    message = cleanupError.message ?: "Temporary invite reset secret cleanup failed.",
+                                ),
+                            )
+                        } else {
+                            _lastInviteOperationError.value = null
+                        }
+                        persistState()
                         onComplete(InviteResetResult.Reset)
                     } catch (e: Exception) {
-                        secretStore.removeSecret(tempSecretKey)
+                        val cleanupError = runCatching { secretStore.removeSecret(tempSecretKey) }.exceptionOrNull()
+                        val detail = buildInviteResetErrorDetail(
+                            phase = InvitePeerResetPhase.UNKNOWN,
+                            ownerExit = ownerExit,
+                            slot = slot,
+                            message = e.message ?: "Local reset completion failed after server reset.",
+                            cleanupError = cleanupError?.message,
+                        )
+                        recordInviteOperationError(detail)
                         onComplete(
                             InviteResetResult.Error(
-                                "The server reset succeeded, but ZeroVPN could not save the new invite locally. Recreate the exit or use a future recovery flow.",
+                                "Could not reset this invite. Open Diagnostics for details.",
                             ),
                         )
                     }
@@ -1440,6 +1536,62 @@ class ProvisioningViewModel : ViewModel() {
         }
     }
 
+    private fun recordInviteOperationError(detail: String) {
+        _lastInviteOperationError.value = detail
+        Log.w(TAG, detail)
+        persistState()
+    }
+
+    private fun buildInviteResetErrorDetail(
+        phase: InvitePeerResetPhase,
+        ownerExit: ConfiguredExit,
+        slot: InviteSlot,
+        message: String,
+        exitCode: Int? = null,
+        commandStderr: String = "",
+        cleanupError: String? = null,
+        oldInviteInvalidated: Boolean = false,
+    ): String = buildString {
+        append("reset phase=").append(phase.name)
+        append(" ownerExitId=").append(ownerExit.id)
+        append(" slotId=").append(slot.slotId)
+        append(" slotIndex=").append(slot.slotIndex)
+        append(" tunnelIp=").append(slot.tunnelIp ?: "N/A")
+        append(" oldPeerPrefix=").append(slot.peerPublicKey.safePublicKeyPrefix())
+        append(" sshHost=").append(ownerExit.publicIp.ifBlank { "N/A" })
+        append(" sshUser=").append(ownerExit.sshUsername ?: "N/A")
+        exitCode?.let { append(" exitCode=").append(it) }
+        append(" oldInviteInvalidated=").append(if (oldInviteInvalidated) "yes" else "no")
+        append(" message=").append(message.sanitizeInviteDiagnostic())
+        commandStderr.takeIf { it.isNotBlank() }?.let {
+            append(" stderr=").append(it.sanitizeInviteDiagnostic())
+        }
+        cleanupError?.takeIf { it.isNotBlank() }?.let {
+            append(" cleanupError=").append(it.sanitizeInviteDiagnostic())
+        }
+    }
+
+    private fun InvitePeerResetPhase.mayHaveInvalidatedOldInvite(): Boolean =
+        when (this) {
+            InvitePeerResetPhase.RESTART_WG_FAILED,
+            InvitePeerResetPhase.VERIFY_NEW_PEER_FAILED,
+            InvitePeerResetPhase.VERIFY_LATEST_HANDSHAKES_FAILED
+            -> true
+            else -> false
+        }
+
+    private fun String?.safePublicKeyPrefix(): String =
+        this?.takeIf { it.isNotBlank() }?.let { value ->
+            if (value.length <= 10) "$value..." else "${value.take(10)}..."
+        } ?: "N/A"
+
+    private fun String.sanitizeInviteDiagnostic(): String =
+        lineSequence()
+            .map { it.trim() }
+            .filter { it.isNotBlank() }
+            .joinToString(" | ")
+            .take(700)
+
     private fun nextExitName(): String {
         val used = _configuredExits.value.mapNotNull { exit ->
             Regex("""^Exit (\d+)$""").matchEntire(exit.name)?.groupValues?.getOrNull(1)?.toIntOrNull()
@@ -1597,6 +1749,7 @@ class ProvisioningViewModel : ViewModel() {
 
     companion object {
         const val ORACLE_SIGNUP_URL = "https://signup.oraclecloud.com/"
+        private const val TAG = "ZeroVpnProvisioning"
         // Only for old persisted exits created before region was stored per exit.
         private const val LEGACY_REGION_FALLBACK = "uk-london-1"
         private const val AUTH_BOOTSTRAP_REGION = "us-ashburn-1"

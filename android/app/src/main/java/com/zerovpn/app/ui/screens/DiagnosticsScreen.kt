@@ -87,6 +87,7 @@ fun DiagnosticsScreen(
     val exits by provisioningViewModel.configuredExits.collectAsState()
     val inviteSlots by provisioningViewModel.inviteSlots.collectAsState()
     val sharedExitProfiles by provisioningViewModel.sharedExitProfiles.collectAsState()
+    val lastInviteOperationError by provisioningViewModel.lastInviteOperationError.collectAsState()
     val selectedExitId by provisioningViewModel.selectedExitId.collectAsState()
     val providerSwitchDiagnostics by provisioningViewModel.providerSwitchDiagnostics.collectAsState()
     val vpnState by vpnViewModel.state.collectAsState()
@@ -175,6 +176,7 @@ fun DiagnosticsScreen(
                 hasSharedConfig = provisioningViewModel::hasSharedExitConfig,
                 hasExitWireGuardConfig = provisioningViewModel::hasExitWireGuardConfig,
                 hasExitSshPrivateKey = provisioningViewModel::hasExitSshPrivateKey,
+                lastInviteOperationError = lastInviteOperationError,
             )
             if (BuildConfig.VOLUNTEER_DEBUG_ENABLED) {
                 Spacer(modifier = Modifier.height(12.dp))
@@ -231,6 +233,7 @@ private fun FriendsShareDebugCard(
     hasSharedConfig: (SharedExitProfile) -> Boolean,
     hasExitWireGuardConfig: (com.zerovpn.app.vpn.ConfiguredExit) -> Boolean,
     hasExitSshPrivateKey: (com.zerovpn.app.vpn.ConfiguredExit) -> Boolean,
+    lastInviteOperationError: String?,
 ) {
     Column(
         modifier = Modifier
@@ -259,6 +262,7 @@ private fun FriendsShareDebugCard(
         DebugValue("Invite slot count", inviteSlots.size.toString())
         DebugValue("Owner exit count with slots", inviteSlots.map { it.ownerExitId }.distinct().size.toString())
         DebugValue("Shared exit profile count", sharedExitProfiles.size.toString())
+        DebugBlock("Last invite operation error", lastInviteOperationError ?: "N/A")
         DebugBlock(
             "Invite slots by owner",
             inviteSlots
