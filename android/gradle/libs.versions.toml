@@ -14,6 +14,7 @@ bcpkix = "1.78.1"
  browser = "1.8.0"
 wireguardTunnel = "1.0.20230706"
 torAndroid = "0.4.8.16"
+zxingCore = "3.5.3"
 
 [libraries]
 androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
@@ -37,6 +38,7 @@ bcpkix = { group = "org.bouncycastle", name = "bcpkix-jdk15to18", version.ref = 
  androidx-browser = { group = "androidx.browser", name = "browser", version.ref = "browser" }
 wireguard-tunnel = { group = "com.wireguard.android", name = "tunnel", version.ref = "wireguardTunnel" }
 tor-android = { group = "info.guardianproject", name = "tor-android", version.ref = "torAndroid" }
+zxing-core = { group = "com.google.zxing", name = "core", version.ref = "zxingCore" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }
