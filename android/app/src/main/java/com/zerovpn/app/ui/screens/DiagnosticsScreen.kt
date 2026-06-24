@@ -246,13 +246,15 @@ private fun FriendsShareDebugCard(
             lineHeight = 18.sp,
         )
         DebugValue("Invite slot count", inviteSlots.size.toString())
+        DebugValue("Owner exit count with slots", inviteSlots.map { it.ownerExitId }.distinct().size.toString())
         DebugValue("Shared exit profile count", sharedExitProfiles.size.toString())
         DebugBlock(
             "Invite slot states",
             inviteSlots
                 .sortedWith(compareBy<InviteSlot>({ it.ownerExitId }, { it.slotIndex }, { it.slotId }))
                 .joinToString("\n") { slot ->
-                    "owner=${slot.ownerExitId} slot=${slot.slotIndex} state=${slot.state.name}"
+                    "owner=${slot.ownerExitId} slot=${slot.slotIndex} state=${slot.state.name} " +
+                        "ip=${slot.tunnelIp ?: "N/A"} peer=${slot.peerPublicKey.prefixForDiagnostics()}"
                 }
                 .ifBlank { "N/A" },
         )
@@ -664,6 +666,9 @@ private fun SshDebugCard(
 
 private fun Long?.formatDebugTime(): String =
     this?.let { DateFormat.getDateTimeInstance().format(Date(it)) } ?: "N/A"
+
+private fun String?.prefixForDiagnostics(): String =
+    this?.take(8)?.takeIf { it.isNotBlank() } ?: "N/A"
 
 @Composable
 private fun DebugValue(label: String, value: String) {
