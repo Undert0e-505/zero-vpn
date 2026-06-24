@@ -254,7 +254,10 @@ private fun FriendsShareDebugCard(
                 .sortedWith(compareBy<InviteSlot>({ it.ownerExitId }, { it.slotIndex }, { it.slotId }))
                 .joinToString("\n") { slot ->
                     "owner=${slot.ownerExitId} slot=${slot.slotIndex} state=${slot.state.name} " +
-                        "ip=${slot.tunnelIp ?: "N/A"} peer=${slot.peerPublicKey.prefixForDiagnostics()}"
+                        "ip=${slot.tunnelIp ?: "N/A"} peer=${slot.peerPublicKey.prefixForDiagnostics()} " +
+                        "firstHandshakeAt=${slot.firstHandshakeAt.formatDebugTime()} " +
+                        "lastHandshakeAt=${slot.lastHandshakeAt.formatDebugTime()} " +
+                        "privateShareMaterialPresent=${slot.privateShareMaterialPresentText()}"
                 }
                 .ifBlank { "N/A" },
         )
@@ -671,6 +674,9 @@ private fun Long?.formatDebugTime(): String =
 
 private fun String?.prefixForDiagnostics(): String =
     this?.take(8)?.takeIf { it.isNotBlank() } ?: "N/A"
+
+private fun InviteSlot.privateShareMaterialPresentText(): String =
+    if (!encryptedClientConfig.isNullOrBlank() || !encryptedClientPrivateKey.isNullOrBlank()) "yes" else "no"
 
 @Composable
 private fun DebugValue(label: String, value: String) {

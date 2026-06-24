@@ -14,6 +14,10 @@ class FriendsRepository(
             .filter { it.ownerExitId == ownerExitId }
             .sortedBy { it.slotIndex }
 
+    fun getPendingInviteSlotsForOwnerExit(ownerExitId: String): List<InviteSlot> =
+        getInviteSlotsForOwnerExit(ownerExitId)
+            .filter { it.state == InviteSlotState.PENDING_CLAIM }
+
     fun upsertInviteSlot(slot: InviteSlot): List<InviteSlot> {
         val slots = loadInviteSlots()
             .filterNot { it.slotId == slot.slotId } + slot.copy(updatedAt = System.currentTimeMillis())
@@ -64,6 +68,14 @@ class FriendsRepository(
             it.copy(
                 encryptedClientConfig = null,
                 encryptedClientPrivateKey = null,
+                updatedAt = System.currentTimeMillis(),
+            )
+        }
+
+    fun updateInviteSlotLastHandshake(slotId: String, lastHandshakeAt: Long): List<InviteSlot> =
+        updateInviteSlot(slotId) {
+            it.copy(
+                lastHandshakeAt = lastHandshakeAt,
                 updatedAt = System.currentTimeMillis(),
             )
         }

@@ -33,6 +33,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -40,10 +41,13 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import com.zerovpn.app.friends.InviteSlot
 import com.zerovpn.app.friends.InviteSlotState
 import com.zerovpn.app.friends.QrCodeGenerator
+import com.zerovpn.app.ui.provisioning.InviteClaimCheckResult
 import com.zerovpn.app.ui.provisioning.ProvisioningViewModel
 import com.zerovpn.app.ui.theme.*
 import com.zerovpn.app.vpn.ConfiguredExit
 import com.zerovpn.app.vpn.ExitProvider
+import java.text.DateFormat
+import java.util.Date
 
 @Composable
 fun FriendsScreen(
@@ -51,6 +55,7 @@ fun FriendsScreen(
     modifier: Modifier = Modifier,
     viewModel: ProvisioningViewModel = viewModel(),
 ) {
+    val context = LocalContext.current
     val exits by viewModel.configuredExits.collectAsState()
     val inviteSlots by viewModel.inviteSlots.collectAsState()
     val ownerExits = exits.filter { it.provider == ExitProvider.OCI }
@@ -60,8 +65,14 @@ fun FriendsScreen(
     var renameTarget by remember { mutableStateOf<InviteSlot?>(null) }
     var qrDialog by remember { mutableStateOf<QrDialogState?>(null) }
     var errorMessage by remember { mutableStateOf<String?>(null) }
+    var infoMessage by remember { mutableStateOf<String?>(null) }
+    var checkingSlotId by remember { mutableStateOf<String?>(null) }
 
     fun showQrForSlot(slot: InviteSlot, markPending: Boolean, name: String? = null) {
+        if (slot.state == InviteSlotState.CLAIMED) {
+            errorMessage = "This invite has already been claimed. The QR is no longer available."
+            return
+        }
         val config = slot.encryptedClientConfig?.takeIf { it.isNotBlank() }
         if (config == null) {
             errorMessage = "This invite slot does not have a share config yet. Create a new Oracle exit to generate share slots."
@@ -82,6 +93,25 @@ fun FriendsScreen(
             viewModel.markInviteSlotPending(slot.slotId, System.currentTimeMillis())
         }
         qrDialog = QrDialogState(displayName = displayName, bitmap = bitmap)
+    }
+
+    fun checkClaim(slot: InviteSlot) {
+        if (checkingSlotId != null) return
+        checkingSlotId = slot.slotId
+        viewModel.checkInviteSlotClaim(context, slot.slotId) { result ->
+            checkingSlotId = null
+            when (result) {
+                InviteClaimCheckResult.NotClaimed -> {
+                    infoMessage = "Not claimed yet. This invite has not connected."
+                }
+                InviteClaimCheckResult.Claimed -> {
+                    infoMessage = "Invite claimed. The QR has now been hidden."
+                }
+                is InviteClaimCheckResult.Error -> {
+                    errorMessage = result.message
+                }
+            }
+        }
     }
 
     shareTarget?.let { slot ->
@@ -123,6 +153,22 @@ fun FriendsScreen(
             text = { Text(message, fontSize = 14.sp, color = TextPrimary, lineHeight = 20.sp) },
             confirmButton = {
                 TextButton(onClick = { errorMessage = null }) {
+                    Text("OK", color = Accent)
+                }
+            },
+        )
+    }
+
+    infoMessage?.let { message ->
+        AlertDialog(
+            onDismissRequest = { infoMessage = null },
+            containerColor = Surface,
+            titleContentColor = TextPrimary,
+            textContentColor = TextPrimary,
+            title = { Text("Invite claim", fontSize = 18.sp, fontWeight = FontWeight.SemiBold) },
+            text = { Text(message, fontSize = 14.sp, color = TextPrimary, lineHeight = 20.sp) },
+            confirmButton = {
+                TextButton(onClick = { infoMessage = null }) {
                     Text("OK", color = Accent)
                 }
             },
@@ -173,7 +219,9 @@ fun FriendsScreen(
                         slot = slot,
                         onShare = { shareTarget = slot },
                         onShowQrAgain = { showQrForSlot(slot = slot, markPending = false) },
+                        onCheckClaim = { checkClaim(slot) },
                         onRename = { renameTarget = slot },
+                        isCheckingClaim = checkingSlotId == slot.slotId,
                     )
                     Spacer(modifier = Modifier.height(10.dp))
                 }
@@ -260,7 +308,9 @@ private fun InviteSlotCard(
     slot: InviteSlot,
     onShare: () -> Unit,
     onShowQrAgain: () -> Unit,
+    onCheckClaim: () -> Unit,
     onRename: () -> Unit,
+    isCheckingClaim: Boolean,
 ) {
     Column(
         modifier = Modifier
@@ -290,13 +340,21 @@ private fun InviteSlotCard(
                 color = TextDim,
             )
         }
+        slot.peerPublicKey?.takeIf { it.isNotBlank() }?.let {
+            Spacer(modifier = Modifier.height(2.dp))
+            Text(
+                text = "Peer: ${it.prefixForInviteCard()}",
+                fontSize = 12.sp,
+                color = TextDim,
+            )
+        }
         slot.firstHandshakeAt?.let {
             Spacer(modifier = Modifier.height(2.dp))
-            Text("First connected: recorded", fontSize = 12.sp, color = TextDim)
+            Text("First connected: ${it.formatInviteTime()}", fontSize = 12.sp, color = TextDim)
         }
         slot.lastHandshakeAt?.let {
             Spacer(modifier = Modifier.height(2.dp))
-            Text("Last seen: recorded", fontSize = 12.sp, color = TextDim)
+            Text("Last seen: ${it.formatInviteTime()}", fontSize = 12.sp, color = TextDim)
         }
         if (slot.state == InviteSlotState.CLAIMED) {
             Spacer(modifier = Modifier.height(8.dp))
@@ -329,18 +387,36 @@ private fun InviteSlotCard(
                 }
             }
             InviteSlotState.PENDING_CLAIM -> {
-                Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
-                    Button(
-                        onClick = onShowQrAgain,
-                        modifier = Modifier.weight(1f).height(44.dp),
-                        colors = ButtonDefaults.buttonColors(containerColor = Accent, contentColor = Bg),
-                        shape = RoundedCornerShape(8.dp),
-                    ) {
-                        Text("Show QR again", fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                Text("Waiting for first connection", fontSize = 12.sp, color = TextDim)
+                Spacer(modifier = Modifier.height(8.dp))
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+                    Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
+                        Button(
+                            onClick = onCheckClaim,
+                            enabled = !isCheckingClaim,
+                            modifier = Modifier.weight(1f).height(44.dp),
+                            colors = ButtonDefaults.buttonColors(containerColor = Accent, contentColor = Bg),
+                            shape = RoundedCornerShape(8.dp),
+                        ) {
+                            Text(
+                                if (isCheckingClaim) "Checking..." else "Check claim",
+                                fontSize = 13.sp,
+                                fontWeight = FontWeight.Bold,
+                            )
+                        }
+                        OutlinedButton(
+                            onClick = onShowQrAgain,
+                            enabled = !isCheckingClaim,
+                            modifier = Modifier.weight(1f).height(44.dp),
+                            shape = RoundedCornerShape(8.dp),
+                        ) {
+                            Text("Show QR", fontSize = 13.sp, fontWeight = FontWeight.Medium, color = Accent)
+                        }
                     }
                     OutlinedButton(
                         onClick = onRename,
-                        modifier = Modifier.weight(1f).height(44.dp),
+                        enabled = !isCheckingClaim,
+                        modifier = Modifier.fillMaxWidth().height(44.dp),
                         shape = RoundedCornerShape(8.dp),
                     ) {
                         Text("Rename", fontSize = 13.sp, fontWeight = FontWeight.Medium, color = Accent)
@@ -348,13 +424,22 @@ private fun InviteSlotCard(
                 }
             }
             InviteSlotState.CLAIMED -> {
-                OutlinedButton(
-                    onClick = {},
-                    enabled = false,
-                    modifier = Modifier.fillMaxWidth().height(44.dp),
-                    shape = RoundedCornerShape(8.dp),
-                ) {
-                    Text("Revoke/reset coming next", fontSize = 13.sp, fontWeight = FontWeight.Medium, color = TextDim)
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+                    OutlinedButton(
+                        onClick = onRename,
+                        modifier = Modifier.fillMaxWidth().height(44.dp),
+                        shape = RoundedCornerShape(8.dp),
+                    ) {
+                        Text("Rename", fontSize = 13.sp, fontWeight = FontWeight.Medium, color = Accent)
+                    }
+                    OutlinedButton(
+                        onClick = {},
+                        enabled = false,
+                        modifier = Modifier.fillMaxWidth().height(44.dp),
+                        shape = RoundedCornerShape(8.dp),
+                    ) {
+                        Text("Revoke/reset coming next", fontSize = 13.sp, fontWeight = FontWeight.Medium, color = TextDim)
+                    }
                 }
             }
             InviteSlotState.REVOKED -> {
@@ -501,3 +586,9 @@ private fun InviteSlotState.displayText(): String = when (this) {
     InviteSlotState.CLAIMED -> "Claimed"
     InviteSlotState.REVOKED -> "Revoked"
 }
+
+private fun Long.formatInviteTime(): String =
+    DateFormat.getDateTimeInstance(DateFormat.MEDIUM, DateFormat.SHORT).format(Date(this))
+
+private fun String.prefixForInviteCard(): String =
+    take(8).takeIf { it.isNotBlank() } ?: "N/A"
