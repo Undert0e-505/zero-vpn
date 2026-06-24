@@ -12,13 +12,16 @@ import java.io.File
 class InviteHandshakeChecker(
     private val context: Context,
 ) {
-    suspend fun queryLatestHandshakes(exit: ConfiguredExit): HandshakeQueryResult =
+    suspend fun queryLatestHandshakes(
+        exit: ConfiguredExit,
+        sshPrivateKey: String,
+    ): HandshakeQueryResult =
         withContext(Dispatchers.IO) {
             val host = exit.publicIp.takeIf { it.isNotBlank() }
                 ?: return@withContext HandshakeQueryResult.MissingSshCredentials
             val username = exit.sshUsername?.takeIf { it.isNotBlank() }
                 ?: return@withContext HandshakeQueryResult.MissingSshCredentials
-            val privateKey = exit.sshPrivateKey?.takeIf { it.isNotBlank() }
+            val privateKey = sshPrivateKey.takeIf { it.isNotBlank() }
                 ?: return@withContext HandshakeQueryResult.MissingSshCredentials
 
             val keyFile = File(context.cacheDir, "zerovpn_friend_claim_${System.currentTimeMillis()}.key")

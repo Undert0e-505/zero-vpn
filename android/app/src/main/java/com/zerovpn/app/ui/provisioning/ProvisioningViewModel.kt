@@ -16,9 +16,11 @@ import com.zerovpn.app.friends.ParsedWireGuardInvite
 import com.zerovpn.app.friends.SharedExitProviderType
 import com.zerovpn.app.friends.SharedExitProfile
 import com.zerovpn.app.friends.SharedExitSource
+import com.zerovpn.app.friends.sha256
 import com.zerovpn.app.oci.OciProvisioner
 import com.zerovpn.app.oci.OciRegion
 import com.zerovpn.app.oci.OciRegions
+import com.zerovpn.app.storage.SecureSecretStore
 import com.zerovpn.app.vpn.ConfiguredExit
 import com.zerovpn.app.vpn.ExitLifecycleState
 import com.zerovpn.app.vpn.ExitProvider
@@ -70,7 +72,7 @@ class ProvisioningViewModel : ViewModel() {
     data class SshDebugInfo(
         val publicIp: String,
         val username: String,
-        val privateKey: String,
+        val privateKeyPresent: Boolean,
     ) {
         val windowsSshCommand: String
             get() = "ssh -i C:\\ssh-keys\\zerovpn_current_vm_key $username@$publicIp"
@@ -111,12 +113,14 @@ class ProvisioningViewModel : ViewModel() {
 
     // State persistence
     private lateinit var prefs: SharedPreferences
+    private lateinit var secretStore: SecureSecretStore
     private var friendsRepository: FriendsRepository? = null
     private var prefsLoaded = false
 
     fun initPrefs(context: Context) {
         if (prefsLoaded) return
         prefs = context.getSharedPreferences("zerovpn_provisioning", Context.MODE_PRIVATE)
+        secretStore = SecureSecretStore(context)
         friendsRepository = FriendsRepository(prefs)
         loadPersistedState()
         loadFriendsState()
@@ -125,8 +129,38 @@ class ProvisioningViewModel : ViewModel() {
 
     private fun loadFriendsState() {
         val repository = friendsRepository ?: return
-        _inviteSlots.value = repository.listInviteSlots()
-        _sharedExitProfiles.value = repository.listSharedExits()
+        var slots = repository.listInviteSlots()
+        slots.forEach { slot ->
+            val legacyConfig = slot.encryptedClientConfig?.takeIf { it.isNotBlank() }
+            if (legacyConfig != null && slot.clientConfigSecretKey.isNullOrBlank()) {
+                val key = SecureSecretStore.inviteClientConfig(slot.slotId)
+                secretStore.putSecret(key, legacyConfig)
+                slots = repository.upsertInviteSlot(
+                    slot.copy(
+                        clientConfigSecretKey = key,
+                        encryptedClientConfig = null,
+                        encryptedClientPrivateKey = null,
+                    ),
+                )
+            }
+        }
+        var profiles = repository.listSharedExits()
+        profiles.forEach { profile ->
+            val legacyConfig = profile.encryptedWireGuardConfig?.takeIf { it.isNotBlank() }
+            if (legacyConfig != null && profile.wireGuardConfigSecretKey.isNullOrBlank()) {
+                val key = SecureSecretStore.sharedWireGuardConfig(profile.id)
+                secretStore.putSecret(key, legacyConfig)
+                profiles = repository.addSharedExit(
+                    profile.copy(
+                        wireGuardConfigSecretKey = key,
+                        configHash = profile.configHash ?: legacyConfig.sha256(),
+                        encryptedWireGuardConfig = null,
+                    ),
+                )
+            }
+        }
+        _inviteSlots.value = slots
+        _sharedExitProfiles.value = profiles
     }
 
     private fun loadPersistedState() {
@@ -239,7 +273,6 @@ class ProvisioningViewModel : ViewModel() {
             apiKeyFingerprint?.let { putString("api_key_fingerprint", it) }
             _publicIp.value?.let { putString("public_ip", it) }
             putInt("wireguard_port", _wireGuardPort.value)
-            clientConfig?.let { putString("wireguard_client_config", it) }
             wireGuardClientPublicKey?.let { putString("wireguard_client_public_key", it) }
             wireGuardServerPublicKey?.let { putString("wireguard_server_public_key", it) }
             wireGuardServerPeerPublicKey?.let { putString("wireguard_server_peer_public_key", it) }
@@ -391,11 +424,11 @@ class ProvisioningViewModel : ViewModel() {
             apiKeyUserOcid = selected.apiKeyUserOcid
             apiKeyTenancyOcid = selected.apiKeyTenancyOcid
             apiKeyFingerprint = selected.apiKeyFingerprint
-            _sshDebugInfo.value = selected.sshPrivateKey?.let {
+            _sshDebugInfo.value = selected.sshPrivateKeySecretKey?.takeIf { secretStore.hasSecret(it) }?.let {
                 SshDebugInfo(
                     publicIp = selected.publicIp,
                     username = selected.sshUsername ?: "ubuntu",
-                    privateKey = it,
+                    privateKeyPresent = true,
                 )
             }
         }
@@ -430,6 +463,29 @@ class ProvisioningViewModel : ViewModel() {
             .filter { it.ownerExitId == ownerExitId && it.state == InviteSlotState.PENDING_CLAIM }
             .sortedBy { it.slotIndex }
 
+    fun getInviteSlotClientConfig(slotId: String): String? {
+        val slot = _inviteSlots.value.firstOrNull { it.slotId == slotId } ?: return null
+        return slot.clientConfigSecretKey?.let { secretStore.getSecret(it) }
+            ?: slot.encryptedClientConfig?.takeIf { it.isNotBlank() }
+    }
+
+    fun hasInviteSlotPrivateMaterial(slot: InviteSlot): Boolean =
+        slot.clientConfigSecretKey?.let { secretStore.hasSecret(it) } == true ||
+            !slot.encryptedClientConfig.isNullOrBlank() ||
+            !slot.encryptedClientPrivateKey.isNullOrBlank()
+
+    fun hasExitWireGuardConfig(exit: ConfiguredExit): Boolean =
+        exit.wireGuardConfigSecretKey?.let { secretStore.hasSecret(it) } == true ||
+            exit.wireGuardConfig.isNotBlank()
+
+    fun hasExitSshPrivateKey(exit: ConfiguredExit): Boolean =
+        exit.sshPrivateKeySecretKey?.let { secretStore.hasSecret(it) } == true ||
+            !exit.sshPrivateKey.isNullOrBlank()
+
+    fun hasSharedExitConfig(profile: SharedExitProfile): Boolean =
+        profile.wireGuardConfigSecretKey?.let { secretStore.hasSecret(it) } == true ||
+            !profile.encryptedWireGuardConfig.isNullOrBlank()
+
     fun upsertInviteSlot(slot: InviteSlot) {
         friendsRepository?.let { repository ->
             _inviteSlots.value = repository.upsertInviteSlot(slot)
@@ -461,6 +517,9 @@ class ProvisioningViewModel : ViewModel() {
     }
 
     fun clearBurnedPrivateMaterial(slotId: String) {
+        _inviteSlots.value.firstOrNull { it.slotId == slotId }?.clientConfigSecretKey?.let {
+            secretStore.removeSecret(it)
+        }
         friendsRepository?.let { repository ->
             _inviteSlots.value = repository.clearBurnedPrivateMaterial(slotId)
         }
@@ -496,8 +555,15 @@ class ProvisioningViewModel : ViewModel() {
             onComplete(InviteClaimCheckResult.Error("The owner exit for this invite was not found."))
             return
         }
+        val sshPrivateKey = ownerExit.sshPrivateKeySecretKey
+            ?.let { secretStore.getSecret(it) }
+            ?: ownerExit.sshPrivateKey
+        if (sshPrivateKey.isNullOrBlank()) {
+            onComplete(InviteClaimCheckResult.Error("Owner key is missing for this exit. Recreate the exit or use a future recovery flow."))
+            return
+        }
         viewModelScope.launch {
-            when (val result = InviteHandshakeChecker(context.applicationContext).queryLatestHandshakes(ownerExit)) {
+            when (val result = InviteHandshakeChecker(context.applicationContext).queryLatestHandshakes(ownerExit, sshPrivateKey)) {
                 is HandshakeQueryResult.MissingSshCredentials -> {
                     onComplete(
                         InviteClaimCheckResult.Error(
@@ -524,6 +590,7 @@ class ProvisioningViewModel : ViewModel() {
                         return@launch
                     }
                     val handshakeAt = latestHandshakeSeconds * 1000L
+                    slot.clientConfigSecretKey?.let { secretStore.removeSecret(it) }
                     friendsRepository?.let { repository ->
                         _inviteSlots.value = repository.markInviteSlotClaimed(
                             slotId = slot.slotId,
@@ -562,24 +629,27 @@ class ProvisioningViewModel : ViewModel() {
     }
 
     fun hasImportedSharedExit(invite: ParsedWireGuardInvite): Boolean =
-        _configuredExits.value.any { exit ->
-            exit.provider == ExitProvider.SHARED_WIREGUARD &&
-                exit.wireGuardConfig.trim() == invite.rawConfig.trim()
-        }
+        _sharedExitProfiles.value.any { profile -> profile.configHash == invite.configHash } ||
+            _configuredExits.value.any { exit ->
+                exit.provider == ExitProvider.SHARED_WIREGUARD &&
+                    exit.wireGuardConfig.trim() == invite.rawConfig.trim()
+            }
 
     fun importSharedExit(invite: ParsedWireGuardInvite, displayName: String): ConfiguredExit? {
         if (hasImportedSharedExit(invite)) return null
         val now = System.currentTimeMillis()
         val profileId = "shared:${UUID.randomUUID()}"
         val name = displayName.trim().ifBlank { "Shared Exit" }
+        val secretKey = SecureSecretStore.sharedWireGuardConfig(profileId)
+        secretStore.putSecret(secretKey, invite.rawConfig)
         val profile = SharedExitProfile(
             id = profileId,
             displayName = name,
             source = SharedExitSource.IMPORTED_QR,
             providerType = SharedExitProviderType.SHARED_WIREGUARD,
-            // Stored using existing app persistence in this spike; migrate to encrypted
-            // storage before public release.
-            encryptedWireGuardConfig = invite.rawConfig,
+            wireGuardConfigSecretKey = secretKey,
+            configHash = invite.configHash,
+            encryptedWireGuardConfig = null,
             endpointHost = invite.endpointHost,
             endpointIp = invite.endpointHost,
             importedAt = now,
@@ -592,6 +662,7 @@ class ProvisioningViewModel : ViewModel() {
             wireGuardPort = invite.endpointPort,
             region = "Shared Exit",
             wireGuardConfig = invite.rawConfig,
+            wireGuardConfigSecretKey = secretKey,
             provider = ExitProvider.SHARED_WIREGUARD,
             endpointHost = invite.endpointHost,
             endpointPort = invite.endpointPort,
@@ -626,6 +697,12 @@ class ProvisioningViewModel : ViewModel() {
     }
 
     fun removeSharedExitProfile(profileId: String) {
+        _sharedExitProfiles.value.firstOrNull { it.id == profileId }?.wireGuardConfigSecretKey?.let {
+            secretStore.removeSecret(it)
+        }
+        _configuredExits.value.firstOrNull { it.id == profileId }?.wireGuardConfigSecretKey?.let {
+            secretStore.removeSecret(it)
+        }
         friendsRepository?.let { repository ->
             _sharedExitProfiles.value = repository.removeSharedExit(profileId)
         }
@@ -675,6 +752,7 @@ class ProvisioningViewModel : ViewModel() {
     }
 
     fun removeLocalExit(exitId: String) {
+        _configuredExits.value.firstOrNull { it.id == exitId }?.let { removeLocalExitSecrets(it) }
         _configuredExits.value = _configuredExits.value.filterNot { it.id == exitId }
         if (_selectedExitId.value == exitId) {
             _selectedExitId.value = _configuredExits.value.firstOrNull()?.id
@@ -811,6 +889,7 @@ class ProvisioningViewModel : ViewModel() {
                 _currentPhase.value = null
                 _publicIp.value = null
                 targetExit?.let { removed ->
+                    removeLocalExitSecrets(removed)
                     _configuredExits.value = _configuredExits.value.filterNot { it.id == removed.id }
                     if (_selectedExitId.value == removed.id) {
                         _selectedExitId.value = _configuredExits.value.firstOrNull()?.id
@@ -1037,7 +1116,7 @@ class ProvisioningViewModel : ViewModel() {
             _sshDebugInfo.value = SshDebugInfo(
                 publicIp = result.publicIp,
                 username = result.sshUsername,
-                privateKey = result.sshPrivateKey,
+                privateKeyPresent = true,
             )
             val configuredExit = buildConfiguredExit(
                 exitId = pendingProvisionExitId ?: newExitId(),
@@ -1089,18 +1168,20 @@ class ProvisioningViewModel : ViewModel() {
         val now = System.currentTimeMillis()
         var slots = _inviteSlots.value
         inviteProfiles.sortedBy { it.slotIndex }.forEach { profile ->
+            val slotId = "$ownerExitId:friend-${profile.slotIndex}"
+            val secretKey = SecureSecretStore.inviteClientConfig(slotId)
+            secretStore.putSecret(secretKey, profile.clientConfig)
             slots = repository.upsertInviteSlot(
                 InviteSlot(
-                    slotId = "$ownerExitId:friend-${profile.slotIndex}",
+                    slotId = slotId,
                     ownerExitId = ownerExitId,
                     slotIndex = profile.slotIndex,
                     displayName = null,
                     state = InviteSlotState.UNUSED,
                     tunnelIp = profile.tunnelIp,
                     peerPublicKey = profile.clientPublicKey,
-                    // Stored using existing app persistence; migrate to encrypted storage
-                    // before public release of Friends feature.
-                    encryptedClientConfig = profile.clientConfig,
+                    clientConfigSecretKey = secretKey,
+                    encryptedClientConfig = null,
                     encryptedClientPrivateKey = null,
                     createdAt = now,
                     updatedAt = now,
@@ -1199,29 +1280,40 @@ class ProvisioningViewModel : ViewModel() {
         sshUsername: String?,
         sshPrivateKey: String?,
         createdAt: Long,
-    ): ConfiguredExit = ConfiguredExit(
-        id = exitId,
-        name = name,
-        publicIp = publicIp,
-        wireGuardPort = wireGuardPort,
-        region = region,
-        wireGuardConfig = wireGuardConfig,
-        provider = ExitProvider.OCI,
-        endpointHost = publicIp,
-        endpointPort = wireGuardPort,
-        instanceId = resourceIds?.instanceId,
-        sshUsername = sshUsername,
-        sshPrivateKey = sshPrivateKey,
-        apiKeyUserOcid = apiKeyUserOcid,
-        apiKeyTenancyOcid = apiKeyTenancyOcid,
-        apiKeyFingerprint = apiKeyFingerprint,
-        lifecycleState = ExitLifecycleState.READY,
-        createdAt = createdAt,
-        ociResourceIds = resourceIds?.toConfiguredResourceIds(),
-        serverPublicKey = wireGuardServerPublicKey ?: parseWireGuardValue(wireGuardConfig, "Peer", "PublicKey"),
-        serverPeerPublicKey = wireGuardServerPeerPublicKey ?: wireGuardClientPublicKey,
-        clientPublicKey = wireGuardClientPublicKey,
-    )
+    ): ConfiguredExit {
+        val wireGuardSecretKey = SecureSecretStore.oracleOwnerWireGuardConfig(exitId)
+        if (wireGuardConfig.isNotBlank()) {
+            secretStore.putSecret(wireGuardSecretKey, wireGuardConfig)
+        }
+        val sshSecretKey = sshPrivateKey?.takeIf { it.isNotBlank() }?.let {
+            SecureSecretStore.oracleSshPrivateKey(exitId).also { key -> secretStore.putSecret(key, it) }
+        }
+        return ConfiguredExit(
+            id = exitId,
+            name = name,
+            publicIp = publicIp,
+            wireGuardPort = wireGuardPort,
+            region = region,
+            wireGuardConfig = wireGuardConfig,
+            wireGuardConfigSecretKey = wireGuardSecretKey,
+            provider = ExitProvider.OCI,
+            endpointHost = publicIp,
+            endpointPort = wireGuardPort,
+            instanceId = resourceIds?.instanceId,
+            sshUsername = sshUsername,
+            sshPrivateKeySecretKey = sshSecretKey,
+            sshPrivateKey = sshPrivateKey,
+            apiKeyUserOcid = apiKeyUserOcid,
+            apiKeyTenancyOcid = apiKeyTenancyOcid,
+            apiKeyFingerprint = apiKeyFingerprint,
+            lifecycleState = ExitLifecycleState.READY,
+            createdAt = createdAt,
+            ociResourceIds = resourceIds?.toConfiguredResourceIds(),
+            serverPublicKey = wireGuardServerPublicKey ?: parseWireGuardValue(wireGuardConfig, "Peer", "PublicKey"),
+            serverPeerPublicKey = wireGuardServerPeerPublicKey ?: wireGuardClientPublicKey,
+            clientPublicKey = wireGuardClientPublicKey,
+        )
+    }
 
     private fun parseWireGuardValue(config: String, sectionName: String, key: String): String? {
         val start = config.indexOf("[$sectionName]")
@@ -1260,6 +1352,15 @@ class ProvisioningViewModel : ViewModel() {
             if (exit.id == exitId) transform(exit) else exit
         }
         persistState()
+    }
+
+    private fun removeLocalExitSecrets(exit: ConfiguredExit) {
+        exit.wireGuardConfigSecretKey?.let { secretStore.removeSecret(it) }
+        exit.sshPrivateKeySecretKey?.let { secretStore.removeSecret(it) }
+        _inviteSlots.value
+            .filter { it.ownerExitId == exit.id }
+            .mapNotNull { it.clientConfigSecretKey }
+            .forEach { secretStore.removeSecret(it) }
     }
 
     private fun nextExitName(): String {
@@ -1302,12 +1403,14 @@ class ProvisioningViewModel : ViewModel() {
         .put("publicIp", publicIp)
         .put("wireGuardPort", wireGuardPort)
         .put("region", region)
-        .put("wireGuardConfig", wireGuardConfig)
+        .put("wireGuardConfig", JSONObject.NULL)
+        .put("wireGuardConfigSecretKey", wireGuardConfigSecretKey)
         .put("endpointHost", endpointHost)
         .put("endpointPort", endpointPort)
         .put("compartmentId", compartmentId)
         .put("instanceId", instanceId)
         .put("sshUsername", sshUsername)
+        .put("sshPrivateKeySecretKey", sshPrivateKeySecretKey)
         .put("sshPrivateKey", JSONObject.NULL)
         .put("apiKeyUserOcid", apiKeyUserOcid)
         .put("apiKeyTenancyOcid", apiKeyTenancyOcid)
@@ -1334,21 +1437,49 @@ class ProvisioningViewModel : ViewModel() {
         .put("instanceId", instanceId)
 
     private fun JSONObject.toConfiguredExit(): ConfiguredExit {
+        val exitId = getString("id")
+        val provider = runCatching {
+            ExitProvider.valueOf(optString("provider", ExitProvider.OCI.name))
+        }.getOrDefault(ExitProvider.OCI)
+        val legacyWireGuardConfig = optNullableString("wireGuardConfig")
+        val storedWireGuardSecretKey = optNullableString("wireGuardConfigSecretKey")
+        val wireGuardSecretKey = storedWireGuardSecretKey
+            ?: legacyWireGuardConfig?.takeIf { it.isNotBlank() }?.let {
+                if (provider == ExitProvider.SHARED_WIREGUARD) {
+                    SecureSecretStore.sharedWireGuardConfig(exitId)
+                } else {
+                    SecureSecretStore.oracleOwnerWireGuardConfig(exitId)
+                }
+            }
+        if (legacyWireGuardConfig != null && storedWireGuardSecretKey == null && wireGuardSecretKey != null) {
+            secretStore.putSecret(wireGuardSecretKey, legacyWireGuardConfig)
+        }
+        val legacySshPrivateKey = optNullableString("sshPrivateKey")
+        val storedSshSecretKey = optNullableString("sshPrivateKeySecretKey")
+        val sshSecretKey = storedSshSecretKey
+            ?: legacySshPrivateKey?.takeIf { it.isNotBlank() }?.let {
+                SecureSecretStore.oracleSshPrivateKey(exitId)
+            }
+        if (legacySshPrivateKey != null && storedSshSecretKey == null && sshSecretKey != null) {
+            secretStore.putSecret(sshSecretKey, legacySshPrivateKey)
+        }
         val resourceJson = optJSONObject("ociResourceIds")
         return ConfiguredExit(
-            id = getString("id"),
+            id = exitId,
             name = optString("name").takeIf { it.isNotBlank() } ?: "Exit 1",
-            provider = runCatching { ExitProvider.valueOf(optString("provider", ExitProvider.OCI.name)) }.getOrDefault(ExitProvider.OCI),
+            provider = provider,
             publicIp = getString("publicIp"),
             wireGuardPort = optInt("wireGuardPort", 51820),
             region = optString("region", LEGACY_REGION_FALLBACK),
-            wireGuardConfig = getString("wireGuardConfig"),
+            wireGuardConfig = wireGuardSecretKey?.let { secretStore.getSecret(it) }.orEmpty(),
+            wireGuardConfigSecretKey = wireGuardSecretKey,
             endpointHost = optString("endpointHost").takeIf { it.isNotBlank() } ?: getString("publicIp"),
             endpointPort = optInt("endpointPort", optInt("wireGuardPort", 51820)),
             compartmentId = optNullableString("compartmentId"),
             instanceId = optNullableString("instanceId"),
             sshUsername = optNullableString("sshUsername"),
-            sshPrivateKey = optNullableString("sshPrivateKey"),
+            sshPrivateKeySecretKey = sshSecretKey,
+            sshPrivateKey = sshSecretKey?.let { secretStore.getSecret(it) },
             apiKeyUserOcid = optNullableString("apiKeyUserOcid"),
             apiKeyTenancyOcid = optNullableString("apiKeyTenancyOcid"),
             apiKeyFingerprint = optNullableString("apiKeyFingerprint"),

@@ -170,6 +170,11 @@ fun DiagnosticsScreen(
             FriendsShareDebugCard(
                 inviteSlots = inviteSlots,
                 sharedExitProfiles = sharedExitProfiles,
+                exits = exits,
+                hasInviteMaterial = provisioningViewModel::hasInviteSlotPrivateMaterial,
+                hasSharedConfig = provisioningViewModel::hasSharedExitConfig,
+                hasExitWireGuardConfig = provisioningViewModel::hasExitWireGuardConfig,
+                hasExitSshPrivateKey = provisioningViewModel::hasExitSshPrivateKey,
             )
             if (BuildConfig.VOLUNTEER_DEBUG_ENABLED) {
                 Spacer(modifier = Modifier.height(12.dp))
@@ -207,11 +212,6 @@ fun DiagnosticsScreen(
             Spacer(modifier = Modifier.height(12.dp))
             SshDebugCard(
                 sshDebugInfo = sshDebugInfo,
-                onCopyPrivateKey = {
-                    sshDebugInfo?.privateKey?.let { key ->
-                        copyToClipboard(context, "ZeroVPN VM SSH private key", key)
-                    }
-                },
                 onCopyCommand = {
                     sshDebugInfo?.windowsSshCommand?.let { command ->
                         copyToClipboard(context, "ZeroVPN VM SSH command", command)
@@ -226,6 +226,11 @@ fun DiagnosticsScreen(
 private fun FriendsShareDebugCard(
     inviteSlots: List<InviteSlot>,
     sharedExitProfiles: List<SharedExitProfile>,
+    exits: List<com.zerovpn.app.vpn.ConfiguredExit>,
+    hasInviteMaterial: (InviteSlot) -> Boolean,
+    hasSharedConfig: (SharedExitProfile) -> Boolean,
+    hasExitWireGuardConfig: (com.zerovpn.app.vpn.ConfiguredExit) -> Boolean,
+    hasExitSshPrivateKey: (com.zerovpn.app.vpn.ConfiguredExit) -> Boolean,
 ) {
     Column(
         modifier = Modifier
@@ -257,7 +262,21 @@ private fun FriendsShareDebugCard(
                         "ip=${slot.tunnelIp ?: "N/A"} peer=${slot.peerPublicKey.prefixForDiagnostics()} " +
                         "firstHandshakeAt=${slot.firstHandshakeAt.formatDebugTime()} " +
                         "lastHandshakeAt=${slot.lastHandshakeAt.formatDebugTime()} " +
-                        "privateShareMaterialPresent=${slot.privateShareMaterialPresentText()}"
+                        "secretKey=${slot.clientConfigSecretKey ?: "N/A"} " +
+                        "privateShareMaterialPresent=${if (hasInviteMaterial(slot)) "yes" else "no"}"
+                }
+                .ifBlank { "N/A" },
+        )
+        DebugBlock(
+            "Owner exit secrets",
+            exits
+                .filter { it.provider == com.zerovpn.app.vpn.ExitProvider.OCI }
+                .sortedBy { it.createdAt }
+                .joinToString("\n") { exit ->
+                    "id=${exit.id} name=${exit.name} wgSecretKey=${exit.wireGuardConfigSecretKey ?: "N/A"} " +
+                        "ownerWireGuardConfigPresent=${if (hasExitWireGuardConfig(exit)) "yes" else "no"} " +
+                        "sshSecretKey=${exit.sshPrivateKeySecretKey ?: "N/A"} " +
+                        "sshPrivateKeyPresent=${if (hasExitSshPrivateKey(exit)) "yes" else "no"}"
                 }
                 .ifBlank { "N/A" },
         )
@@ -268,6 +287,8 @@ private fun FriendsShareDebugCard(
                 .joinToString("\n") { profile ->
                     "id=${profile.id} name=${profile.displayName} source=${profile.source.name} " +
                         "provider=${profile.providerType.name} endpoint=${profile.endpointHost ?: "N/A"} " +
+                        "secretKey=${profile.wireGuardConfigSecretKey ?: "N/A"} " +
+                        "configPresent=${if (hasSharedConfig(profile)) "yes" else "no"} " +
                         "importedAt=${profile.importedAt.formatDebugTime()}"
                 }
                 .ifBlank { "N/A" },
@@ -603,7 +624,6 @@ private fun ProviderSwitchDebugCard(
 @Composable
 private fun SshDebugCard(
     sshDebugInfo: ProvisioningViewModel.SshDebugInfo?,
-    onCopyPrivateKey: () -> Unit,
     onCopyCommand: () -> Unit,
 ) {
     Column(
@@ -620,16 +640,16 @@ private fun SshDebugCard(
             color = Danger,
         )
         Text(
-            text = "Temporary debug only. Anyone with this key can SSH into this VM. Destroy this node after debugging.",
+            text = "Developer metadata only. The SSH private key is not displayed or copied.",
             fontSize = 13.sp,
             fontWeight = FontWeight.SemiBold,
-            color = Danger,
+            color = TextDim,
             lineHeight = 18.sp,
         )
 
         if (sshDebugInfo == null) {
             Text(
-                text = "No generated VM SSH private key is available in memory. Provision a node in this app session, then return here.",
+                text = "No SSH metadata is available for the selected exit.",
                 fontSize = 13.sp,
                 color = TextDim,
                 lineHeight = 18.sp,
@@ -639,26 +659,16 @@ private fun SshDebugCard(
 
         DebugValue("VM IP", sshDebugInfo.publicIp)
         DebugValue("SSH user", sshDebugInfo.username)
+        DebugValue("SSH key present", if (sshDebugInfo.privateKeyPresent) "yes" else "no")
         DebugBlock("SSH command", sshDebugInfo.windowsSshCommand)
-        DebugBlock("Private key", sshDebugInfo.privateKey)
 
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(12.dp),
         ) {
-            Button(
-                onClick = onCopyPrivateKey,
-                modifier = Modifier.weight(1f),
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = Danger,
-                    contentColor = Bg,
-                ),
-            ) {
-                Text("Copy Key", fontSize = 13.sp, fontWeight = FontWeight.Bold)
-            }
             OutlinedButton(
                 onClick = onCopyCommand,
-                modifier = Modifier.weight(1f),
+                modifier = Modifier.fillMaxWidth(),
                 colors = ButtonDefaults.outlinedButtonColors(
                     contentColor = TextPrimary,
                 ),
@@ -674,9 +684,6 @@ private fun Long?.formatDebugTime(): String =
 
 private fun String?.prefixForDiagnostics(): String =
     this?.take(8)?.takeIf { it.isNotBlank() } ?: "N/A"
-
-private fun InviteSlot.privateShareMaterialPresentText(): String =
-    if (!encryptedClientConfig.isNullOrBlank() || !encryptedClientPrivateKey.isNullOrBlank()) "yes" else "no"
 
 @Composable
 private fun DebugValue(label: String, value: String) {
