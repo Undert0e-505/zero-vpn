@@ -140,6 +140,12 @@ class FriendsRepository(
         return profiles.sortedBy { it.importedAt }
     }
 
+    fun removeInviteSlotsForOwnerExit(ownerExitId: String): List<InviteSlot> {
+        val slots = loadInviteSlots().filterNot { it.ownerExitId == ownerExitId }
+        saveInviteSlots(slots)
+        return slots.sortedWith(inviteSlotSort)
+    }
+
     private fun updateInviteSlot(slotId: String, transform: (InviteSlot) -> InviteSlot): List<InviteSlot> {
         val slots = loadInviteSlots().map { slot ->
             if (slot.slotId == slotId) transform(slot) else slot

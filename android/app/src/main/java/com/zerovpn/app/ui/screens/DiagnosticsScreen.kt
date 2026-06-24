@@ -250,9 +250,25 @@ private fun FriendsShareDebugCard(
             color = TextDim,
             lineHeight = 18.sp,
         )
+        DebugValue("Configured exit count", exits.size.toString())
+        DebugValue("Owner Oracle exit count", exits.count { it.provider == com.zerovpn.app.vpn.ExitProvider.OCI }.toString())
+        DebugValue(
+            "Imported shared exit count",
+            exits.count { it.provider == com.zerovpn.app.vpn.ExitProvider.SHARED_WIREGUARD }.toString(),
+        )
         DebugValue("Invite slot count", inviteSlots.size.toString())
         DebugValue("Owner exit count with slots", inviteSlots.map { it.ownerExitId }.distinct().size.toString())
         DebugValue("Shared exit profile count", sharedExitProfiles.size.toString())
+        DebugBlock(
+            "Invite slots by owner",
+            inviteSlots
+                .groupingBy { it.ownerExitId }
+                .eachCount()
+                .entries
+                .sortedBy { it.key }
+                .joinToString("\n") { "owner=${it.key} slots=${it.value}" }
+                .ifBlank { "N/A" },
+        )
         DebugBlock(
             "Invite slot states",
             inviteSlots

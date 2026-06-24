@@ -200,12 +200,7 @@ class ProvisioningViewModel : ViewModel() {
             wireGuardServerPublicKey = selected.serverPublicKey
             wireGuardServerPeerPublicKey = selected.serverPeerPublicKey
             resourceIds = selected.ociResourceIds?.toProvisionerResourceIds()
-            _state.value = ProvisioningState.Success(
-                publicIp = selected.publicIp,
-                wireGuardPort = selected.wireGuardPort,
-                region = selected.region,
-                isDevMode = _isDevMode.value,
-            )
+            _state.value = ProvisioningState.Idle
             persistState()
             return
         }
@@ -238,12 +233,7 @@ class ProvisioningViewModel : ViewModel() {
                     _configuredExits.value = listOf(exit)
                     _selectedExitId.value = exit.id
                 }
-                _state.value = ProvisioningState.Success(
-                    publicIp = savedIp,
-                    wireGuardPort = savedPort,
-                    region = homeRegion ?: LEGACY_REGION_FALLBACK,
-                    isDevMode = _isDevMode.value,
-                )
+                _state.value = ProvisioningState.Idle
             }
             // Don't restore Running state — if we were mid-provision, user needs to retry
         }
@@ -834,13 +824,20 @@ class ProvisioningViewModel : ViewModel() {
     }
 
     fun removeLocalExit(exitId: String) {
-        _configuredExits.value.firstOrNull { it.id == exitId }?.let { removeLocalExitSecrets(it) }
+        _configuredExits.value.firstOrNull { it.id == exitId }?.let { cleanupOwnerExitLocalState(it) }
         _configuredExits.value = _configuredExits.value.filterNot { it.id == exitId }
         if (_selectedExitId.value == exitId) {
             _selectedExitId.value = _configuredExits.value.firstOrNull()?.id
         }
         restoreStateFromSelectedExitOrIdle()
         persistState()
+    }
+
+    fun clearTransientProvisioningSuccess() {
+        if (_state.value is ProvisioningState.Success || _state.value is ProvisioningState.Destroyed) {
+            restoreStateFromSelectedExitOrIdle()
+            persistState()
+        }
     }
 
     fun startProvisioning(context: Context) {
@@ -971,7 +968,7 @@ class ProvisioningViewModel : ViewModel() {
                 _currentPhase.value = null
                 _publicIp.value = null
                 targetExit?.let { removed ->
-                    removeLocalExitSecrets(removed)
+                    cleanupOwnerExitLocalState(removed)
                     _configuredExits.value = _configuredExits.value.filterNot { it.id == removed.id }
                     if (_selectedExitId.value == removed.id) {
                         _selectedExitId.value = _configuredExits.value.firstOrNull()?.id
@@ -1421,12 +1418,7 @@ class ProvisioningViewModel : ViewModel() {
         _selectedExitId.value = selected.id
         _publicIp.value = selected.publicIp
         _wireGuardPort.value = selected.wireGuardPort
-        _state.value = ProvisioningState.Success(
-            publicIp = selected.publicIp,
-            wireGuardPort = selected.wireGuardPort,
-            region = selected.region,
-            isDevMode = _isDevMode.value,
-        )
+        _state.value = ProvisioningState.Idle
     }
 
     private fun updateExit(exitId: String, transform: (ConfiguredExit) -> ConfiguredExit) {
@@ -1436,13 +1428,16 @@ class ProvisioningViewModel : ViewModel() {
         persistState()
     }
 
-    private fun removeLocalExitSecrets(exit: ConfiguredExit) {
+    private fun cleanupOwnerExitLocalState(exit: ConfiguredExit) {
         exit.wireGuardConfigSecretKey?.let { secretStore.removeSecret(it) }
         exit.sshPrivateKeySecretKey?.let { secretStore.removeSecret(it) }
         _inviteSlots.value
             .filter { it.ownerExitId == exit.id }
             .mapNotNull { it.clientConfigSecretKey }
             .forEach { secretStore.removeSecret(it) }
+        friendsRepository?.let { repository ->
+            _inviteSlots.value = repository.removeInviteSlotsForOwnerExit(exit.id)
+        }
     }
 
     private fun nextExitName(): String {
