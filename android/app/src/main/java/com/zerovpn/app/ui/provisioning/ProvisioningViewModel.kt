@@ -7,6 +7,10 @@ import android.net.Uri
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.browser.customtabs.CustomTabsIntent
+import com.zerovpn.app.friends.FriendsRepository
+import com.zerovpn.app.friends.InviteSlot
+import com.zerovpn.app.friends.InviteSlotState
+import com.zerovpn.app.friends.SharedExitProfile
 import com.zerovpn.app.oci.OciProvisioner
 import com.zerovpn.app.oci.OciRegion
 import com.zerovpn.app.oci.OciRegions
@@ -73,6 +77,12 @@ class ProvisioningViewModel : ViewModel() {
     private val _providerSwitchDiagnostics = MutableStateFlow(ProviderSwitchDiagnostics())
     val providerSwitchDiagnostics: StateFlow<ProviderSwitchDiagnostics> = _providerSwitchDiagnostics.asStateFlow()
 
+    private val _inviteSlots = MutableStateFlow<List<InviteSlot>>(emptyList())
+    val inviteSlots: StateFlow<List<InviteSlot>> = _inviteSlots.asStateFlow()
+
+    private val _sharedExitProfiles = MutableStateFlow<List<SharedExitProfile>>(emptyList())
+    val sharedExitProfiles: StateFlow<List<SharedExitProfile>> = _sharedExitProfiles.asStateFlow()
+
     private var provisioner: OciProvisioner? = null
     private var authResult: OciProvisioner.AuthResult? = null
     private var preflightResult: OciProvisioner.PreflightResult? = null
@@ -90,13 +100,22 @@ class ProvisioningViewModel : ViewModel() {
 
     // State persistence
     private lateinit var prefs: SharedPreferences
+    private var friendsRepository: FriendsRepository? = null
     private var prefsLoaded = false
 
     fun initPrefs(context: Context) {
         if (prefsLoaded) return
         prefs = context.getSharedPreferences("zerovpn_provisioning", Context.MODE_PRIVATE)
+        friendsRepository = FriendsRepository(prefs)
         loadPersistedState()
+        loadFriendsState()
         prefsLoaded = true
+    }
+
+    private fun loadFriendsState() {
+        val repository = friendsRepository ?: return
+        _inviteSlots.value = repository.listInviteSlots()
+        _sharedExitProfiles.value = repository.listSharedExits()
     }
 
     private fun loadPersistedState() {
@@ -390,6 +409,69 @@ class ProvisioningViewModel : ViewModel() {
 
     fun updateProviderSwitchDiagnostics(diagnostics: ProviderSwitchDiagnostics) {
         _providerSwitchDiagnostics.value = diagnostics
+    }
+
+    fun getInviteSlotsForOwnerExit(ownerExitId: String): List<InviteSlot> =
+        _inviteSlots.value.filter { it.ownerExitId == ownerExitId }.sortedBy { it.slotIndex }
+
+    fun upsertInviteSlot(slot: InviteSlot) {
+        friendsRepository?.let { repository ->
+            _inviteSlots.value = repository.upsertInviteSlot(slot)
+        }
+    }
+
+    fun renameInviteSlot(slotId: String, name: String?) {
+        friendsRepository?.let { repository ->
+            _inviteSlots.value = repository.renameInviteSlot(slotId, name)
+        }
+    }
+
+    fun updateInviteSlotState(slotId: String, state: InviteSlotState) {
+        friendsRepository?.let { repository ->
+            _inviteSlots.value = repository.updateInviteSlotState(slotId, state)
+        }
+    }
+
+    fun markInviteSlotPending(slotId: String, qrShownAt: Long) {
+        friendsRepository?.let { repository ->
+            _inviteSlots.value = repository.markInviteSlotPending(slotId, qrShownAt)
+        }
+    }
+
+    fun markInviteSlotClaimed(slotId: String, firstHandshakeAt: Long, lastHandshakeAt: Long) {
+        friendsRepository?.let { repository ->
+            _inviteSlots.value = repository.markInviteSlotClaimed(slotId, firstHandshakeAt, lastHandshakeAt)
+        }
+    }
+
+    fun clearBurnedPrivateMaterial(slotId: String) {
+        friendsRepository?.let { repository ->
+            _inviteSlots.value = repository.clearBurnedPrivateMaterial(slotId)
+        }
+    }
+
+    fun markInviteSlotRevoked(slotId: String, revokedAt: Long) {
+        friendsRepository?.let { repository ->
+            _inviteSlots.value = repository.markInviteSlotRevoked(slotId, revokedAt)
+        }
+    }
+
+    fun addSharedExit(profile: SharedExitProfile) {
+        friendsRepository?.let { repository ->
+            _sharedExitProfiles.value = repository.addSharedExit(profile)
+        }
+    }
+
+    fun renameSharedExit(profileId: String, name: String) {
+        friendsRepository?.let { repository ->
+            _sharedExitProfiles.value = repository.renameSharedExit(profileId, name)
+        }
+    }
+
+    fun removeSharedExit(profileId: String) {
+        friendsRepository?.let { repository ->
+            _sharedExitProfiles.value = repository.removeSharedExit(profileId)
+        }
     }
 
     fun createVolunteerExit(): ConfiguredExit {
