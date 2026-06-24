@@ -30,7 +30,6 @@ fun AddExitScreen(
     onNavigateToProvision: () -> Unit,
     onNavigateToVolunteer: () -> Unit,
     onNavigateToScanInvite: () -> Unit,
-    showVolunteerDebug: Boolean,
     modifier: Modifier = Modifier,
 ) {
     var disabledMessage by remember { mutableStateOf<String?>(null) }
@@ -87,17 +86,15 @@ fun AddExitScreen(
 
         Spacer(modifier = Modifier.height(8.dp))
 
-        if (showVolunteerDebug) {
-            OptionButton(
-                icon = Icons.Default.VolunteerActivism,
-                label = "Volunteer Exit",
-                statusLabel = "Experimental",
-                supportingText = "Route traffic through the Volunteer Network. Slower, web/TCP-focused, and still under validation.",
-                onClick = onNavigateToVolunteer,
-            )
+        OptionButton(
+            icon = Icons.Default.VolunteerActivism,
+            label = "Volunteer Exit",
+            statusLabel = "Experimental",
+            supportingText = "Use an experimental no-cloud exit. Slower, web-focused, and some sites may block it.",
+            onClick = onNavigateToVolunteer,
+        )
 
-            Spacer(modifier = Modifier.height(8.dp))
-        }
+        Spacer(modifier = Modifier.height(8.dp))
 
         OptionButton(
             icon = Icons.Default.QrCodeScanner,

@@ -29,7 +29,7 @@ Bottom navigation does not restore child state. This avoids reopening transient 
 
 - Create Oracle Free Exit: starts Oracle provisioning flow.
 - Scan QR Invite: opens scanner route.
-- Volunteer Exit: visible only in Volunteer debug mode.
+- Volunteer Exit: visible in the normal Add Exit workflow and labelled experimental.
 - Import Config / Create Private Node: disabled placeholders with explanatory copy.
 
 ### Oracle Provisioning
