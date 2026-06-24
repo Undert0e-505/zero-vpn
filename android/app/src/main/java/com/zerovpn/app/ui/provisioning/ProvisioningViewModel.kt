@@ -50,6 +50,24 @@ sealed interface InviteResetResult {
     data class Error(val message: String) : InviteResetResult
 }
 
+enum class OracleOperationType {
+    NONE,
+    PROVISION,
+    DESTROY_EXIT,
+    CLEANUP_PARTIAL_EXIT,
+}
+
+data class OracleOperationDiagnostics(
+    val pendingOperation: OracleOperationType = OracleOperationType.NONE,
+    val failedOperation: OracleOperationType = OracleOperationType.NONE,
+    val targetExitId: String? = null,
+    val targetRegion: String? = null,
+    val targetInstanceIdPrefix: String? = null,
+    val targetDisplayName: String? = null,
+    val authState: String = "missing",
+    val lastError: String? = null,
+)
+
 class ProvisioningViewModel : ViewModel() {
 
     private val _events = MutableStateFlow<List<ProvisioningEvent>>(emptyList())
@@ -108,6 +126,10 @@ class ProvisioningViewModel : ViewModel() {
     private val _lastInviteOperationError = MutableStateFlow<String?>(null)
     val lastInviteOperationError: StateFlow<String?> = _lastInviteOperationError.asStateFlow()
 
+    private val _oracleOperationDiagnostics = MutableStateFlow(OracleOperationDiagnostics())
+    val oracleOperationDiagnostics: StateFlow<OracleOperationDiagnostics> =
+        _oracleOperationDiagnostics.asStateFlow()
+
     private var provisioner: OciProvisioner? = null
     private var authResult: OciProvisioner.AuthResult? = null
     private var preflightResult: OciProvisioner.PreflightResult? = null
@@ -122,12 +144,28 @@ class ProvisioningViewModel : ViewModel() {
     private var apiKeyFingerprint: String? = null
     private var pendingProvisionExitId: String? = null
     private var provisioningJob: Job? = null
+    private var pendingOracleOperation = PendingOracleOperation.None
+    private var failedOracleOperation = PendingOracleOperation.None
+    private var lastOracleOperationError: String? = null
 
     // State persistence
     private lateinit var prefs: SharedPreferences
     private lateinit var secretStore: SecureSecretStore
     private var friendsRepository: FriendsRepository? = null
     private var prefsLoaded = false
+
+    private data class PendingOracleOperation(
+        val type: OracleOperationType,
+        val exitId: String? = null,
+        val region: String? = null,
+        val instanceId: String? = null,
+        val displayName: String? = null,
+    ) {
+        companion object {
+            val None = PendingOracleOperation(OracleOperationType.NONE)
+            val Provision = PendingOracleOperation(OracleOperationType.PROVISION)
+        }
+    }
 
     fun initPrefs(context: Context) {
         if (prefsLoaded) return
@@ -191,6 +229,10 @@ class ProvisioningViewModel : ViewModel() {
         apiKeyTenancyOcid = prefs.getString("api_key_tenancy_ocid", null)
         apiKeyFingerprint = prefs.getString("api_key_fingerprint", null)
         _lastInviteOperationError.value = prefs.getString("last_invite_operation_error", null)
+        lastOracleOperationError = prefs.getString("last_oracle_operation_error", null)
+        pendingOracleOperation = loadOracleOperation("pending_oracle_operation")
+        failedOracleOperation = loadOracleOperation("failed_oracle_operation")
+        refreshOracleOperationDiagnostics()
 
         val exits = loadConfiguredExits()
         if (exits.isNotEmpty()) {
@@ -266,6 +308,17 @@ class ProvisioningViewModel : ViewModel() {
                 "resource_igw_id",
                 "resource_instance_id",
                 "last_invite_operation_error",
+                "last_oracle_operation_error",
+                "pending_oracle_operation_type",
+                "pending_oracle_operation_exit_id",
+                "pending_oracle_operation_region",
+                "pending_oracle_operation_instance_id",
+                "pending_oracle_operation_display_name",
+                "failed_oracle_operation_type",
+                "failed_oracle_operation_exit_id",
+                "failed_oracle_operation_region",
+                "failed_oracle_operation_instance_id",
+                "failed_oracle_operation_display_name",
             ).forEach { remove(it) }
             putString("state", _state.value::class.simpleName)
             putString("oracle_onboarding_state", _oracleOnboardingState.value.name)
@@ -282,6 +335,9 @@ class ProvisioningViewModel : ViewModel() {
             wireGuardServerPeerPublicKey?.let { putString("wireguard_server_peer_public_key", it) }
             _selectedExitId.value?.let { putString("selected_exit_id", it) }
             _lastInviteOperationError.value?.let { putString("last_invite_operation_error", it) }
+            lastOracleOperationError?.let { putString("last_oracle_operation_error", it) }
+            putOracleOperation("pending_oracle_operation", pendingOracleOperation)
+            putOracleOperation("failed_oracle_operation", failedOracleOperation)
             putString("configured_exits_json", serializeConfiguredExits(_configuredExits.value))
             resourceIds?.let { rids ->
                 rids.vcnId?.let { putString("resource_vcn_id", it) }
@@ -334,6 +390,83 @@ class ProvisioningViewModel : ViewModel() {
         }
     }
 
+    private fun loadOracleOperation(prefix: String): PendingOracleOperation {
+        if (!::prefs.isInitialized) return PendingOracleOperation.None
+        val type = runCatching {
+            OracleOperationType.valueOf(
+                prefs.getString("${prefix}_type", OracleOperationType.NONE.name)
+                    ?: OracleOperationType.NONE.name,
+            )
+        }.getOrDefault(OracleOperationType.NONE)
+        if (type == OracleOperationType.NONE) return PendingOracleOperation.None
+        return PendingOracleOperation(
+            type = type,
+            exitId = prefs.getString("${prefix}_exit_id", null),
+            region = prefs.getString("${prefix}_region", null),
+            instanceId = prefs.getString("${prefix}_instance_id", null),
+            displayName = prefs.getString("${prefix}_display_name", null),
+        )
+    }
+
+    private fun SharedPreferences.Editor.putOracleOperation(
+        prefix: String,
+        operation: PendingOracleOperation,
+    ) {
+        putString("${prefix}_type", operation.type.name)
+        operation.exitId?.let { putString("${prefix}_exit_id", it) }
+        operation.region?.let { putString("${prefix}_region", it) }
+        operation.instanceId?.let { putString("${prefix}_instance_id", it) }
+        operation.displayName?.let { putString("${prefix}_display_name", it) }
+    }
+
+    private fun setPendingOracleOperation(operation: PendingOracleOperation) {
+        pendingOracleOperation = operation
+        failedOracleOperation = PendingOracleOperation.None
+        lastOracleOperationError = null
+        refreshOracleOperationDiagnostics()
+    }
+
+    private fun setFailedOracleOperation(operation: PendingOracleOperation, error: String?) {
+        pendingOracleOperation = PendingOracleOperation.None
+        failedOracleOperation = operation
+        lastOracleOperationError = error?.sanitizeInviteDiagnostic()
+        refreshOracleOperationDiagnostics()
+    }
+
+    private fun clearOracleOperationState() {
+        pendingOracleOperation = PendingOracleOperation.None
+        failedOracleOperation = PendingOracleOperation.None
+        lastOracleOperationError = null
+        refreshOracleOperationDiagnostics()
+    }
+
+    private fun refreshOracleOperationDiagnostics() {
+        val operation = when {
+            pendingOracleOperation.type != OracleOperationType.NONE -> pendingOracleOperation
+            failedOracleOperation.type != OracleOperationType.NONE -> failedOracleOperation
+            else -> PendingOracleOperation.None
+        }
+        _oracleOperationDiagnostics.value = OracleOperationDiagnostics(
+            pendingOperation = pendingOracleOperation.type,
+            failedOperation = failedOracleOperation.type,
+            targetExitId = operation.exitId,
+            targetRegion = operation.region,
+            targetInstanceIdPrefix = operation.instanceId.safeOcidPrefix(),
+            targetDisplayName = operation.displayName,
+            authState = if (authResult == null) "missing" else "present",
+            lastError = lastOracleOperationError,
+        )
+    }
+
+    private fun ConfiguredExit.toDestroyOperation(): PendingOracleOperation =
+        PendingOracleOperation(
+            type = OracleOperationType.DESTROY_EXIT,
+            exitId = id,
+            region = region,
+            instanceId = ociResourceIds?.instanceId ?: instanceId,
+            displayName = name,
+        )
+
     fun showPreStart() {
         _state.value = ProvisioningState.PreStart
         _oracleOnboardingState.value = OracleOnboardingState.NotStarted
@@ -362,6 +495,7 @@ class ProvisioningViewModel : ViewModel() {
         apiKeyTenancyOcid = null
         apiKeyFingerprint = null
         pendingProvisionExitId = null
+        clearOracleOperationState()
         _state.value = ProvisioningState.PreStart
         _oracleOnboardingState.value = OracleOnboardingState.NotStarted
         persistState()
@@ -383,6 +517,7 @@ class ProvisioningViewModel : ViewModel() {
             _oracleOnboardingState.value == OracleOnboardingState.WaitingForAuthReturn
         ) {
             _oracleOnboardingState.value = OracleOnboardingState.AuthReturned
+            refreshOracleOperationDiagnostics()
             persistState()
         }
     }
@@ -393,6 +528,7 @@ class ProvisioningViewModel : ViewModel() {
             persistState()
         } else if (_oracleOnboardingState.value == OracleOnboardingState.AuthLaunched) {
             _oracleOnboardingState.value = OracleOnboardingState.WaitingForAuthReturn
+            refreshOracleOperationDiagnostics()
             persistState()
         }
     }
@@ -410,6 +546,7 @@ class ProvisioningViewModel : ViewModel() {
         authResult = null
         preflightResult = null
         pendingProvisionExitId = null
+        clearOracleOperationState()
         provisioningJob?.cancel()
         provisioningJob = null
         _oracleOnboardingState.value = OracleOnboardingState.NotStarted
@@ -437,6 +574,7 @@ class ProvisioningViewModel : ViewModel() {
                 )
             }
         }
+        refreshOracleOperationDiagnostics()
         persistState()
     }
 
@@ -938,6 +1076,7 @@ class ProvisioningViewModel : ViewModel() {
 
     fun startProvisioning(context: Context) {
         if (_state.value is ProvisioningState.Running) return
+        setPendingOracleOperation(PendingOracleOperation.Provision)
         _oracleOnboardingState.value = OracleOnboardingState.AuthLaunched
         // Read the latest dev mode setting from SharedPreferences
         if (::prefs.isInitialized) {
@@ -958,6 +1097,25 @@ class ProvisioningViewModel : ViewModel() {
     }
 
     fun retry(context: Context) {
+        val operation = when {
+            failedOracleOperation.type != OracleOperationType.NONE -> failedOracleOperation
+            pendingOracleOperation.type != OracleOperationType.NONE -> pendingOracleOperation
+            else -> PendingOracleOperation.Provision
+        }
+        if (operation.type == OracleOperationType.DESTROY_EXIT) {
+            destroyNode(context, operation.exitId)
+            return
+        }
+        if (operation.type != OracleOperationType.PROVISION) {
+            _state.value = ProvisioningState.Failure(
+                failedPhase = Phase.DONE,
+                lastSuccessPhase = null,
+                errorMessage = "No Oracle operation is available to retry.",
+            )
+            persistState()
+            return
+        }
+        setPendingOracleOperation(PendingOracleOperation.Provision)
         if (::prefs.isInitialized) {
             _isDevMode.value = prefs.getBoolean("is_dev_mode", false)
         }
@@ -986,38 +1144,41 @@ class ProvisioningViewModel : ViewModel() {
     }
 
     fun destroyNode(context: Context, exitId: String? = _selectedExitId.value) {
+        if (_state.value is ProvisioningState.Running || _state.value is ProvisioningState.Destroying) return
         val targetExit = exitId?.let { id -> _configuredExits.value.firstOrNull { it.id == id } }
-        _state.value = ProvisioningState.Destroying
-        if (targetExit != null) {
-            updateExit(targetExit.id) { it.copy(lifecycleState = ExitLifecycleState.DESTROYING, lastError = null) }
+        val destroyOperation = targetExit?.toDestroyOperation() ?: PendingOracleOperation(
+            type = OracleOperationType.DESTROY_EXIT,
+            exitId = exitId,
+        )
+        setPendingOracleOperation(destroyOperation)
+        if (targetExit == null) {
+            val message = "Selected Oracle exit was not found. Destroy was not started."
+            setFailedOracleOperation(destroyOperation, message)
+            _state.value = ProvisioningState.Failure(
+                failedPhase = Phase.DONE,
+                lastSuccessPhase = null,
+                errorMessage = message,
+            )
+            persistState()
+            return
         }
+        _state.value = ProvisioningState.Destroying
+        updateExit(targetExit.id) { it.copy(lifecycleState = ExitLifecycleState.DESTROYING, lastError = null) }
         viewModelScope.launch {
-            val currentRids = targetExit?.ociResourceIds?.toProvisionerResourceIds() ?: resourceIds ?: loadResourceIds()
-            val currentRegion = targetExit?.region ?: homeRegion
-            val currentApiKeyUserOcid = targetExit?.apiKeyUserOcid ?: apiKeyUserOcid
-            val currentApiKeyFingerprint = targetExit?.apiKeyFingerprint ?: apiKeyFingerprint
+            val currentRids = targetExit.ociResourceIds?.toProvisionerResourceIds()
+            val currentRegion = targetExit.region
+            val currentApiKeyUserOcid = targetExit.apiKeyUserOcid
+            val currentApiKeyFingerprint = targetExit.apiKeyFingerprint
 
             if (currentRids == null) {
+                val message = "Local resource IDs are missing. Delete the node resources manually in the Oracle Console."
+                setFailedOracleOperation(destroyOperation, message)
                 targetExit?.let {
                     updateExit(it.id) { exit ->
                         exit.copy(
                             lifecycleState = ExitLifecycleState.FAILED,
-                            lastError = "Local resource IDs are missing. Delete the node resources manually in the Oracle Console.",
+                            lastError = message,
                         )
-                    }
-                }
-                _state.value = ProvisioningState.Failure(
-                    failedPhase = Phase.DONE,
-                    lastSuccessPhase = null,
-                    errorMessage = "Local resource IDs are missing. Delete the node resources manually in the Oracle Console.",
-                )
-                return@launch
-            }
-            if (currentRegion == null) {
-                val message = "Oracle region is missing for this node. Delete the node resources manually in the Oracle Console."
-                targetExit?.let {
-                    updateExit(it.id) { exit ->
-                        exit.copy(lifecycleState = ExitLifecycleState.FAILED, lastError = message)
                     }
                 }
                 _state.value = ProvisioningState.Failure(
@@ -1025,9 +1186,9 @@ class ProvisioningViewModel : ViewModel() {
                     lastSuccessPhase = null,
                     errorMessage = message,
                 )
+                persistState()
                 return@launch
             }
-
             val prov = provisioner ?: OciProvisioner(context, currentRegion, _isDevMode.value).also { provisioner = it }
             val eventJob = viewModelScope.launch {
                 prov.events.collect { event ->
@@ -1046,10 +1207,14 @@ class ProvisioningViewModel : ViewModel() {
                 )
                 val currentAuth = authResult ?: run {
                     _currentPhase.value = Phase.AUTH
-                    emit(Phase.AUTH, Status.RUNNING, "Authentication required before destroy...")
+                    emit(Phase.AUTH, Status.RUNNING, "Sign in to Oracle to destroy this exit.")
+                    _oracleOnboardingState.value = OracleOnboardingState.AuthLaunched
+                    persistState()
                     prov.authenticate().also { authResult = it }
                 }
+                refreshOracleOperationDiagnostics()
 
+                _currentPhase.value = Phase.DONE
                 emit(Phase.DONE, Status.RUNNING, "Destroying node resources...")
                 prov.destroy(
                     rids = currentRids,
@@ -1077,6 +1242,7 @@ class ProvisioningViewModel : ViewModel() {
                 wireGuardServerPublicKey = null
                 wireGuardServerPeerPublicKey = null
                 authResult = null
+                clearOracleOperationState()
                 apiKeyUserOcid = null
                 apiKeyTenancyOcid = null
                 apiKeyFingerprint = null
@@ -1084,19 +1250,29 @@ class ProvisioningViewModel : ViewModel() {
                     persistState()
                 }
             } catch (e: Exception) {
+                val destroyError = if (_currentPhase.value == Phase.AUTH) {
+                    "Destroy cancelled. Oracle sign-in was not completed."
+                } else {
+                    e.message ?: "Destroy failed."
+                }
+                setFailedOracleOperation(destroyOperation, destroyError)
                 targetExit?.let {
                     updateExit(it.id) { exit ->
                         exit.copy(
                             lifecycleState = ExitLifecycleState.FAILED,
-                            lastError = e.message,
+                            lastError = destroyError,
                         )
                     }
                 }
                 _state.value = ProvisioningState.Failure(
                     failedPhase = _currentPhase.value ?: Phase.DONE,
                     lastSuccessPhase = null,
-                    errorMessage = e.message,
+                    errorMessage = destroyError,
                 )
+                if (_currentPhase.value == Phase.AUTH) {
+                    _oracleOnboardingState.value = OracleOnboardingState.AuthFailed
+                }
+                persistState()
             } finally {
                 eventJob.cancel()
             }
@@ -1142,6 +1318,7 @@ class ProvisioningViewModel : ViewModel() {
             wireGuardServerPublicKey = null
             wireGuardServerPeerPublicKey = null
             pendingProvisionExitId = null
+            clearOracleOperationState()
             restoreStateFromSelectedExitOrIdle()
             persistState()
         }
@@ -1149,6 +1326,20 @@ class ProvisioningViewModel : ViewModel() {
 
     private suspend fun runProvisioning(context: Context) {
         try {
+            if (pendingOracleOperation.type != OracleOperationType.PROVISION) {
+                val message = "Provisioning was not the pending Oracle operation."
+                setFailedOracleOperation(
+                    PendingOracleOperation(OracleOperationType.PROVISION),
+                    message,
+                )
+                _state.value = ProvisioningState.Failure(
+                    failedPhase = Phase.AUTH,
+                    lastSuccessPhase = null,
+                    errorMessage = message,
+                )
+                persistState()
+                return
+            }
             val uiSelectedRegion = _selectedOracleRegion.value
             val persistedRegion = homeRegion
             val authBootstrapRegion = uiSelectedRegion ?: persistedRegion ?: AUTH_BOOTSTRAP_REGION
@@ -1176,6 +1367,7 @@ class ProvisioningViewModel : ViewModel() {
                     "manualRegionId=${uiSelectedRegion ?: "none"} authBootstrapRegionId=$authBootstrapRegion",
             )
             authResult = prov.authenticate()
+            refreshOracleOperationDiagnostics()
             _oracleOnboardingState.value = OracleOnboardingState.ReadyToProvision
             persistState()
 
@@ -1198,6 +1390,7 @@ class ProvisioningViewModel : ViewModel() {
 
             if (!preflightResult!!.success) {
                 eventJob.cancel()
+                setFailedOracleOperation(PendingOracleOperation.Provision, preflightResult!!.error)
                 _state.value = ProvisioningState.Failure(
                     failedPhase = Phase.API_KEY,
                     lastSuccessPhase = Phase.AUTH,
@@ -1221,6 +1414,7 @@ class ProvisioningViewModel : ViewModel() {
             doProvision(context, prov)
 
         } catch (e: Exception) {
+            setFailedOracleOperation(PendingOracleOperation.Provision, e.message)
             val lastSuccess = when (_currentPhase.value) {
                 Phase.AUTH -> null
                 Phase.API_KEY -> Phase.AUTH
@@ -1244,6 +1438,7 @@ class ProvisioningViewModel : ViewModel() {
 
     private suspend fun continueProvisioningAfterWarning(context: Context) {
         try {
+            setPendingOracleOperation(PendingOracleOperation.Provision)
             val warningRegion = preflightResult?.homeRegion ?: homeRegion ?: _selectedOracleRegion.value
                 ?: throw IllegalStateException("Oracle region is not available.")
             val prov = provisioner ?: OciProvisioner(context, warningRegion, _isDevMode.value).also { provisioner = it }
@@ -1260,6 +1455,7 @@ class ProvisioningViewModel : ViewModel() {
 
             doProvision(context, prov)
         } catch (e: Exception) {
+            setFailedOracleOperation(PendingOracleOperation.Provision, e.message)
             _state.value = ProvisioningState.Failure(
                 failedPhase = _currentPhase.value ?: Phase.AUTH,
                 lastSuccessPhase = null,
@@ -1320,8 +1516,10 @@ class ProvisioningViewModel : ViewModel() {
                 isDevMode = _isDevMode.value,
             )
             _oracleOnboardingState.value = OracleOnboardingState.NotStarted
+            clearOracleOperationState()
             persistState()
         } catch (e: Exception) {
+            setFailedOracleOperation(PendingOracleOperation.Provision, e.message)
             _state.value = ProvisioningState.Failure(
                 failedPhase = _currentPhase.value ?: Phase.AUTH,
                 lastSuccessPhase = null,
@@ -1584,6 +1782,11 @@ class ProvisioningViewModel : ViewModel() {
         this?.takeIf { it.isNotBlank() }?.let { value ->
             if (value.length <= 10) "$value..." else "${value.take(10)}..."
         } ?: "N/A"
+
+    private fun String?.safeOcidPrefix(): String? =
+        this?.takeIf { it.isNotBlank() }?.let { value ->
+            if (value.length <= 18) "$value..." else "${value.take(18)}..."
+        }
 
     private fun String.sanitizeInviteDiagnostic(): String =
         lineSequence()

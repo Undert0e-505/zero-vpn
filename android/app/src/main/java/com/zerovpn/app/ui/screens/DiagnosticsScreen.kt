@@ -42,6 +42,7 @@ import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.zerovpn.app.ui.provisioning.ProvisioningViewModel
+import com.zerovpn.app.ui.provisioning.OracleOperationDiagnostics
 import com.zerovpn.app.BuildConfig
 import com.zerovpn.app.friends.InviteSlot
 import com.zerovpn.app.friends.SharedExitProfile
@@ -88,6 +89,7 @@ fun DiagnosticsScreen(
     val inviteSlots by provisioningViewModel.inviteSlots.collectAsState()
     val sharedExitProfiles by provisioningViewModel.sharedExitProfiles.collectAsState()
     val lastInviteOperationError by provisioningViewModel.lastInviteOperationError.collectAsState()
+    val oracleOperationDiagnostics by provisioningViewModel.oracleOperationDiagnostics.collectAsState()
     val selectedExitId by provisioningViewModel.selectedExitId.collectAsState()
     val providerSwitchDiagnostics by provisioningViewModel.providerSwitchDiagnostics.collectAsState()
     val vpnState by vpnViewModel.state.collectAsState()
@@ -178,6 +180,8 @@ fun DiagnosticsScreen(
                 hasExitSshPrivateKey = provisioningViewModel::hasExitSshPrivateKey,
                 lastInviteOperationError = lastInviteOperationError,
             )
+            Spacer(modifier = Modifier.height(12.dp))
+            OracleOperationDebugCard(oracleOperationDiagnostics)
             if (BuildConfig.VOLUNTEER_DEBUG_ENABLED) {
                 Spacer(modifier = Modifier.height(12.dp))
                 VolunteerNetworkSpikeCard(
@@ -315,6 +319,39 @@ private fun FriendsShareDebugCard(
                 }
                 .ifBlank { "N/A" },
         )
+    }
+}
+
+@Composable
+private fun OracleOperationDebugCard(
+    diagnostics: OracleOperationDiagnostics,
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(Surface, RoundedCornerShape(8.dp))
+            .border(1.dp, Border, RoundedCornerShape(8.dp))
+            .padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        Text(
+            text = "ORACLE OPERATION STATE",
+            style = SectionTitleStyle,
+        )
+        Text(
+            text = "Developer-mode operation metadata only. Tokens, API key material, SSH keys, and VPN configs are not displayed.",
+            fontSize = 13.sp,
+            color = TextDim,
+            lineHeight = 18.sp,
+        )
+        DebugValue("Pending operation", diagnostics.pendingOperation.name)
+        DebugValue("Failed operation", diagnostics.failedOperation.name)
+        DebugValue("Target exit id", diagnostics.targetExitId ?: "N/A")
+        DebugValue("Target display name", diagnostics.targetDisplayName ?: "N/A")
+        DebugValue("Target region", diagnostics.targetRegion ?: "N/A")
+        DebugValue("Target instance prefix", diagnostics.targetInstanceIdPrefix ?: "N/A")
+        DebugValue("Auth state", diagnostics.authState)
+        DebugBlock("Last Oracle operation error", diagnostics.lastError ?: "N/A")
     }
 }
 
