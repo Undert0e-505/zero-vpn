@@ -82,6 +82,7 @@ fun HomeScreen(
     var renameTarget by remember { mutableStateOf<ConfiguredExit?>(null) }
     var pendingPermissionExit by remember { mutableStateOf<ConfiguredExit?>(null) }
     var missingExitMessage by remember { mutableStateOf<String?>(null) }
+    var removingExitId by remember { mutableStateOf<String?>(null) }
     var switchTargetExitId by remember { mutableStateOf<String?>(null) }
     var lastProviderSwitchStartedAt by remember { mutableStateOf<Long?>(null) }
     var lastProviderSwitchCompletedAt by remember { mutableStateOf<Long?>(null) }
@@ -254,34 +255,43 @@ fun HomeScreen(
                 )
             },
             confirmButton = {
-                TextButton(onClick = {
-                    showDestroyDialog = false
-                    scope.launch {
-                        val destroyExitId = destroyTarget?.id
-                        if (destroyTarget?.provider == ExitProvider.VOLUNTEER && destroyExitId == activeExitId) {
-                            volunteerNetworkController.stopVolunteerVpnTest()
-                            if (!waitForVolunteerStopped(volunteerNetworkController)) {
-                                snackbarHostState.showSnackbar("Disconnect failed. Exit was not removed.")
-                                return@launch
+                TextButton(
+                    enabled = removingExitId == null,
+                    onClick = {
+                        val target = destroyTarget
+                        val destroyExitId = target?.id
+                        showDestroyDialog = false
+                        if (target == null || destroyExitId == null || removingExitId != null) return@TextButton
+                        scope.launch {
+                            removingExitId = destroyExitId
+                            if (target.provider == ExitProvider.VOLUNTEER && destroyExitId == activeExitId) {
+                                volunteerNetworkController.stopVolunteerVpnTest()
+                                if (!waitForVolunteerStopped(volunteerNetworkController)) {
+                                    removingExitId = null
+                                    snackbarHostState.showSnackbar("Disconnect failed. Exit was not removed.")
+                                    return@launch
+                                }
+                            } else {
+                                val disconnected = vpnViewModel.disconnectIfActive(destroyExitId)
+                                if (!disconnected) {
+                                    removingExitId = null
+                                    snackbarHostState.showSnackbar("Disconnect failed. Exit was not removed.")
+                                    return@launch
+                                }
                             }
-                        } else {
-                            val disconnected = vpnViewModel.disconnectIfActive(destroyExitId)
-                            if (!disconnected) {
-                                snackbarHostState.showSnackbar("Disconnect failed. Exit was not removed.")
-                                return@launch
+                            when (target.provider) {
+                                ExitProvider.VOLUNTEER -> viewModel.removeLocalExit(destroyExitId)
+                                ExitProvider.SHARED_WIREGUARD -> viewModel.removeSharedExitProfile(destroyExitId)
+                                ExitProvider.OCI -> {
+                                    viewModel.destroyNode(context, destroyExitId)
+                                    onDestroyStarted()
+                                }
                             }
+                            destroyTarget = null
+                            removingExitId = null
                         }
-                        if (destroyTarget?.provider == ExitProvider.VOLUNTEER && destroyExitId != null) {
-                            viewModel.removeLocalExit(destroyExitId)
-                        } else if (destroyTarget?.provider == ExitProvider.SHARED_WIREGUARD && destroyExitId != null) {
-                            viewModel.removeSharedExitProfile(destroyExitId)
-                        } else {
-                            viewModel.destroyNode(context, destroyExitId)
-                            onDestroyStarted()
-                        }
-                        destroyTarget = null
-                    }
-                }) {
+                    },
+                ) {
                     Text(if (destroyTarget?.provider == ExitProvider.OCI) "Destroy" else "Remove exit", color = Danger)
                 }
             },
@@ -515,6 +525,7 @@ fun HomeScreen(
                     active = exitIsActive,
                     switchingTarget = exitIsSwitchTarget,
                     busy = switchInProgress ||
+                        removingExitId == exit.id ||
                         exit.lifecycleState == ExitLifecycleState.DESTROYING,
                     onSelect = { viewModel.selectExit(exit.id) },
                     onConnect = {
