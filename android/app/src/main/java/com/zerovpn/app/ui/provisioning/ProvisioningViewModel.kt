@@ -8,6 +8,8 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.browser.customtabs.CustomTabsIntent
 import com.zerovpn.app.friends.FriendsRepository
+import com.zerovpn.app.friends.HandshakeQueryResult
+import com.zerovpn.app.friends.InviteHandshakeChecker
 import com.zerovpn.app.friends.InviteSlot
 import com.zerovpn.app.friends.InviteSlotState
 import com.zerovpn.app.friends.ParsedWireGuardInvite
@@ -30,6 +32,12 @@ import kotlinx.coroutines.launch
 import org.json.JSONArray
 import org.json.JSONObject
 import java.util.UUID
+
+sealed interface InviteClaimCheckResult {
+    data object NotClaimed : InviteClaimCheckResult
+    data object Claimed : InviteClaimCheckResult
+    data class Error(val message: String) : InviteClaimCheckResult
+}
 
 class ProvisioningViewModel : ViewModel() {
 
@@ -417,6 +425,11 @@ class ProvisioningViewModel : ViewModel() {
     fun getInviteSlotsForOwnerExit(ownerExitId: String): List<InviteSlot> =
         _inviteSlots.value.filter { it.ownerExitId == ownerExitId }.sortedBy { it.slotIndex }
 
+    fun getPendingInviteSlotsForOwnerExit(ownerExitId: String): List<InviteSlot> =
+        _inviteSlots.value
+            .filter { it.ownerExitId == ownerExitId && it.state == InviteSlotState.PENDING_CLAIM }
+            .sortedBy { it.slotIndex }
+
     fun upsertInviteSlot(slot: InviteSlot) {
         friendsRepository?.let { repository ->
             _inviteSlots.value = repository.upsertInviteSlot(slot)
@@ -450,6 +463,77 @@ class ProvisioningViewModel : ViewModel() {
     fun clearBurnedPrivateMaterial(slotId: String) {
         friendsRepository?.let { repository ->
             _inviteSlots.value = repository.clearBurnedPrivateMaterial(slotId)
+        }
+    }
+
+    fun updateInviteSlotLastHandshake(slotId: String, lastHandshakeAt: Long) {
+        friendsRepository?.let { repository ->
+            _inviteSlots.value = repository.updateInviteSlotLastHandshake(slotId, lastHandshakeAt)
+        }
+    }
+
+    fun checkInviteSlotClaim(
+        context: Context,
+        slotId: String,
+        onComplete: (InviteClaimCheckResult) -> Unit,
+    ) {
+        val slot = _inviteSlots.value.firstOrNull { it.slotId == slotId }
+        if (slot == null) {
+            onComplete(InviteClaimCheckResult.Error("This invite slot was not found."))
+            return
+        }
+        if (slot.state != InviteSlotState.PENDING_CLAIM) {
+            onComplete(InviteClaimCheckResult.Error("Only pending invite slots can be checked."))
+            return
+        }
+        val peerPublicKey = slot.peerPublicKey?.takeIf { it.isNotBlank() }
+        if (peerPublicKey == null) {
+            onComplete(InviteClaimCheckResult.Error("This invite slot does not have a peer public key."))
+            return
+        }
+        val ownerExit = _configuredExits.value.firstOrNull { it.id == slot.ownerExitId }
+        if (ownerExit == null) {
+            onComplete(InviteClaimCheckResult.Error("The owner exit for this invite was not found."))
+            return
+        }
+        viewModelScope.launch {
+            when (val result = InviteHandshakeChecker(context.applicationContext).queryLatestHandshakes(ownerExit)) {
+                is HandshakeQueryResult.MissingSshCredentials -> {
+                    onComplete(
+                        InviteClaimCheckResult.Error(
+                            "This app session does not have the VM SSH key needed to verify the claim. Owner verification/recovery will be added later.",
+                        ),
+                    )
+                }
+                is HandshakeQueryResult.Failed -> {
+                    onComplete(
+                        InviteClaimCheckResult.Error(
+                            result.message.takeIf { it.isNotBlank() }
+                                ?: "Could not check this invite claim. Please try again.",
+                        ),
+                    )
+                }
+                is HandshakeQueryResult.Success -> {
+                    val latestHandshakeSeconds = result.latestHandshakes[peerPublicKey]
+                    if (latestHandshakeSeconds == null) {
+                        onComplete(InviteClaimCheckResult.Error("This invite peer was not found on the exit."))
+                        return@launch
+                    }
+                    if (latestHandshakeSeconds <= 0L) {
+                        onComplete(InviteClaimCheckResult.NotClaimed)
+                        return@launch
+                    }
+                    val handshakeAt = latestHandshakeSeconds * 1000L
+                    friendsRepository?.let { repository ->
+                        _inviteSlots.value = repository.markInviteSlotClaimed(
+                            slotId = slot.slotId,
+                            firstHandshakeAt = handshakeAt,
+                            lastHandshakeAt = handshakeAt,
+                        )
+                    }
+                    onComplete(InviteClaimCheckResult.Claimed)
+                }
+            }
         }
     }
 
