@@ -262,6 +262,8 @@ private fun FriendsShareDebugCard(
                         "ip=${slot.tunnelIp ?: "N/A"} peer=${slot.peerPublicKey.prefixForDiagnostics()} " +
                         "firstHandshakeAt=${slot.firstHandshakeAt.formatDebugTime()} " +
                         "lastHandshakeAt=${slot.lastHandshakeAt.formatDebugTime()} " +
+                        "revokedAt=${slot.revokedAt.formatDebugTime()} " +
+                        "resetAt=${slot.resetAt.formatDebugTime()} " +
                         "secretKey=${slot.clientConfigSecretKey ?: "N/A"} " +
                         "privateShareMaterialPresent=${if (hasInviteMaterial(slot)) "yes" else "no"}"
                 }

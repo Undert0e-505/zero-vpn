@@ -10,6 +10,8 @@ import androidx.browser.customtabs.CustomTabsIntent
 import com.zerovpn.app.friends.FriendsRepository
 import com.zerovpn.app.friends.HandshakeQueryResult
 import com.zerovpn.app.friends.InviteHandshakeChecker
+import com.zerovpn.app.friends.InvitePeerResetResult
+import com.zerovpn.app.friends.InvitePeerResetter
 import com.zerovpn.app.friends.InviteSlot
 import com.zerovpn.app.friends.InviteSlotState
 import com.zerovpn.app.friends.ParsedWireGuardInvite
@@ -39,6 +41,11 @@ sealed interface InviteClaimCheckResult {
     data object NotClaimed : InviteClaimCheckResult
     data object Claimed : InviteClaimCheckResult
     data class Error(val message: String) : InviteClaimCheckResult
+}
+
+sealed interface InviteResetResult {
+    data object Reset : InviteResetResult
+    data class Error(val message: String) : InviteResetResult
 }
 
 class ProvisioningViewModel : ViewModel() {
@@ -599,6 +606,81 @@ class ProvisioningViewModel : ViewModel() {
                         )
                     }
                     onComplete(InviteClaimCheckResult.Claimed)
+                }
+            }
+        }
+    }
+
+    fun resetInviteSlot(
+        context: Context,
+        slotId: String,
+        onComplete: (InviteResetResult) -> Unit,
+    ) {
+        val slot = _inviteSlots.value.firstOrNull { it.slotId == slotId }
+        if (slot == null) {
+            onComplete(InviteResetResult.Error("This invite slot was not found."))
+            return
+        }
+        if (slot.state != InviteSlotState.PENDING_CLAIM && slot.state != InviteSlotState.CLAIMED) {
+            onComplete(InviteResetResult.Error("Only pending or claimed invite slots can be reset."))
+            return
+        }
+        val ownerExit = _configuredExits.value.firstOrNull { it.id == slot.ownerExitId }
+        if (ownerExit == null) {
+            onComplete(InviteResetResult.Error("The owner exit for this invite was not found."))
+            return
+        }
+        val sshPrivateKey = ownerExit.sshPrivateKeySecretKey
+            ?.let { secretStore.getSecret(it) }
+            ?: ownerExit.sshPrivateKey
+        if (sshPrivateKey.isNullOrBlank()) {
+            onComplete(InviteResetResult.Error("Owner key is missing for this exit. Recreate the exit or use a future recovery flow."))
+            return
+        }
+        val finalSecretKey = SecureSecretStore.inviteClientConfig(slot.slotId)
+        val tempSecretKey = "$finalSecretKey:pendingReset"
+        viewModelScope.launch {
+            when (
+                val result = InvitePeerResetter(context.applicationContext).resetPeer(
+                    ownerExit = ownerExit,
+                    slot = slot,
+                    sshPrivateKey = sshPrivateKey,
+                    beforeServerMutation = { clientConfig ->
+                        secretStore.putSecret(tempSecretKey, clientConfig)
+                    },
+                )
+            ) {
+                is InvitePeerResetResult.Failed -> {
+                    secretStore.removeSecret(tempSecretKey)
+                    onComplete(
+                        InviteResetResult.Error(
+                            result.message.takeIf { it.isNotBlank() }
+                                ?: "Could not reset this invite. Please try again.",
+                        ),
+                    )
+                }
+                is InvitePeerResetResult.Success -> {
+                    try {
+                        secretStore.putSecret(finalSecretKey, result.clientConfig)
+                        friendsRepository?.let { repository ->
+                            _inviteSlots.value = repository.resetInviteSlotAfterRevoke(
+                                slotId = slot.slotId,
+                                newPeerPublicKey = result.newPeerPublicKey,
+                                tunnelIp = result.tunnelIp,
+                                clientConfigSecretKey = finalSecretKey,
+                                resetAt = System.currentTimeMillis(),
+                            )
+                        }
+                        secretStore.removeSecret(tempSecretKey)
+                        onComplete(InviteResetResult.Reset)
+                    } catch (e: Exception) {
+                        secretStore.removeSecret(tempSecretKey)
+                        onComplete(
+                            InviteResetResult.Error(
+                                "The server reset succeeded, but ZeroVPN could not save the new invite locally. Recreate the exit or use a future recovery flow.",
+                            ),
+                        )
+                    }
                 }
             }
         }

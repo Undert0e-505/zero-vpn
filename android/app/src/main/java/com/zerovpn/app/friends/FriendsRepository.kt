@@ -91,6 +91,31 @@ class FriendsRepository(
             )
         }
 
+    fun resetInviteSlotAfterRevoke(
+        slotId: String,
+        newPeerPublicKey: String,
+        tunnelIp: String,
+        clientConfigSecretKey: String,
+        resetAt: Long,
+    ): List<InviteSlot> =
+        updateInviteSlot(slotId) {
+            it.copy(
+                displayName = null,
+                state = InviteSlotState.UNUSED,
+                tunnelIp = tunnelIp,
+                peerPublicKey = newPeerPublicKey,
+                clientConfigSecretKey = clientConfigSecretKey,
+                encryptedClientConfig = null,
+                encryptedClientPrivateKey = null,
+                qrShownAt = null,
+                firstHandshakeAt = null,
+                lastHandshakeAt = null,
+                revokedAt = resetAt,
+                resetAt = resetAt,
+                updatedAt = System.currentTimeMillis(),
+            )
+        }
+
     fun listSharedExits(): List<SharedExitProfile> =
         loadSharedExits().sortedBy { it.importedAt }
 
@@ -187,6 +212,7 @@ class FriendsRepository(
         .put("firstHandshakeAt", firstHandshakeAt)
         .put("lastHandshakeAt", lastHandshakeAt)
         .put("revokedAt", revokedAt)
+        .put("resetAt", resetAt)
         .put("createdAt", createdAt)
         .put("updatedAt", updatedAt)
 
@@ -207,6 +233,7 @@ class FriendsRepository(
         firstHandshakeAt = optLongOrNull("firstHandshakeAt"),
         lastHandshakeAt = optLongOrNull("lastHandshakeAt"),
         revokedAt = optLongOrNull("revokedAt"),
+        resetAt = optLongOrNull("resetAt"),
         createdAt = optLong("createdAt", System.currentTimeMillis()),
         updatedAt = optLong("updatedAt", System.currentTimeMillis()),
     )
