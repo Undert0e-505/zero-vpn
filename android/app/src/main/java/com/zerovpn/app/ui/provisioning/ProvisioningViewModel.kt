@@ -4,16 +4,32 @@ import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
 import android.net.Uri
+import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.browser.customtabs.CustomTabsIntent
+import com.zerovpn.app.friends.FriendsRepository
+import com.zerovpn.app.friends.HandshakeQueryResult
+import com.zerovpn.app.friends.InviteHandshakeChecker
+import com.zerovpn.app.friends.InvitePeerResetPhase
+import com.zerovpn.app.friends.InvitePeerResetResult
+import com.zerovpn.app.friends.InvitePeerResetter
+import com.zerovpn.app.friends.InviteSlot
+import com.zerovpn.app.friends.InviteSlotState
+import com.zerovpn.app.friends.ParsedWireGuardInvite
+import com.zerovpn.app.friends.SharedExitProviderType
+import com.zerovpn.app.friends.SharedExitProfile
+import com.zerovpn.app.friends.SharedExitSource
+import com.zerovpn.app.friends.sha256
 import com.zerovpn.app.oci.OciProvisioner
 import com.zerovpn.app.oci.OciRegion
 import com.zerovpn.app.oci.OciRegions
+import com.zerovpn.app.storage.SecureSecretStore
 import com.zerovpn.app.vpn.ConfiguredExit
 import com.zerovpn.app.vpn.ExitLifecycleState
 import com.zerovpn.app.vpn.ExitProvider
 import com.zerovpn.app.vpn.OciResourceIds
+import com.zerovpn.app.vpn.ProviderSwitchDiagnostics
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -22,6 +38,35 @@ import kotlinx.coroutines.launch
 import org.json.JSONArray
 import org.json.JSONObject
 import java.util.UUID
+
+sealed interface InviteClaimCheckResult {
+    data object NotClaimed : InviteClaimCheckResult
+    data object Claimed : InviteClaimCheckResult
+    data class Error(val message: String) : InviteClaimCheckResult
+}
+
+sealed interface InviteResetResult {
+    data object Reset : InviteResetResult
+    data class Error(val message: String) : InviteResetResult
+}
+
+enum class OracleOperationType {
+    NONE,
+    PROVISION,
+    DESTROY_EXIT,
+    CLEANUP_PARTIAL_EXIT,
+}
+
+data class OracleOperationDiagnostics(
+    val pendingOperation: OracleOperationType = OracleOperationType.NONE,
+    val failedOperation: OracleOperationType = OracleOperationType.NONE,
+    val targetExitId: String? = null,
+    val targetRegion: String? = null,
+    val targetInstanceIdPrefix: String? = null,
+    val targetDisplayName: String? = null,
+    val authState: String = "missing",
+    val lastError: String? = null,
+)
 
 class ProvisioningViewModel : ViewModel() {
 
@@ -54,7 +99,7 @@ class ProvisioningViewModel : ViewModel() {
     data class SshDebugInfo(
         val publicIp: String,
         val username: String,
-        val privateKey: String,
+        val privateKeyPresent: Boolean,
     ) {
         val windowsSshCommand: String
             get() = "ssh -i C:\\ssh-keys\\zerovpn_current_vm_key $username@$publicIp"
@@ -68,6 +113,22 @@ class ProvisioningViewModel : ViewModel() {
 
     private val _selectedExitId = MutableStateFlow<String?>(null)
     val selectedExitId: StateFlow<String?> = _selectedExitId.asStateFlow()
+
+    private val _providerSwitchDiagnostics = MutableStateFlow(ProviderSwitchDiagnostics())
+    val providerSwitchDiagnostics: StateFlow<ProviderSwitchDiagnostics> = _providerSwitchDiagnostics.asStateFlow()
+
+    private val _inviteSlots = MutableStateFlow<List<InviteSlot>>(emptyList())
+    val inviteSlots: StateFlow<List<InviteSlot>> = _inviteSlots.asStateFlow()
+
+    private val _sharedExitProfiles = MutableStateFlow<List<SharedExitProfile>>(emptyList())
+    val sharedExitProfiles: StateFlow<List<SharedExitProfile>> = _sharedExitProfiles.asStateFlow()
+
+    private val _lastInviteOperationError = MutableStateFlow<String?>(null)
+    val lastInviteOperationError: StateFlow<String?> = _lastInviteOperationError.asStateFlow()
+
+    private val _oracleOperationDiagnostics = MutableStateFlow(OracleOperationDiagnostics())
+    val oracleOperationDiagnostics: StateFlow<OracleOperationDiagnostics> =
+        _oracleOperationDiagnostics.asStateFlow()
 
     private var provisioner: OciProvisioner? = null
     private var authResult: OciProvisioner.AuthResult? = null
@@ -83,16 +144,73 @@ class ProvisioningViewModel : ViewModel() {
     private var apiKeyFingerprint: String? = null
     private var pendingProvisionExitId: String? = null
     private var provisioningJob: Job? = null
+    private var pendingOracleOperation = PendingOracleOperation.None
+    private var failedOracleOperation = PendingOracleOperation.None
+    private var lastOracleOperationError: String? = null
 
     // State persistence
     private lateinit var prefs: SharedPreferences
+    private lateinit var secretStore: SecureSecretStore
+    private var friendsRepository: FriendsRepository? = null
     private var prefsLoaded = false
+
+    private data class PendingOracleOperation(
+        val type: OracleOperationType,
+        val exitId: String? = null,
+        val region: String? = null,
+        val instanceId: String? = null,
+        val displayName: String? = null,
+    ) {
+        companion object {
+            val None = PendingOracleOperation(OracleOperationType.NONE)
+            val Provision = PendingOracleOperation(OracleOperationType.PROVISION)
+        }
+    }
 
     fun initPrefs(context: Context) {
         if (prefsLoaded) return
         prefs = context.getSharedPreferences("zerovpn_provisioning", Context.MODE_PRIVATE)
+        secretStore = SecureSecretStore(context)
+        friendsRepository = FriendsRepository(prefs)
         loadPersistedState()
+        loadFriendsState()
         prefsLoaded = true
+    }
+
+    private fun loadFriendsState() {
+        val repository = friendsRepository ?: return
+        var slots = repository.listInviteSlots()
+        slots.forEach { slot ->
+            val legacyConfig = slot.encryptedClientConfig?.takeIf { it.isNotBlank() }
+            if (legacyConfig != null && slot.clientConfigSecretKey.isNullOrBlank()) {
+                val key = SecureSecretStore.inviteClientConfig(slot.slotId)
+                secretStore.putSecret(key, legacyConfig)
+                slots = repository.upsertInviteSlot(
+                    slot.copy(
+                        clientConfigSecretKey = key,
+                        encryptedClientConfig = null,
+                        encryptedClientPrivateKey = null,
+                    ),
+                )
+            }
+        }
+        var profiles = repository.listSharedExits()
+        profiles.forEach { profile ->
+            val legacyConfig = profile.encryptedWireGuardConfig?.takeIf { it.isNotBlank() }
+            if (legacyConfig != null && profile.wireGuardConfigSecretKey.isNullOrBlank()) {
+                val key = SecureSecretStore.sharedWireGuardConfig(profile.id)
+                secretStore.putSecret(key, legacyConfig)
+                profiles = repository.addSharedExit(
+                    profile.copy(
+                        wireGuardConfigSecretKey = key,
+                        configHash = profile.configHash ?: legacyConfig.sha256(),
+                        encryptedWireGuardConfig = null,
+                    ),
+                )
+            }
+        }
+        _inviteSlots.value = slots
+        _sharedExitProfiles.value = profiles
     }
 
     private fun loadPersistedState() {
@@ -110,6 +228,11 @@ class ProvisioningViewModel : ViewModel() {
         apiKeyUserOcid = prefs.getString("api_key_user_ocid", null)
         apiKeyTenancyOcid = prefs.getString("api_key_tenancy_ocid", null)
         apiKeyFingerprint = prefs.getString("api_key_fingerprint", null)
+        _lastInviteOperationError.value = prefs.getString("last_invite_operation_error", null)
+        lastOracleOperationError = prefs.getString("last_oracle_operation_error", null)
+        pendingOracleOperation = loadOracleOperation("pending_oracle_operation")
+        failedOracleOperation = loadOracleOperation("failed_oracle_operation")
+        refreshOracleOperationDiagnostics()
 
         val exits = loadConfiguredExits()
         if (exits.isNotEmpty()) {
@@ -125,12 +248,7 @@ class ProvisioningViewModel : ViewModel() {
             wireGuardServerPublicKey = selected.serverPublicKey
             wireGuardServerPeerPublicKey = selected.serverPeerPublicKey
             resourceIds = selected.ociResourceIds?.toProvisionerResourceIds()
-            _state.value = ProvisioningState.Success(
-                publicIp = selected.publicIp,
-                wireGuardPort = selected.wireGuardPort,
-                region = selected.region,
-                isDevMode = _isDevMode.value,
-            )
+            _state.value = ProvisioningState.Idle
             persistState()
             return
         }
@@ -163,12 +281,7 @@ class ProvisioningViewModel : ViewModel() {
                     _configuredExits.value = listOf(exit)
                     _selectedExitId.value = exit.id
                 }
-                _state.value = ProvisioningState.Success(
-                    publicIp = savedIp,
-                    wireGuardPort = savedPort,
-                    region = homeRegion ?: LEGACY_REGION_FALLBACK,
-                    isDevMode = _isDevMode.value,
-                )
+                _state.value = ProvisioningState.Idle
             }
             // Don't restore Running state — if we were mid-provision, user needs to retry
         }
@@ -194,6 +307,18 @@ class ProvisioningViewModel : ViewModel() {
                 "resource_subnet_id",
                 "resource_igw_id",
                 "resource_instance_id",
+                "last_invite_operation_error",
+                "last_oracle_operation_error",
+                "pending_oracle_operation_type",
+                "pending_oracle_operation_exit_id",
+                "pending_oracle_operation_region",
+                "pending_oracle_operation_instance_id",
+                "pending_oracle_operation_display_name",
+                "failed_oracle_operation_type",
+                "failed_oracle_operation_exit_id",
+                "failed_oracle_operation_region",
+                "failed_oracle_operation_instance_id",
+                "failed_oracle_operation_display_name",
             ).forEach { remove(it) }
             putString("state", _state.value::class.simpleName)
             putString("oracle_onboarding_state", _oracleOnboardingState.value.name)
@@ -205,11 +330,14 @@ class ProvisioningViewModel : ViewModel() {
             apiKeyFingerprint?.let { putString("api_key_fingerprint", it) }
             _publicIp.value?.let { putString("public_ip", it) }
             putInt("wireguard_port", _wireGuardPort.value)
-            clientConfig?.let { putString("wireguard_client_config", it) }
             wireGuardClientPublicKey?.let { putString("wireguard_client_public_key", it) }
             wireGuardServerPublicKey?.let { putString("wireguard_server_public_key", it) }
             wireGuardServerPeerPublicKey?.let { putString("wireguard_server_peer_public_key", it) }
             _selectedExitId.value?.let { putString("selected_exit_id", it) }
+            _lastInviteOperationError.value?.let { putString("last_invite_operation_error", it) }
+            lastOracleOperationError?.let { putString("last_oracle_operation_error", it) }
+            putOracleOperation("pending_oracle_operation", pendingOracleOperation)
+            putOracleOperation("failed_oracle_operation", failedOracleOperation)
             putString("configured_exits_json", serializeConfiguredExits(_configuredExits.value))
             resourceIds?.let { rids ->
                 rids.vcnId?.let { putString("resource_vcn_id", it) }
@@ -262,6 +390,83 @@ class ProvisioningViewModel : ViewModel() {
         }
     }
 
+    private fun loadOracleOperation(prefix: String): PendingOracleOperation {
+        if (!::prefs.isInitialized) return PendingOracleOperation.None
+        val type = runCatching {
+            OracleOperationType.valueOf(
+                prefs.getString("${prefix}_type", OracleOperationType.NONE.name)
+                    ?: OracleOperationType.NONE.name,
+            )
+        }.getOrDefault(OracleOperationType.NONE)
+        if (type == OracleOperationType.NONE) return PendingOracleOperation.None
+        return PendingOracleOperation(
+            type = type,
+            exitId = prefs.getString("${prefix}_exit_id", null),
+            region = prefs.getString("${prefix}_region", null),
+            instanceId = prefs.getString("${prefix}_instance_id", null),
+            displayName = prefs.getString("${prefix}_display_name", null),
+        )
+    }
+
+    private fun SharedPreferences.Editor.putOracleOperation(
+        prefix: String,
+        operation: PendingOracleOperation,
+    ) {
+        putString("${prefix}_type", operation.type.name)
+        operation.exitId?.let { putString("${prefix}_exit_id", it) }
+        operation.region?.let { putString("${prefix}_region", it) }
+        operation.instanceId?.let { putString("${prefix}_instance_id", it) }
+        operation.displayName?.let { putString("${prefix}_display_name", it) }
+    }
+
+    private fun setPendingOracleOperation(operation: PendingOracleOperation) {
+        pendingOracleOperation = operation
+        failedOracleOperation = PendingOracleOperation.None
+        lastOracleOperationError = null
+        refreshOracleOperationDiagnostics()
+    }
+
+    private fun setFailedOracleOperation(operation: PendingOracleOperation, error: String?) {
+        pendingOracleOperation = PendingOracleOperation.None
+        failedOracleOperation = operation
+        lastOracleOperationError = error?.sanitizeInviteDiagnostic()
+        refreshOracleOperationDiagnostics()
+    }
+
+    private fun clearOracleOperationState() {
+        pendingOracleOperation = PendingOracleOperation.None
+        failedOracleOperation = PendingOracleOperation.None
+        lastOracleOperationError = null
+        refreshOracleOperationDiagnostics()
+    }
+
+    private fun refreshOracleOperationDiagnostics() {
+        val operation = when {
+            pendingOracleOperation.type != OracleOperationType.NONE -> pendingOracleOperation
+            failedOracleOperation.type != OracleOperationType.NONE -> failedOracleOperation
+            else -> PendingOracleOperation.None
+        }
+        _oracleOperationDiagnostics.value = OracleOperationDiagnostics(
+            pendingOperation = pendingOracleOperation.type,
+            failedOperation = failedOracleOperation.type,
+            targetExitId = operation.exitId,
+            targetRegion = operation.region,
+            targetInstanceIdPrefix = operation.instanceId.safeOcidPrefix(),
+            targetDisplayName = operation.displayName,
+            authState = if (authResult == null) "missing" else "present",
+            lastError = lastOracleOperationError,
+        )
+    }
+
+    private fun ConfiguredExit.toDestroyOperation(): PendingOracleOperation =
+        PendingOracleOperation(
+            type = OracleOperationType.DESTROY_EXIT,
+            exitId = id,
+            region = region,
+            instanceId = ociResourceIds?.instanceId ?: instanceId,
+            displayName = name,
+        )
+
     fun showPreStart() {
         _state.value = ProvisioningState.PreStart
         _oracleOnboardingState.value = OracleOnboardingState.NotStarted
@@ -290,6 +495,7 @@ class ProvisioningViewModel : ViewModel() {
         apiKeyTenancyOcid = null
         apiKeyFingerprint = null
         pendingProvisionExitId = null
+        clearOracleOperationState()
         _state.value = ProvisioningState.PreStart
         _oracleOnboardingState.value = OracleOnboardingState.NotStarted
         persistState()
@@ -311,6 +517,7 @@ class ProvisioningViewModel : ViewModel() {
             _oracleOnboardingState.value == OracleOnboardingState.WaitingForAuthReturn
         ) {
             _oracleOnboardingState.value = OracleOnboardingState.AuthReturned
+            refreshOracleOperationDiagnostics()
             persistState()
         }
     }
@@ -321,6 +528,7 @@ class ProvisioningViewModel : ViewModel() {
             persistState()
         } else if (_oracleOnboardingState.value == OracleOnboardingState.AuthLaunched) {
             _oracleOnboardingState.value = OracleOnboardingState.WaitingForAuthReturn
+            refreshOracleOperationDiagnostics()
             persistState()
         }
     }
@@ -338,6 +546,7 @@ class ProvisioningViewModel : ViewModel() {
         authResult = null
         preflightResult = null
         pendingProvisionExitId = null
+        clearOracleOperationState()
         provisioningJob?.cancel()
         provisioningJob = null
         _oracleOnboardingState.value = OracleOnboardingState.NotStarted
@@ -357,14 +566,15 @@ class ProvisioningViewModel : ViewModel() {
             apiKeyUserOcid = selected.apiKeyUserOcid
             apiKeyTenancyOcid = selected.apiKeyTenancyOcid
             apiKeyFingerprint = selected.apiKeyFingerprint
-            _sshDebugInfo.value = selected.sshPrivateKey?.let {
+            _sshDebugInfo.value = selected.sshPrivateKeySecretKey?.takeIf { secretStore.hasSecret(it) }?.let {
                 SshDebugInfo(
                     publicIp = selected.publicIp,
                     username = selected.sshUsername ?: "ubuntu",
-                    privateKey = it,
+                    privateKeyPresent = true,
                 )
             }
         }
+        refreshOracleOperationDiagnostics()
         persistState()
     }
 
@@ -384,8 +594,489 @@ class ProvisioningViewModel : ViewModel() {
         persistState()
     }
 
+    fun updateProviderSwitchDiagnostics(diagnostics: ProviderSwitchDiagnostics) {
+        _providerSwitchDiagnostics.value = diagnostics
+    }
+
+    fun getInviteSlotsForOwnerExit(ownerExitId: String): List<InviteSlot> =
+        _inviteSlots.value.filter { it.ownerExitId == ownerExitId }.sortedBy { it.slotIndex }
+
+    fun getPendingInviteSlotsForOwnerExit(ownerExitId: String): List<InviteSlot> =
+        _inviteSlots.value
+            .filter { it.ownerExitId == ownerExitId && it.state == InviteSlotState.PENDING_CLAIM }
+            .sortedBy { it.slotIndex }
+
+    fun getInviteSlotClientConfig(slotId: String): String? {
+        val slot = _inviteSlots.value.firstOrNull { it.slotId == slotId } ?: return null
+        return slot.clientConfigSecretKey?.let { secretStore.getSecret(it) }
+            ?: slot.encryptedClientConfig?.takeIf { it.isNotBlank() }
+    }
+
+    fun hasInviteSlotPrivateMaterial(slot: InviteSlot): Boolean =
+        slot.clientConfigSecretKey?.let { secretStore.hasSecret(it) } == true ||
+            !slot.encryptedClientConfig.isNullOrBlank() ||
+            !slot.encryptedClientPrivateKey.isNullOrBlank()
+
+    fun hasExitWireGuardConfig(exit: ConfiguredExit): Boolean =
+        exit.wireGuardConfigSecretKey?.let { secretStore.hasSecret(it) } == true ||
+            exit.wireGuardConfig.isNotBlank()
+
+    fun hasExitSshPrivateKey(exit: ConfiguredExit): Boolean =
+        exit.sshPrivateKeySecretKey?.let { secretStore.hasSecret(it) } == true ||
+            !exit.sshPrivateKey.isNullOrBlank()
+
+    fun hasSharedExitConfig(profile: SharedExitProfile): Boolean =
+        profile.wireGuardConfigSecretKey?.let { secretStore.hasSecret(it) } == true ||
+            !profile.encryptedWireGuardConfig.isNullOrBlank()
+
+    fun upsertInviteSlot(slot: InviteSlot) {
+        friendsRepository?.let { repository ->
+            _inviteSlots.value = repository.upsertInviteSlot(slot)
+        }
+    }
+
+    fun renameInviteSlot(slotId: String, name: String?) {
+        friendsRepository?.let { repository ->
+            _inviteSlots.value = repository.renameInviteSlot(slotId, name)
+        }
+    }
+
+    fun updateInviteSlotState(slotId: String, state: InviteSlotState) {
+        friendsRepository?.let { repository ->
+            _inviteSlots.value = repository.updateInviteSlotState(slotId, state)
+        }
+    }
+
+    fun markInviteSlotPending(slotId: String, qrShownAt: Long) {
+        friendsRepository?.let { repository ->
+            _inviteSlots.value = repository.markInviteSlotPending(slotId, qrShownAt)
+        }
+    }
+
+    fun markInviteSlotClaimed(slotId: String, firstHandshakeAt: Long, lastHandshakeAt: Long) {
+        _inviteSlots.value.firstOrNull { it.slotId == slotId }?.clientConfigSecretKey?.let {
+            secretStore.removeSecret(it)
+        }
+        friendsRepository?.let { repository ->
+            _inviteSlots.value = repository.markInviteSlotClaimed(slotId, firstHandshakeAt, lastHandshakeAt)
+        }
+    }
+
+    fun clearBurnedPrivateMaterial(slotId: String) {
+        _inviteSlots.value.firstOrNull { it.slotId == slotId }?.clientConfigSecretKey?.let {
+            secretStore.removeSecret(it)
+        }
+        friendsRepository?.let { repository ->
+            _inviteSlots.value = repository.clearBurnedPrivateMaterial(slotId)
+        }
+    }
+
+    fun updateInviteSlotLastHandshake(slotId: String, lastHandshakeAt: Long) {
+        friendsRepository?.let { repository ->
+            _inviteSlots.value = repository.updateInviteSlotLastHandshake(slotId, lastHandshakeAt)
+        }
+    }
+
+    fun checkInviteSlotClaim(
+        context: Context,
+        slotId: String,
+        onComplete: (InviteClaimCheckResult) -> Unit,
+    ) {
+        val slot = _inviteSlots.value.firstOrNull { it.slotId == slotId }
+        if (slot == null) {
+            onComplete(InviteClaimCheckResult.Error("This invite slot was not found."))
+            return
+        }
+        if (slot.state != InviteSlotState.PENDING_CLAIM) {
+            onComplete(InviteClaimCheckResult.Error("Only pending invite slots can be checked."))
+            return
+        }
+        val peerPublicKey = slot.peerPublicKey?.takeIf { it.isNotBlank() }
+        if (peerPublicKey == null) {
+            onComplete(InviteClaimCheckResult.Error("This invite slot does not have a peer public key."))
+            return
+        }
+        val ownerExit = _configuredExits.value.firstOrNull { it.id == slot.ownerExitId }
+        if (ownerExit == null) {
+            onComplete(InviteClaimCheckResult.Error("The owner exit for this invite was not found."))
+            return
+        }
+        val sshPrivateKey = ownerExit.sshPrivateKeySecretKey
+            ?.let { secretStore.getSecret(it) }
+            ?: ownerExit.sshPrivateKey
+        if (sshPrivateKey.isNullOrBlank()) {
+            onComplete(InviteClaimCheckResult.Error("Owner key is missing for this exit. Recreate the exit or use a future recovery flow."))
+            return
+        }
+        viewModelScope.launch {
+            when (val result = InviteHandshakeChecker(context.applicationContext).queryLatestHandshakes(ownerExit, sshPrivateKey)) {
+                is HandshakeQueryResult.MissingSshCredentials -> {
+                    onComplete(
+                        InviteClaimCheckResult.Error(
+                            "This app session does not have the VM SSH key needed to verify the claim. Owner verification/recovery will be added later.",
+                        ),
+                    )
+                }
+                is HandshakeQueryResult.Failed -> {
+                    onComplete(
+                        InviteClaimCheckResult.Error(
+                            result.message.takeIf { it.isNotBlank() }
+                                ?: "Could not check this invite claim. Please try again.",
+                        ),
+                    )
+                }
+                is HandshakeQueryResult.Success -> {
+                    val latestHandshakeSeconds = result.latestHandshakes[peerPublicKey]
+                    if (latestHandshakeSeconds == null) {
+                        onComplete(InviteClaimCheckResult.Error("This invite peer was not found on the exit."))
+                        return@launch
+                    }
+                    if (latestHandshakeSeconds <= 0L) {
+                        onComplete(InviteClaimCheckResult.NotClaimed)
+                        return@launch
+                    }
+                    val handshakeAt = latestHandshakeSeconds * 1000L
+                    slot.clientConfigSecretKey?.let { secretStore.removeSecret(it) }
+                    friendsRepository?.let { repository ->
+                        _inviteSlots.value = repository.markInviteSlotClaimed(
+                            slotId = slot.slotId,
+                            firstHandshakeAt = handshakeAt,
+                            lastHandshakeAt = handshakeAt,
+                        )
+                    }
+                    onComplete(InviteClaimCheckResult.Claimed)
+                }
+            }
+        }
+    }
+
+    fun resetInviteSlot(
+        context: Context,
+        slotId: String,
+        onComplete: (InviteResetResult) -> Unit,
+    ) {
+        val slot = _inviteSlots.value.firstOrNull { it.slotId == slotId }
+        if (slot == null) {
+            recordInviteOperationError("reset phase=${InvitePeerResetPhase.PRECHECK_MISSING_SLOT.name} slotId=$slotId message=This invite slot was not found.")
+            onComplete(InviteResetResult.Error("This invite slot was not found."))
+            return
+        }
+        if (slot.state != InviteSlotState.PENDING_CLAIM && slot.state != InviteSlotState.CLAIMED) {
+            recordInviteOperationError(
+                "reset phase=${InvitePeerResetPhase.PRECHECK_MISSING_SLOT.name} " +
+                    "ownerExitId=${slot.ownerExitId} slotId=${slot.slotId} slotIndex=${slot.slotIndex} " +
+                    "state=${slot.state.name} message=Only pending or claimed invite slots can be reset.",
+            )
+            onComplete(InviteResetResult.Error("Only pending or claimed invite slots can be reset."))
+            return
+        }
+        val ownerExit = _configuredExits.value.firstOrNull { it.id == slot.ownerExitId }
+        if (ownerExit == null) {
+            recordInviteOperationError(
+                "reset phase=${InvitePeerResetPhase.PRECHECK_MISSING_OWNER_EXIT.name} " +
+                    "ownerExitId=${slot.ownerExitId} slotId=${slot.slotId} slotIndex=${slot.slotIndex} " +
+                    "message=The owner exit for this invite was not found.",
+            )
+            onComplete(InviteResetResult.Error("The owner exit for this invite was not found."))
+            return
+        }
+        val sshPrivateKey = ownerExit.sshPrivateKeySecretKey
+            ?.let { secretStore.getSecret(it) }
+            ?: ownerExit.sshPrivateKey
+        if (sshPrivateKey.isNullOrBlank()) {
+            recordInviteOperationError(
+                buildInviteResetErrorDetail(
+                    phase = InvitePeerResetPhase.PRECHECK_MISSING_SSH_KEY,
+                    ownerExit = ownerExit,
+                    slot = slot,
+                    message = "Owner key is missing for this exit.",
+                ),
+            )
+            onComplete(InviteResetResult.Error("Owner key is missing for this exit. Recreate the exit or use a future recovery flow."))
+            return
+        }
+        val finalSecretKey = SecureSecretStore.inviteClientConfig(slot.slotId)
+        val tempSecretKey = "$finalSecretKey:pendingReset"
+        _lastInviteOperationError.value = null
+        persistState()
+        viewModelScope.launch {
+            when (
+                val result = InvitePeerResetter(context.applicationContext).resetPeer(
+                    ownerExit = ownerExit,
+                    slot = slot,
+                    sshPrivateKey = sshPrivateKey,
+                    beforeServerMutation = { clientConfig ->
+                        secretStore.putSecret(tempSecretKey, clientConfig)
+                    },
+                )
+            ) {
+                is InvitePeerResetResult.Failed -> {
+                    val cleanupError = runCatching { secretStore.removeSecret(tempSecretKey) }.exceptionOrNull()
+                    val serverMayHaveInvalidatedOldInvite = result.phase.mayHaveInvalidatedOldInvite()
+                    if (serverMayHaveInvalidatedOldInvite) {
+                        slot.clientConfigSecretKey?.let { runCatching { secretStore.removeSecret(it) } }
+                        friendsRepository?.let { repository ->
+                            _inviteSlots.value = repository.markInviteSlotRevoked(slot.slotId, System.currentTimeMillis())
+                        }
+                    }
+                    val detail = buildInviteResetErrorDetail(
+                        phase = result.phase,
+                        ownerExit = ownerExit,
+                        slot = slot,
+                        message = result.message,
+                        exitCode = result.exitCode,
+                        commandStderr = result.commandStderr,
+                        cleanupError = cleanupError?.message,
+                        oldInviteInvalidated = serverMayHaveInvalidatedOldInvite,
+                    )
+                    recordInviteOperationError(detail)
+                    onComplete(
+                        InviteResetResult.Error(
+                            "Could not reset this invite. Open Diagnostics for details.",
+                        ),
+                    )
+                }
+                is InvitePeerResetResult.Success -> {
+                    try {
+                        runCatching { secretStore.putSecret(finalSecretKey, result.clientConfig) }.getOrElse { e ->
+                            val detail = buildInviteResetErrorDetail(
+                                phase = InvitePeerResetPhase.FINAL_SECRET_STORE_FAILED,
+                                ownerExit = ownerExit,
+                                slot = slot,
+                                message = e.message ?: "Secure-store write failed after server reset.",
+                            )
+                            recordInviteOperationError(detail)
+                            secretStore.removeSecret(tempSecretKey)
+                            onComplete(InviteResetResult.Error("Could not reset this invite. Open Diagnostics for details."))
+                            return@launch
+                        }
+                        runCatching {
+                            val repository = friendsRepository ?: error("Friends repository is not available.")
+                            _inviteSlots.value = repository.resetInviteSlotAfterRevoke(
+                                slotId = slot.slotId,
+                                newPeerPublicKey = result.newPeerPublicKey,
+                                tunnelIp = result.tunnelIp,
+                                clientConfigSecretKey = finalSecretKey,
+                                resetAt = System.currentTimeMillis(),
+                            )
+                        }.getOrElse { e ->
+                            val detail = buildInviteResetErrorDetail(
+                                phase = InvitePeerResetPhase.LOCAL_METADATA_UPDATE_FAILED,
+                                ownerExit = ownerExit,
+                                slot = slot,
+                                message = e.message ?: "Local invite metadata update failed after server reset.",
+                            )
+                            recordInviteOperationError(detail)
+                            secretStore.removeSecret(tempSecretKey)
+                            onComplete(InviteResetResult.Error("Could not reset this invite. Open Diagnostics for details."))
+                            return@launch
+                        }
+                        slot.clientConfigSecretKey
+                            ?.takeIf { it != finalSecretKey }
+                            ?.let { secretStore.removeSecret(it) }
+                        val cleanupError = runCatching { secretStore.removeSecret(tempSecretKey) }.exceptionOrNull()
+                        if (cleanupError != null) {
+                            recordInviteOperationError(
+                                buildInviteResetErrorDetail(
+                                    phase = InvitePeerResetPhase.CLEANUP_TEMP_SECRET_FAILED,
+                                    ownerExit = ownerExit,
+                                    slot = slot,
+                                    message = cleanupError.message ?: "Temporary invite reset secret cleanup failed.",
+                                ),
+                            )
+                        } else {
+                            _lastInviteOperationError.value = null
+                        }
+                        persistState()
+                        onComplete(InviteResetResult.Reset)
+                    } catch (e: Exception) {
+                        val cleanupError = runCatching { secretStore.removeSecret(tempSecretKey) }.exceptionOrNull()
+                        val detail = buildInviteResetErrorDetail(
+                            phase = InvitePeerResetPhase.UNKNOWN,
+                            ownerExit = ownerExit,
+                            slot = slot,
+                            message = e.message ?: "Local reset completion failed after server reset.",
+                            cleanupError = cleanupError?.message,
+                        )
+                        recordInviteOperationError(detail)
+                        onComplete(
+                            InviteResetResult.Error(
+                                "Could not reset this invite. Open Diagnostics for details.",
+                            ),
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    fun markInviteSlotRevoked(slotId: String, revokedAt: Long) {
+        friendsRepository?.let { repository ->
+            _inviteSlots.value = repository.markInviteSlotRevoked(slotId, revokedAt)
+        }
+    }
+
+    fun addSharedExit(profile: SharedExitProfile) {
+        friendsRepository?.let { repository ->
+            _sharedExitProfiles.value = repository.addSharedExit(profile)
+        }
+    }
+
+    fun renameSharedExit(profileId: String, name: String) {
+        friendsRepository?.let { repository ->
+            _sharedExitProfiles.value = repository.renameSharedExit(profileId, name)
+        }
+    }
+
+    fun removeSharedExit(profileId: String) {
+        friendsRepository?.let { repository ->
+            _sharedExitProfiles.value = repository.removeSharedExit(profileId)
+        }
+    }
+
+    fun hasImportedSharedExit(invite: ParsedWireGuardInvite): Boolean =
+        _sharedExitProfiles.value.any { profile -> profile.configHash == invite.configHash } ||
+            _configuredExits.value.any { exit ->
+                exit.provider == ExitProvider.SHARED_WIREGUARD &&
+                    exit.wireGuardConfig.trim() == invite.rawConfig.trim()
+            }
+
+    fun importSharedExit(invite: ParsedWireGuardInvite, displayName: String): ConfiguredExit? {
+        if (hasImportedSharedExit(invite)) return null
+        val now = System.currentTimeMillis()
+        val profileId = "shared:${UUID.randomUUID()}"
+        val name = displayName.trim().ifBlank { "Shared Exit" }
+        val secretKey = SecureSecretStore.sharedWireGuardConfig(profileId)
+        secretStore.putSecret(secretKey, invite.rawConfig)
+        val profile = SharedExitProfile(
+            id = profileId,
+            displayName = name,
+            source = SharedExitSource.IMPORTED_QR,
+            providerType = SharedExitProviderType.SHARED_WIREGUARD,
+            wireGuardConfigSecretKey = secretKey,
+            configHash = invite.configHash,
+            encryptedWireGuardConfig = null,
+            endpointHost = invite.endpointHost,
+            endpointIp = invite.endpointHost,
+            importedAt = now,
+            updatedAt = now,
+        )
+        val exit = ConfiguredExit(
+            id = profileId,
+            name = name,
+            publicIp = invite.endpointHost,
+            wireGuardPort = invite.endpointPort,
+            region = "Shared Exit",
+            wireGuardConfig = invite.rawConfig,
+            wireGuardConfigSecretKey = secretKey,
+            provider = ExitProvider.SHARED_WIREGUARD,
+            endpointHost = invite.endpointHost,
+            endpointPort = invite.endpointPort,
+            lifecycleState = ExitLifecycleState.READY,
+            createdAt = now,
+            serverPublicKey = invite.peerPublicKey,
+            serverPeerPublicKey = invite.clientPublicKey,
+            clientPublicKey = invite.clientPublicKey,
+            transportLabel = "Shared WireGuard exit",
+            tcpSupported = true,
+            udpSupported = true,
+            destroyMeaning = "removeLocalProfile",
+        )
+        friendsRepository?.let { repository ->
+            _sharedExitProfiles.value = repository.addSharedExit(profile)
+        }
+        _configuredExits.value = _configuredExits.value + exit
+        _selectedExitId.value = exit.id
+        restoreStateFromSelectedExitOrIdle()
+        persistState()
+        return exit
+    }
+
+    fun renameSharedExitProfile(profileId: String, name: String) {
+        val trimmed = name.trim().ifBlank { "Shared Exit" }
+        friendsRepository?.let { repository ->
+            _sharedExitProfiles.value = repository.renameSharedExit(profileId, trimmed)
+        }
+        updateExit(profileId) { exit ->
+            if (exit.provider == ExitProvider.SHARED_WIREGUARD) exit.copy(name = trimmed) else exit
+        }
+    }
+
+    fun removeSharedExitProfile(profileId: String) {
+        _sharedExitProfiles.value.firstOrNull { it.id == profileId }?.wireGuardConfigSecretKey?.let {
+            secretStore.removeSecret(it)
+        }
+        _configuredExits.value.firstOrNull { it.id == profileId }?.wireGuardConfigSecretKey?.let {
+            secretStore.removeSecret(it)
+        }
+        friendsRepository?.let { repository ->
+            _sharedExitProfiles.value = repository.removeSharedExit(profileId)
+        }
+        _configuredExits.value = _configuredExits.value.filterNot {
+            it.id == profileId && it.provider == ExitProvider.SHARED_WIREGUARD
+        }
+        if (_selectedExitId.value == profileId) {
+            _selectedExitId.value = _configuredExits.value.firstOrNull()?.id
+        }
+        restoreStateFromSelectedExitOrIdle()
+        persistState()
+    }
+
+    fun createVolunteerExit(): ConfiguredExit {
+        _configuredExits.value.firstOrNull { it.provider == ExitProvider.VOLUNTEER }?.let { existing ->
+            selectExit(existing.id)
+            return existing
+        }
+        val exit = ConfiguredExit(
+            id = "volunteer:${UUID.randomUUID()}",
+            name = "Volunteer Exit",
+            publicIp = "Unknown",
+            wireGuardPort = 0,
+            region = "Volunteer Network",
+            wireGuardConfig = "",
+            provider = ExitProvider.VOLUNTEER,
+            endpointHost = "embedded-tor",
+            endpointPort = 0,
+            lifecycleState = ExitLifecycleState.READY,
+            createdAt = System.currentTimeMillis(),
+            transportLabel = "Volunteer Network",
+            tcpSupported = true,
+            udpSupported = false,
+            dnsStatus = "Under validation",
+            destroyMeaning = "removeLocalProfile",
+        )
+        _configuredExits.value = _configuredExits.value + exit
+        _selectedExitId.value = exit.id
+        _state.value = ProvisioningState.Success(
+            publicIp = exit.publicIp,
+            wireGuardPort = exit.wireGuardPort,
+            region = exit.region,
+            isDevMode = _isDevMode.value,
+        )
+        persistState()
+        return exit
+    }
+
+    fun removeLocalExit(exitId: String) {
+        _configuredExits.value.firstOrNull { it.id == exitId }?.let { cleanupOwnerExitLocalState(it) }
+        _configuredExits.value = _configuredExits.value.filterNot { it.id == exitId }
+        if (_selectedExitId.value == exitId) {
+            _selectedExitId.value = _configuredExits.value.firstOrNull()?.id
+        }
+        restoreStateFromSelectedExitOrIdle()
+        persistState()
+    }
+
+    fun clearTransientProvisioningSuccess() {
+        if (_state.value is ProvisioningState.Success || _state.value is ProvisioningState.Destroyed) {
+            restoreStateFromSelectedExitOrIdle()
+            persistState()
+        }
+    }
+
     fun startProvisioning(context: Context) {
         if (_state.value is ProvisioningState.Running) return
+        setPendingOracleOperation(PendingOracleOperation.Provision)
         _oracleOnboardingState.value = OracleOnboardingState.AuthLaunched
         // Read the latest dev mode setting from SharedPreferences
         if (::prefs.isInitialized) {
@@ -406,6 +1097,25 @@ class ProvisioningViewModel : ViewModel() {
     }
 
     fun retry(context: Context) {
+        val operation = when {
+            failedOracleOperation.type != OracleOperationType.NONE -> failedOracleOperation
+            pendingOracleOperation.type != OracleOperationType.NONE -> pendingOracleOperation
+            else -> PendingOracleOperation.Provision
+        }
+        if (operation.type == OracleOperationType.DESTROY_EXIT) {
+            destroyNode(context, operation.exitId)
+            return
+        }
+        if (operation.type != OracleOperationType.PROVISION) {
+            _state.value = ProvisioningState.Failure(
+                failedPhase = Phase.DONE,
+                lastSuccessPhase = null,
+                errorMessage = "No Oracle operation is available to retry.",
+            )
+            persistState()
+            return
+        }
+        setPendingOracleOperation(PendingOracleOperation.Provision)
         if (::prefs.isInitialized) {
             _isDevMode.value = prefs.getBoolean("is_dev_mode", false)
         }
@@ -434,38 +1144,41 @@ class ProvisioningViewModel : ViewModel() {
     }
 
     fun destroyNode(context: Context, exitId: String? = _selectedExitId.value) {
+        if (_state.value is ProvisioningState.Running || _state.value is ProvisioningState.Destroying) return
         val targetExit = exitId?.let { id -> _configuredExits.value.firstOrNull { it.id == id } }
-        _state.value = ProvisioningState.Destroying
-        if (targetExit != null) {
-            updateExit(targetExit.id) { it.copy(lifecycleState = ExitLifecycleState.DESTROYING, lastError = null) }
+        val destroyOperation = targetExit?.toDestroyOperation() ?: PendingOracleOperation(
+            type = OracleOperationType.DESTROY_EXIT,
+            exitId = exitId,
+        )
+        setPendingOracleOperation(destroyOperation)
+        if (targetExit == null) {
+            val message = "Selected Oracle exit was not found. Destroy was not started."
+            setFailedOracleOperation(destroyOperation, message)
+            _state.value = ProvisioningState.Failure(
+                failedPhase = Phase.DONE,
+                lastSuccessPhase = null,
+                errorMessage = message,
+            )
+            persistState()
+            return
         }
+        _state.value = ProvisioningState.Destroying
+        updateExit(targetExit.id) { it.copy(lifecycleState = ExitLifecycleState.DESTROYING, lastError = null) }
         viewModelScope.launch {
-            val currentRids = targetExit?.ociResourceIds?.toProvisionerResourceIds() ?: resourceIds ?: loadResourceIds()
-            val currentRegion = targetExit?.region ?: homeRegion
-            val currentApiKeyUserOcid = targetExit?.apiKeyUserOcid ?: apiKeyUserOcid
-            val currentApiKeyFingerprint = targetExit?.apiKeyFingerprint ?: apiKeyFingerprint
+            val currentRids = targetExit.ociResourceIds?.toProvisionerResourceIds()
+            val currentRegion = targetExit.region
+            val currentApiKeyUserOcid = targetExit.apiKeyUserOcid
+            val currentApiKeyFingerprint = targetExit.apiKeyFingerprint
 
             if (currentRids == null) {
+                val message = "Local resource IDs are missing. Delete the node resources manually in the Oracle Console."
+                setFailedOracleOperation(destroyOperation, message)
                 targetExit?.let {
                     updateExit(it.id) { exit ->
                         exit.copy(
                             lifecycleState = ExitLifecycleState.FAILED,
-                            lastError = "Local resource IDs are missing. Delete the node resources manually in the Oracle Console.",
+                            lastError = message,
                         )
-                    }
-                }
-                _state.value = ProvisioningState.Failure(
-                    failedPhase = Phase.DONE,
-                    lastSuccessPhase = null,
-                    errorMessage = "Local resource IDs are missing. Delete the node resources manually in the Oracle Console.",
-                )
-                return@launch
-            }
-            if (currentRegion == null) {
-                val message = "Oracle region is missing for this node. Delete the node resources manually in the Oracle Console."
-                targetExit?.let {
-                    updateExit(it.id) { exit ->
-                        exit.copy(lifecycleState = ExitLifecycleState.FAILED, lastError = message)
                     }
                 }
                 _state.value = ProvisioningState.Failure(
@@ -473,9 +1186,9 @@ class ProvisioningViewModel : ViewModel() {
                     lastSuccessPhase = null,
                     errorMessage = message,
                 )
+                persistState()
                 return@launch
             }
-
             val prov = provisioner ?: OciProvisioner(context, currentRegion, _isDevMode.value).also { provisioner = it }
             val eventJob = viewModelScope.launch {
                 prov.events.collect { event ->
@@ -494,10 +1207,14 @@ class ProvisioningViewModel : ViewModel() {
                 )
                 val currentAuth = authResult ?: run {
                     _currentPhase.value = Phase.AUTH
-                    emit(Phase.AUTH, Status.RUNNING, "Authentication required before destroy...")
+                    emit(Phase.AUTH, Status.RUNNING, "Sign in to Oracle to destroy this exit.")
+                    _oracleOnboardingState.value = OracleOnboardingState.AuthLaunched
+                    persistState()
                     prov.authenticate().also { authResult = it }
                 }
+                refreshOracleOperationDiagnostics()
 
+                _currentPhase.value = Phase.DONE
                 emit(Phase.DONE, Status.RUNNING, "Destroying node resources...")
                 prov.destroy(
                     rids = currentRids,
@@ -512,6 +1229,7 @@ class ProvisioningViewModel : ViewModel() {
                 _currentPhase.value = null
                 _publicIp.value = null
                 targetExit?.let { removed ->
+                    cleanupOwnerExitLocalState(removed)
                     _configuredExits.value = _configuredExits.value.filterNot { it.id == removed.id }
                     if (_selectedExitId.value == removed.id) {
                         _selectedExitId.value = _configuredExits.value.firstOrNull()?.id
@@ -524,6 +1242,7 @@ class ProvisioningViewModel : ViewModel() {
                 wireGuardServerPublicKey = null
                 wireGuardServerPeerPublicKey = null
                 authResult = null
+                clearOracleOperationState()
                 apiKeyUserOcid = null
                 apiKeyTenancyOcid = null
                 apiKeyFingerprint = null
@@ -531,19 +1250,29 @@ class ProvisioningViewModel : ViewModel() {
                     persistState()
                 }
             } catch (e: Exception) {
+                val destroyError = if (_currentPhase.value == Phase.AUTH) {
+                    "Destroy cancelled. Oracle sign-in was not completed."
+                } else {
+                    e.message ?: "Destroy failed."
+                }
+                setFailedOracleOperation(destroyOperation, destroyError)
                 targetExit?.let {
                     updateExit(it.id) { exit ->
                         exit.copy(
                             lifecycleState = ExitLifecycleState.FAILED,
-                            lastError = e.message,
+                            lastError = destroyError,
                         )
                     }
                 }
                 _state.value = ProvisioningState.Failure(
                     failedPhase = _currentPhase.value ?: Phase.DONE,
                     lastSuccessPhase = null,
-                    errorMessage = e.message,
+                    errorMessage = destroyError,
                 )
+                if (_currentPhase.value == Phase.AUTH) {
+                    _oracleOnboardingState.value = OracleOnboardingState.AuthFailed
+                }
+                persistState()
             } finally {
                 eventJob.cancel()
             }
@@ -589,6 +1318,7 @@ class ProvisioningViewModel : ViewModel() {
             wireGuardServerPublicKey = null
             wireGuardServerPeerPublicKey = null
             pendingProvisionExitId = null
+            clearOracleOperationState()
             restoreStateFromSelectedExitOrIdle()
             persistState()
         }
@@ -596,6 +1326,20 @@ class ProvisioningViewModel : ViewModel() {
 
     private suspend fun runProvisioning(context: Context) {
         try {
+            if (pendingOracleOperation.type != OracleOperationType.PROVISION) {
+                val message = "Provisioning was not the pending Oracle operation."
+                setFailedOracleOperation(
+                    PendingOracleOperation(OracleOperationType.PROVISION),
+                    message,
+                )
+                _state.value = ProvisioningState.Failure(
+                    failedPhase = Phase.AUTH,
+                    lastSuccessPhase = null,
+                    errorMessage = message,
+                )
+                persistState()
+                return
+            }
             val uiSelectedRegion = _selectedOracleRegion.value
             val persistedRegion = homeRegion
             val authBootstrapRegion = uiSelectedRegion ?: persistedRegion ?: AUTH_BOOTSTRAP_REGION
@@ -623,6 +1367,7 @@ class ProvisioningViewModel : ViewModel() {
                     "manualRegionId=${uiSelectedRegion ?: "none"} authBootstrapRegionId=$authBootstrapRegion",
             )
             authResult = prov.authenticate()
+            refreshOracleOperationDiagnostics()
             _oracleOnboardingState.value = OracleOnboardingState.ReadyToProvision
             persistState()
 
@@ -645,6 +1390,7 @@ class ProvisioningViewModel : ViewModel() {
 
             if (!preflightResult!!.success) {
                 eventJob.cancel()
+                setFailedOracleOperation(PendingOracleOperation.Provision, preflightResult!!.error)
                 _state.value = ProvisioningState.Failure(
                     failedPhase = Phase.API_KEY,
                     lastSuccessPhase = Phase.AUTH,
@@ -668,6 +1414,7 @@ class ProvisioningViewModel : ViewModel() {
             doProvision(context, prov)
 
         } catch (e: Exception) {
+            setFailedOracleOperation(PendingOracleOperation.Provision, e.message)
             val lastSuccess = when (_currentPhase.value) {
                 Phase.AUTH -> null
                 Phase.API_KEY -> Phase.AUTH
@@ -691,6 +1438,7 @@ class ProvisioningViewModel : ViewModel() {
 
     private suspend fun continueProvisioningAfterWarning(context: Context) {
         try {
+            setPendingOracleOperation(PendingOracleOperation.Provision)
             val warningRegion = preflightResult?.homeRegion ?: homeRegion ?: _selectedOracleRegion.value
                 ?: throw IllegalStateException("Oracle region is not available.")
             val prov = provisioner ?: OciProvisioner(context, warningRegion, _isDevMode.value).also { provisioner = it }
@@ -707,6 +1455,7 @@ class ProvisioningViewModel : ViewModel() {
 
             doProvision(context, prov)
         } catch (e: Exception) {
+            setFailedOracleOperation(PendingOracleOperation.Provision, e.message)
             _state.value = ProvisioningState.Failure(
                 failedPhase = _currentPhase.value ?: Phase.AUTH,
                 lastSuccessPhase = null,
@@ -738,7 +1487,7 @@ class ProvisioningViewModel : ViewModel() {
             _sshDebugInfo.value = SshDebugInfo(
                 publicIp = result.publicIp,
                 username = result.sshUsername,
-                privateKey = result.sshPrivateKey,
+                privateKeyPresent = true,
             )
             val configuredExit = buildConfiguredExit(
                 exitId = pendingProvisionExitId ?: newExitId(),
@@ -754,6 +1503,10 @@ class ProvisioningViewModel : ViewModel() {
             )
             _configuredExits.value = _configuredExits.value + configuredExit
             _selectedExitId.value = configuredExit.id
+            createInviteSlotsForProvisionedExit(
+                ownerExitId = configuredExit.id,
+                inviteProfiles = result.inviteProfiles,
+            )
 
             _currentPhase.value = Phase.DONE
             _state.value = ProvisioningState.Success(
@@ -763,8 +1516,10 @@ class ProvisioningViewModel : ViewModel() {
                 isDevMode = _isDevMode.value,
             )
             _oracleOnboardingState.value = OracleOnboardingState.NotStarted
+            clearOracleOperationState()
             persistState()
         } catch (e: Exception) {
+            setFailedOracleOperation(PendingOracleOperation.Provision, e.message)
             _state.value = ProvisioningState.Failure(
                 failedPhase = _currentPhase.value ?: Phase.AUTH,
                 lastSuccessPhase = null,
@@ -775,6 +1530,38 @@ class ProvisioningViewModel : ViewModel() {
             }
             persistState()
         }
+    }
+
+    private fun createInviteSlotsForProvisionedExit(
+        ownerExitId: String,
+        inviteProfiles: List<OciProvisioner.InvitePeerProvisionResult>,
+    ) {
+        val repository = friendsRepository ?: return
+        if (inviteProfiles.isEmpty()) return
+        val now = System.currentTimeMillis()
+        var slots = _inviteSlots.value
+        inviteProfiles.sortedBy { it.slotIndex }.forEach { profile ->
+            val slotId = "$ownerExitId:friend-${profile.slotIndex}"
+            val secretKey = SecureSecretStore.inviteClientConfig(slotId)
+            secretStore.putSecret(secretKey, profile.clientConfig)
+            slots = repository.upsertInviteSlot(
+                InviteSlot(
+                    slotId = slotId,
+                    ownerExitId = ownerExitId,
+                    slotIndex = profile.slotIndex,
+                    displayName = null,
+                    state = InviteSlotState.UNUSED,
+                    tunnelIp = profile.tunnelIp,
+                    peerPublicKey = profile.clientPublicKey,
+                    clientConfigSecretKey = secretKey,
+                    encryptedClientConfig = null,
+                    encryptedClientPrivateKey = null,
+                    createdAt = now,
+                    updatedAt = now,
+                ),
+            )
+        }
+        _inviteSlots.value = slots
     }
 
     private fun openUrl(context: Context, url: String) {
@@ -866,29 +1653,40 @@ class ProvisioningViewModel : ViewModel() {
         sshUsername: String?,
         sshPrivateKey: String?,
         createdAt: Long,
-    ): ConfiguredExit = ConfiguredExit(
-        id = exitId,
-        name = name,
-        publicIp = publicIp,
-        wireGuardPort = wireGuardPort,
-        region = region,
-        wireGuardConfig = wireGuardConfig,
-        provider = ExitProvider.OCI,
-        endpointHost = publicIp,
-        endpointPort = wireGuardPort,
-        instanceId = resourceIds?.instanceId,
-        sshUsername = sshUsername,
-        sshPrivateKey = sshPrivateKey,
-        apiKeyUserOcid = apiKeyUserOcid,
-        apiKeyTenancyOcid = apiKeyTenancyOcid,
-        apiKeyFingerprint = apiKeyFingerprint,
-        lifecycleState = ExitLifecycleState.READY,
-        createdAt = createdAt,
-        ociResourceIds = resourceIds?.toConfiguredResourceIds(),
-        serverPublicKey = wireGuardServerPublicKey ?: parseWireGuardValue(wireGuardConfig, "Peer", "PublicKey"),
-        serverPeerPublicKey = wireGuardServerPeerPublicKey ?: wireGuardClientPublicKey,
-        clientPublicKey = wireGuardClientPublicKey,
-    )
+    ): ConfiguredExit {
+        val wireGuardSecretKey = SecureSecretStore.oracleOwnerWireGuardConfig(exitId)
+        if (wireGuardConfig.isNotBlank()) {
+            secretStore.putSecret(wireGuardSecretKey, wireGuardConfig)
+        }
+        val sshSecretKey = sshPrivateKey?.takeIf { it.isNotBlank() }?.let {
+            SecureSecretStore.oracleSshPrivateKey(exitId).also { key -> secretStore.putSecret(key, it) }
+        }
+        return ConfiguredExit(
+            id = exitId,
+            name = name,
+            publicIp = publicIp,
+            wireGuardPort = wireGuardPort,
+            region = region,
+            wireGuardConfig = wireGuardConfig,
+            wireGuardConfigSecretKey = wireGuardSecretKey,
+            provider = ExitProvider.OCI,
+            endpointHost = publicIp,
+            endpointPort = wireGuardPort,
+            instanceId = resourceIds?.instanceId,
+            sshUsername = sshUsername,
+            sshPrivateKeySecretKey = sshSecretKey,
+            sshPrivateKey = sshPrivateKey,
+            apiKeyUserOcid = apiKeyUserOcid,
+            apiKeyTenancyOcid = apiKeyTenancyOcid,
+            apiKeyFingerprint = apiKeyFingerprint,
+            lifecycleState = ExitLifecycleState.READY,
+            createdAt = createdAt,
+            ociResourceIds = resourceIds?.toConfiguredResourceIds(),
+            serverPublicKey = wireGuardServerPublicKey ?: parseWireGuardValue(wireGuardConfig, "Peer", "PublicKey"),
+            serverPeerPublicKey = wireGuardServerPeerPublicKey ?: wireGuardClientPublicKey,
+            clientPublicKey = wireGuardClientPublicKey,
+        )
+    }
 
     private fun parseWireGuardValue(config: String, sectionName: String, key: String): String? {
         val start = config.indexOf("[$sectionName]")
@@ -914,12 +1712,7 @@ class ProvisioningViewModel : ViewModel() {
         _selectedExitId.value = selected.id
         _publicIp.value = selected.publicIp
         _wireGuardPort.value = selected.wireGuardPort
-        _state.value = ProvisioningState.Success(
-            publicIp = selected.publicIp,
-            wireGuardPort = selected.wireGuardPort,
-            region = selected.region,
-            isDevMode = _isDevMode.value,
-        )
+        _state.value = ProvisioningState.Idle
     }
 
     private fun updateExit(exitId: String, transform: (ConfiguredExit) -> ConfiguredExit) {
@@ -928,6 +1721,79 @@ class ProvisioningViewModel : ViewModel() {
         }
         persistState()
     }
+
+    private fun cleanupOwnerExitLocalState(exit: ConfiguredExit) {
+        exit.wireGuardConfigSecretKey?.let { secretStore.removeSecret(it) }
+        exit.sshPrivateKeySecretKey?.let { secretStore.removeSecret(it) }
+        _inviteSlots.value
+            .filter { it.ownerExitId == exit.id }
+            .mapNotNull { it.clientConfigSecretKey }
+            .forEach { secretStore.removeSecret(it) }
+        friendsRepository?.let { repository ->
+            _inviteSlots.value = repository.removeInviteSlotsForOwnerExit(exit.id)
+        }
+    }
+
+    private fun recordInviteOperationError(detail: String) {
+        _lastInviteOperationError.value = detail
+        Log.w(TAG, detail)
+        persistState()
+    }
+
+    private fun buildInviteResetErrorDetail(
+        phase: InvitePeerResetPhase,
+        ownerExit: ConfiguredExit,
+        slot: InviteSlot,
+        message: String,
+        exitCode: Int? = null,
+        commandStderr: String = "",
+        cleanupError: String? = null,
+        oldInviteInvalidated: Boolean = false,
+    ): String = buildString {
+        append("reset phase=").append(phase.name)
+        append(" ownerExitId=").append(ownerExit.id)
+        append(" slotId=").append(slot.slotId)
+        append(" slotIndex=").append(slot.slotIndex)
+        append(" tunnelIp=").append(slot.tunnelIp ?: "N/A")
+        append(" oldPeerPrefix=").append(slot.peerPublicKey.safePublicKeyPrefix())
+        append(" sshHost=").append(ownerExit.publicIp.ifBlank { "N/A" })
+        append(" sshUser=").append(ownerExit.sshUsername ?: "N/A")
+        exitCode?.let { append(" exitCode=").append(it) }
+        append(" oldInviteInvalidated=").append(if (oldInviteInvalidated) "yes" else "no")
+        append(" message=").append(message.sanitizeInviteDiagnostic())
+        commandStderr.takeIf { it.isNotBlank() }?.let {
+            append(" stderr=").append(it.sanitizeInviteDiagnostic())
+        }
+        cleanupError?.takeIf { it.isNotBlank() }?.let {
+            append(" cleanupError=").append(it.sanitizeInviteDiagnostic())
+        }
+    }
+
+    private fun InvitePeerResetPhase.mayHaveInvalidatedOldInvite(): Boolean =
+        when (this) {
+            InvitePeerResetPhase.RESTART_WG_FAILED,
+            InvitePeerResetPhase.VERIFY_NEW_PEER_FAILED,
+            InvitePeerResetPhase.VERIFY_LATEST_HANDSHAKES_FAILED
+            -> true
+            else -> false
+        }
+
+    private fun String?.safePublicKeyPrefix(): String =
+        this?.takeIf { it.isNotBlank() }?.let { value ->
+            if (value.length <= 10) "$value..." else "${value.take(10)}..."
+        } ?: "N/A"
+
+    private fun String?.safeOcidPrefix(): String? =
+        this?.takeIf { it.isNotBlank() }?.let { value ->
+            if (value.length <= 18) "$value..." else "${value.take(18)}..."
+        }
+
+    private fun String.sanitizeInviteDiagnostic(): String =
+        lineSequence()
+            .map { it.trim() }
+            .filter { it.isNotBlank() }
+            .joinToString(" | ")
+            .take(700)
 
     private fun nextExitName(): String {
         val used = _configuredExits.value.mapNotNull { exit ->
@@ -969,12 +1835,14 @@ class ProvisioningViewModel : ViewModel() {
         .put("publicIp", publicIp)
         .put("wireGuardPort", wireGuardPort)
         .put("region", region)
-        .put("wireGuardConfig", wireGuardConfig)
+        .put("wireGuardConfig", JSONObject.NULL)
+        .put("wireGuardConfigSecretKey", wireGuardConfigSecretKey)
         .put("endpointHost", endpointHost)
         .put("endpointPort", endpointPort)
         .put("compartmentId", compartmentId)
         .put("instanceId", instanceId)
         .put("sshUsername", sshUsername)
+        .put("sshPrivateKeySecretKey", sshPrivateKeySecretKey)
         .put("sshPrivateKey", JSONObject.NULL)
         .put("apiKeyUserOcid", apiKeyUserOcid)
         .put("apiKeyTenancyOcid", apiKeyTenancyOcid)
@@ -986,6 +1854,11 @@ class ProvisioningViewModel : ViewModel() {
         .put("serverPublicKey", serverPublicKey)
         .put("serverPeerPublicKey", serverPeerPublicKey)
         .put("clientPublicKey", clientPublicKey)
+        .put("transportLabel", transportLabel)
+        .put("tcpSupported", tcpSupported)
+        .put("udpSupported", udpSupported)
+        .put("dnsStatus", dnsStatus)
+        .put("destroyMeaning", destroyMeaning)
         .put("ociResourceIds", ociResourceIds?.toJson())
 
     private fun OciResourceIds.toJson(): JSONObject = JSONObject()
@@ -996,21 +1869,49 @@ class ProvisioningViewModel : ViewModel() {
         .put("instanceId", instanceId)
 
     private fun JSONObject.toConfiguredExit(): ConfiguredExit {
+        val exitId = getString("id")
+        val provider = runCatching {
+            ExitProvider.valueOf(optString("provider", ExitProvider.OCI.name))
+        }.getOrDefault(ExitProvider.OCI)
+        val legacyWireGuardConfig = optNullableString("wireGuardConfig")
+        val storedWireGuardSecretKey = optNullableString("wireGuardConfigSecretKey")
+        val wireGuardSecretKey = storedWireGuardSecretKey
+            ?: legacyWireGuardConfig?.takeIf { it.isNotBlank() }?.let {
+                if (provider == ExitProvider.SHARED_WIREGUARD) {
+                    SecureSecretStore.sharedWireGuardConfig(exitId)
+                } else {
+                    SecureSecretStore.oracleOwnerWireGuardConfig(exitId)
+                }
+            }
+        if (legacyWireGuardConfig != null && storedWireGuardSecretKey == null && wireGuardSecretKey != null) {
+            secretStore.putSecret(wireGuardSecretKey, legacyWireGuardConfig)
+        }
+        val legacySshPrivateKey = optNullableString("sshPrivateKey")
+        val storedSshSecretKey = optNullableString("sshPrivateKeySecretKey")
+        val sshSecretKey = storedSshSecretKey
+            ?: legacySshPrivateKey?.takeIf { it.isNotBlank() }?.let {
+                SecureSecretStore.oracleSshPrivateKey(exitId)
+            }
+        if (legacySshPrivateKey != null && storedSshSecretKey == null && sshSecretKey != null) {
+            secretStore.putSecret(sshSecretKey, legacySshPrivateKey)
+        }
         val resourceJson = optJSONObject("ociResourceIds")
         return ConfiguredExit(
-            id = getString("id"),
+            id = exitId,
             name = optString("name").takeIf { it.isNotBlank() } ?: "Exit 1",
-            provider = runCatching { ExitProvider.valueOf(optString("provider", ExitProvider.OCI.name)) }.getOrDefault(ExitProvider.OCI),
+            provider = provider,
             publicIp = getString("publicIp"),
             wireGuardPort = optInt("wireGuardPort", 51820),
             region = optString("region", LEGACY_REGION_FALLBACK),
-            wireGuardConfig = getString("wireGuardConfig"),
+            wireGuardConfig = wireGuardSecretKey?.let { secretStore.getSecret(it) }.orEmpty(),
+            wireGuardConfigSecretKey = wireGuardSecretKey,
             endpointHost = optString("endpointHost").takeIf { it.isNotBlank() } ?: getString("publicIp"),
             endpointPort = optInt("endpointPort", optInt("wireGuardPort", 51820)),
             compartmentId = optNullableString("compartmentId"),
             instanceId = optNullableString("instanceId"),
             sshUsername = optNullableString("sshUsername"),
-            sshPrivateKey = optNullableString("sshPrivateKey"),
+            sshPrivateKeySecretKey = sshSecretKey,
+            sshPrivateKey = sshSecretKey?.let { secretStore.getSecret(it) },
             apiKeyUserOcid = optNullableString("apiKeyUserOcid"),
             apiKeyTenancyOcid = optNullableString("apiKeyTenancyOcid"),
             apiKeyFingerprint = optNullableString("apiKeyFingerprint"),
@@ -1032,6 +1933,11 @@ class ProvisioningViewModel : ViewModel() {
             serverPublicKey = optNullableString("serverPublicKey"),
             serverPeerPublicKey = optNullableString("serverPeerPublicKey"),
             clientPublicKey = optNullableString("clientPublicKey"),
+            transportLabel = optNullableString("transportLabel"),
+            tcpSupported = optBooleanOrNull("tcpSupported"),
+            udpSupported = optBooleanOrNull("udpSupported"),
+            dnsStatus = optNullableString("dnsStatus"),
+            destroyMeaning = optNullableString("destroyMeaning"),
         )
     }
 
@@ -1041,8 +1947,12 @@ class ProvisioningViewModel : ViewModel() {
     private fun JSONObject.optLongOrNull(name: String): Long? =
         if (has(name) && !isNull(name)) optLong(name) else null
 
+    private fun JSONObject.optBooleanOrNull(name: String): Boolean? =
+        if (has(name) && !isNull(name)) optBoolean(name) else null
+
     companion object {
         const val ORACLE_SIGNUP_URL = "https://signup.oraclecloud.com/"
+        private const val TAG = "ZeroVpnProvisioning"
         // Only for old persisted exits created before region was stored per exit.
         private const val LEGACY_REGION_FALLBACK = "uk-london-1"
         private const val AUTH_BOOTSTRAP_REGION = "us-ashburn-1"

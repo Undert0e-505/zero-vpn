@@ -63,16 +63,34 @@ That path should be designed separately from public Volunteer Network mode.
 * [Open questions](07-open-questions.md)
 * [Device test results](08-device-test-results.md)
 * [tun2socks feasibility plan](09-tun2socks-feasibility.md)
+* [HEV native integration](10-hev-native-integration.md)
+* [Volunteer VPN device validation](11-volunteer-vpn-device-validation.md)
 * [Sources](sources.md)
 
 ## Next Action
 
-Decide how to integrate the selected tun2socks candidate:
+This branch ports the proven path into `feature/volunteer-debug-integration`
+behind two gates:
 
-1. Prefer a maintained AAR if one becomes available.
-2. Otherwise decide whether to add `hev-socks5-tunnel` as a pinned native
-   source dependency/submodule.
-3. Do not add prebuilt native binaries manually.
-4. Keep the feature behind Developer Mode.
-5. Do not route Android device traffic until DNS, UDP, lifecycle, and stop
-   behavior are explicitly validated.
+* Android debug/developer build flag: `-PenableVolunteerDebug=true`
+* in-app Developer Mode: ON
+
+HEV native remains independently gated with `-PenableHevNative=true`. Normal
+builds and release UI must not expose Volunteer Network controls.
+
+The Developer Mode-only self-contained path has now been validated end to end
+on device:
+
+```text
+Chrome -> Android VpnService TUN -> HEV tun2socks -> embedded Tor SOCKS -> Tor exit
+```
+
+Next work should stay behind Developer Mode and focus on hardening before any
+product UI:
+
+1. Keep DNS leak risk explicit until verified.
+2. Keep UDP unsupported unless a safe design is proven.
+3. Harden lifecycle, restart, and failure recovery.
+4. Preserve the Oracle/WireGuard production path untouched.
+5. Do not add public Volunteer Network UI until diagnostics and warnings are
+   ready.

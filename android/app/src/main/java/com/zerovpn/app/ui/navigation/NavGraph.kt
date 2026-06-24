@@ -9,6 +9,7 @@ import androidx.compose.material.icons.filled.Cloud
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.Hub
 import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.VolunteerActivism
 import androidx.compose.material3.Icon
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
@@ -38,6 +39,7 @@ import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.zerovpn.app.oci.OciAuthReturn
+import com.zerovpn.app.ui.provisioning.ProvisioningState
 import com.zerovpn.app.ui.provisioning.ProvisioningViewModel
 import com.zerovpn.app.ui.screens.*
 import com.zerovpn.app.ui.theme.*
@@ -47,16 +49,19 @@ import kotlinx.coroutines.launch
 sealed class Screen(val route: String, val label: String, val icon: ImageVector) {
     data object Home : Screen("home", "Home", Icons.Default.Home)
     data object AddExit : Screen("add_exit", "Add Exit", Icons.Default.Add)
-    data object NodeInvite : Screen("node_invite", "Nodes", Icons.Default.Hub)
+    data object Friends : Screen("node_invite", "Friends", Icons.Default.Hub)
     data object Diagnostics : Screen("diagnostics", "Diagnostics", Icons.Default.Build)
     data object Settings : Screen("settings", "Settings", Icons.Default.Settings)
     data object OracleProvision : Screen("oracle_provision", "Provision", Icons.Default.Cloud)
+    data object ScanInvite : Screen("scan_invite", "Scan", Icons.Default.Add)
+    data object VolunteerIntro : Screen("volunteer_intro", "Volunteer", Icons.Default.VolunteerActivism)
+    data object VolunteerDetails : Screen("volunteer_details", "Volunteer", Icons.Default.VolunteerActivism)
 }
 
 private val screens = listOf(
     Screen.Home,
     Screen.AddExit,
-    Screen.NodeInvite,
+    Screen.Friends,
     Screen.Diagnostics,
     Screen.Settings,
 )
@@ -72,6 +77,7 @@ fun NavGraph() {
     val lifecycleOwner = LocalLifecycleOwner.current
     val configuredExits by provisioningViewModel.configuredExits.collectAsState()
     val selectedExitId by provisioningViewModel.selectedExitId.collectAsState()
+    val provisioningState by provisioningViewModel.state.collectAsState()
 
     val navBackStackEntry by navController.currentBackStackEntryAsState()
     val currentDestination = navBackStackEntry?.destination
@@ -105,16 +111,35 @@ fun NavGraph() {
             lifecycleOwner.lifecycle.removeObserver(observer)
         }
     }
-    val navigateToTopLevel: (Screen) -> Unit = { screen ->
+
+    LaunchedEffect(currentDestination?.route, configuredExits, provisioningState) {
+        if (
+            currentDestination?.route == Screen.OracleProvision.route &&
+            configuredExits.isNotEmpty() &&
+            provisioningState is ProvisioningState.Idle
+        ) {
+            navController.navigate(Screen.Home.route) {
+                popUpTo(navController.graph.findStartDestination().id) {
+                    saveState = false
+                }
+                launchSingleTop = true
+                restoreState = false
+            }
+        }
+    }
+
+    val navigateToRootTab: (Screen) -> Unit = { screen ->
         if (screen == Screen.AddExit) {
             provisioningViewModel.prepareNewProvisioningFlow()
         }
+        // Root tabs are deterministic escape hatches. Do not restore saved child
+        // routes here; provisioning, scanner, success, and failure states are transient.
         navController.navigate(screen.route) {
             popUpTo(navController.graph.findStartDestination().id) {
-                saveState = true
+                saveState = false
             }
             launchSingleTop = true
-            restoreState = true
+            restoreState = false
         }
     }
 
@@ -144,7 +169,7 @@ fun NavGraph() {
                         },
                         selected = selected,
                         onClick = {
-                            navigateToTopLevel(screen)
+                            navigateToRootTab(screen)
                         },
                         colors = NavigationBarItemDefaults.colors(
                             indicatorColor = Surface,
@@ -171,7 +196,7 @@ fun NavGraph() {
                     viewModel = provisioningViewModel,
                     vpnViewModel = vpnViewModel,
                     onDestroyStarted = { navController.navigate(Screen.OracleProvision.route) },
-                    onAddExit = { navigateToTopLevel(Screen.AddExit) },
+                    onAddExit = { navigateToRootTab(Screen.AddExit) },
                 )
             }
             composable(Screen.AddExit.route) {
@@ -181,6 +206,42 @@ fun NavGraph() {
                         provisioningViewModel.prepareNewProvisioningFlow()
                         navController.navigate(Screen.OracleProvision.route)
                     },
+                    onNavigateToVolunteer = {
+                        navController.navigate(Screen.VolunteerIntro.route)
+                    },
+                    onNavigateToScanInvite = {
+                        navController.navigate(Screen.ScanInvite.route)
+                    },
+                )
+            }
+            composable(Screen.ScanInvite.route) {
+                ScanInviteScreen(
+                    viewModel = provisioningViewModel,
+                    onCancel = { navigateToRootTab(Screen.AddExit) },
+                    onImported = {
+                        navigateToRootTab(Screen.Home)
+                    },
+                )
+            }
+            composable(Screen.VolunteerIntro.route) {
+                VolunteerIntroScreen(
+                    snackbarHostState = snackbarHostState,
+                    provisioningViewModel = provisioningViewModel,
+                    onCancel = { navController.popBackStack() },
+                    onCreated = {
+                        navController.navigate(Screen.VolunteerDetails.route) {
+                            launchSingleTop = true
+                        }
+                    },
+                )
+            }
+            composable(Screen.VolunteerDetails.route) {
+                VolunteerDetailsScreen(
+                    snackbarHostState = snackbarHostState,
+                    provisioningViewModel = provisioningViewModel,
+                    vpnViewModel = vpnViewModel,
+                    onBack = { navController.popBackStack() },
+                    onHome = { navigateToRootTab(Screen.Home) },
                 )
             }
             composable(Screen.OracleProvision.route) {
@@ -190,12 +251,13 @@ fun NavGraph() {
                     viewModel = provisioningViewModel,
                     vpnViewModel = vpnViewModel,
                     onConnectedHome = {
+                        provisioningViewModel.clearTransientProvisioningSuccess()
                         navController.navigate(Screen.Home.route) {
                             popUpTo(navController.graph.findStartDestination().id) {
-                                saveState = true
+                                saveState = false
                             }
                             launchSingleTop = true
-                            restoreState = true
+                            restoreState = false
                         }
                     },
                     onDestroy = {
@@ -211,8 +273,14 @@ fun NavGraph() {
                     },
                 )
             }
-            composable(Screen.NodeInvite.route) {
-                NodeInviteScreen()
+            composable(Screen.Friends.route) {
+                FriendsScreen(
+                    viewModel = provisioningViewModel,
+                    onCreateOracleExit = {
+                        provisioningViewModel.prepareNewProvisioningFlow()
+                        navController.navigate(Screen.OracleProvision.route)
+                    },
+                )
             }
             composable(Screen.Diagnostics.route) {
                 DiagnosticsScreen(

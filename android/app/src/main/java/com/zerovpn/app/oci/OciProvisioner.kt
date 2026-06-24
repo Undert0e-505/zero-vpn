@@ -138,13 +138,27 @@ class OciProvisioner(
         val clientPublicKey: String,
         val serverPublicKey: String,
         val serverPeerPublicKey: String,
+        val inviteProfiles: List<InvitePeerProvisionResult> = emptyList(),
         val sshUsername: String,
         val sshPrivateKey: String,
+    )
+
+    data class InvitePeerProvisionResult(
+        val slotIndex: Int,
+        val tunnelIp: String,
+        val clientConfig: String,
+        val clientPublicKey: String,
     )
 
     private data class WireGuardClientKeys(
         val privateKey: String,
         val publicKey: String,
+    )
+
+    private data class FriendInvitePeer(
+        val slotIndex: Int,
+        val tunnelIp: String,
+        val keys: WireGuardClientKeys,
     )
 
     data class ResourceIds(
@@ -942,6 +956,7 @@ class OciProvisioner(
         publicIp: String,
         sshPrivateKey: String,
         clientKeys: WireGuardClientKeys,
+        friendInvitePeers: List<FriendInvitePeer>,
     ): ProvisionResult {
         val port = 51820
 
@@ -991,15 +1006,14 @@ class OciProvisioner(
             Status.RUNNING,
             "Phase region trace: provisioningRegion=$homeRegion publicIp=$publicIp setupHost=ubuntu@$publicIp",
         )
-        val installResult = runSshCommand(
-            sshConnection,
-            "sudo apt-get update -y; sudo apt-get install -y wireguard wireguard-tools; which wg || exit 1",
-            label = "install WireGuard",
-        )
-        if (installResult.exitCode != 0) {
+        if (!installWireGuardTools(sshConnection)) {
             sshConnection.session?.disconnect()
             keyTempFile.delete()
-            throw Exception("apt install failed: ${installResult.stderr.takeLast(300)}")
+            throw Exception(
+                "WireGuard tools could not be installed on the Oracle VM. " +
+                    "The VM was created and SSH worked, but apt could not find or install WireGuard tools. " +
+                    "Check the setup log for apt update, package policy, and sources output.",
+            )
         }
 
         emit(Phase.WIREGUARD, Status.RUNNING, "Generating server keys...")
@@ -1024,9 +1038,14 @@ class OciProvisioner(
 
         // Fix line endings and run
         runSshCommand(sshConnection, "sed -i 's/\\r\$//' /tmp/setup-wg.sh", label = "normalize WireGuard setup script")
+        val friendPeerEnv = friendInvitePeers
+            .sortedBy { it.slotIndex }
+            .joinToString(" ") { peer ->
+                "FRIEND_${peer.slotIndex}_PUBLIC_KEY='${peer.keys.publicKey}'"
+            }
         val runResult = runSshCommand(
             sshConnection,
-            "CLIENT_PUBLIC_KEY='${clientKeys.publicKey}' bash /tmp/setup-wg.sh",
+            "CLIENT_PUBLIC_KEY='${clientKeys.publicKey}' $friendPeerEnv bash /tmp/setup-wg.sh",
             label = "run WireGuard setup script",
             maxAttempts = 1,
         )
@@ -1066,6 +1085,20 @@ class OciProvisioner(
             "[Peer]\nPublicKey = $serverPub\n" +
             "Endpoint = $publicIp:$port\n" +
             "AllowedIPs = 0.0.0.0/0\nPersistentKeepalive = 25\n"
+        val inviteProfiles = friendInvitePeers
+            .sortedBy { it.slotIndex }
+            .map { peer ->
+                InvitePeerProvisionResult(
+                    slotIndex = peer.slotIndex,
+                    tunnelIp = peer.tunnelIp,
+                    clientPublicKey = peer.keys.publicKey,
+                    clientConfig = "[Interface]\nPrivateKey = ${peer.keys.privateKey}\n" +
+                        "Address = ${peer.tunnelIp}/32\nDNS = 1.1.1.1\n\n" +
+                        "[Peer]\nPublicKey = $serverPub\n" +
+                        "Endpoint = $publicIp:$port\n" +
+                        "AllowedIPs = 0.0.0.0/0\nPersistentKeepalive = 25\n",
+                )
+            }
 
         emit(Phase.WIREGUARD, Status.SUCCESS, "WireGuard configured")
         return ProvisionResult(
@@ -1075,6 +1108,7 @@ class OciProvisioner(
             clientPublicKey = clientKeys.publicKey,
             serverPublicKey = serverPub,
             serverPeerPublicKey = serverPeerPub,
+            inviteProfiles = inviteProfiles,
             sshUsername = "ubuntu",
             sshPrivateKey = sshPrivateKey,
         )
@@ -1158,6 +1192,151 @@ class OciProvisioner(
         )
     }
 
+    private suspend fun installWireGuardTools(connection: SshConnection): Boolean {
+        runLoggedRemoteCommand(connection, "cloud-init wait", "sudo cloud-init status --wait || true")
+        val diagnostics = listOf(
+            "lsb_release -a || cat /etc/os-release",
+            "uname -a",
+            "id",
+            "ip route",
+            "cat /etc/apt/sources.list || true",
+            "ls -la /etc/apt/sources.list.d || true",
+            "find /etc/apt/sources.list.d -maxdepth 1 -type f -print -exec sed -n '1,160p' {} \\; || true",
+            "apt-cache policy || true",
+            "apt-cache policy wireguard wireguard-tools || true",
+            "apt-cache search '^wireguard' || true",
+            "getent hosts archive.ubuntu.com || true",
+            "getent hosts security.ubuntu.com || true",
+        )
+        diagnostics.forEach { command ->
+            runLoggedRemoteCommand(connection, "preinstall diagnostic", command)
+        }
+
+        val updateCommand = "sudo DEBIAN_FRONTEND=noninteractive apt-get update -y -o Acquire::Retries=3"
+        var updateResult = runAptCommandWithRetries(connection, "apt update", updateCommand, attempts = 3)
+        runLoggedRemoteCommand(connection, "package policy after update", "apt-cache policy wireguard wireguard-tools || true")
+        runLoggedRemoteCommand(connection, "package search after update", "apt-cache search '^wireguard' || true")
+
+        val policyAfterUpdate = runLoggedRemoteCommand(
+            connection,
+            "wireguard-tools candidate after update",
+            "apt-cache policy wireguard-tools || true",
+        )
+        if (!hasAptCandidate(policyAfterUpdate.stdout) && isUbuntuVm(connection)) {
+            emit(Phase.WIREGUARD, Status.WARNING, "wireguard-tools has no apt candidate; enabling Ubuntu universe repository")
+            enableUbuntuUniverse(connection)
+            updateResult = runAptCommandWithRetries(connection, "apt update after universe", updateCommand, attempts = 3)
+            runLoggedRemoteCommand(connection, "package policy after universe", "apt-cache policy wireguard wireguard-tools || true")
+            runLoggedRemoteCommand(connection, "package search after universe", "apt-cache search '^wireguard' || true")
+        } else if (!hasAptCandidate(policyAfterUpdate.stdout)) {
+            emit(Phase.WIREGUARD, Status.WARNING, "wireguard-tools has no apt candidate and VM is not Ubuntu; universe fallback skipped")
+        }
+
+        val prereqCommand = "sudo DEBIAN_FRONTEND=noninteractive apt-get install -y " +
+            "software-properties-common apt-transport-https ca-certificates curl"
+        runAptCommandWithRetries(connection, "apt install prerequisites", prereqCommand, attempts = 2)
+        if (isUbuntuVm(connection)) {
+            enableUbuntuUniverse(connection)
+            runAptCommandWithRetries(connection, "apt update after prerequisite universe", updateCommand, attempts = 2)
+        }
+
+        val installWithMeta = "sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends " +
+            "wireguard wireguard-tools iptables iproute2 curl ca-certificates"
+        var installResult = runAptCommandWithRetries(connection, "apt install wireguard packages", installWithMeta, attempts = 3)
+        if (installResult.exitCode != 0) {
+            emit(Phase.WIREGUARD, Status.WARNING, "wireguard meta-package install failed; retrying with wireguard-tools only")
+            runLoggedRemoteCommand(connection, "package policy before tools-only retry", "apt-cache policy wireguard wireguard-tools || true")
+            val installToolsOnly = "sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends " +
+                "wireguard-tools iptables iproute2 curl ca-certificates"
+            installResult = runAptCommandWithRetries(connection, "apt install wireguard-tools only", installToolsOnly, attempts = 3)
+        }
+
+        runLoggedRemoteCommand(connection, "kernel module check", "sudo modprobe wireguard || true")
+        runLoggedRemoteCommand(connection, "loaded module check", "lsmod | grep wireguard || true")
+        runLoggedRemoteCommand(connection, "verify wg", "command -v wg && wg --version || true")
+        runLoggedRemoteCommand(connection, "verify wg-quick", "command -v wg-quick && wg-quick --version || true")
+        runLoggedRemoteCommand(connection, "verify iptables", "command -v iptables && iptables --version || true")
+        runLoggedRemoteCommand(connection, "verify ip", "command -v ip && ip -V || true")
+
+        val wgCheck = runLoggedRemoteCommand(connection, "required wg check", "command -v wg")
+        val wgQuickCheck = runLoggedRemoteCommand(connection, "required wg-quick check", "command -v wg-quick")
+        if (installResult.exitCode != 0 || updateResult.exitCode != 0 || wgCheck.exitCode != 0 || wgQuickCheck.exitCode != 0) {
+            runLoggedRemoteCommand(connection, "final package policy", "apt-cache policy wireguard wireguard-tools || true")
+            emit(Phase.WIREGUARD, Status.ERROR, "WireGuard tools were not installed. See apt source and package policy output above.")
+            return false
+        }
+        return true
+    }
+
+    private suspend fun enableUbuntuUniverse(connection: SshConnection) {
+        runLoggedRemoteCommand(connection, "Ubuntu release info", ". /etc/os-release; echo \"${'$'}ID ${'$'}VERSION_CODENAME\"")
+        runLoggedRemoteCommand(
+            connection,
+            "enable Ubuntu universe",
+            "if command -v add-apt-repository >/dev/null 2>&1; then sudo add-apt-repository -y universe; else echo 'add-apt-repository not available'; exit 1; fi",
+        )
+    }
+
+    private suspend fun runAptCommandWithRetries(
+        connection: SshConnection,
+        label: String,
+        command: String,
+        attempts: Int,
+    ): RemoteCommandResult {
+        var result = RemoteCommandResult(255, "", "$label was not attempted")
+        repeat(attempts) { index ->
+            val attempt = index + 1
+            emit(Phase.WIREGUARD, Status.RUNNING, "$label attempt $attempt/$attempts")
+            result = runLoggedRemoteCommand(connection, "$label attempt $attempt", command)
+            if (result.exitCode == 0) return result
+            if (attempt < attempts) {
+                kotlinx.coroutines.delay(10_000)
+            }
+        }
+        return result
+    }
+
+    private fun hasAptCandidate(policyOutput: String): Boolean =
+        policyOutput.lineSequence().any { line ->
+            val trimmed = line.trim()
+            trimmed.startsWith("Candidate:") &&
+                !trimmed.endsWith("(none)") &&
+                !trimmed.endsWith("none")
+        }
+
+    private suspend fun isUbuntuVm(connection: SshConnection): Boolean {
+        val result = runLoggedRemoteCommand(
+            connection,
+            "detect Ubuntu",
+            "grep -E '^ID=ubuntu$|^ID=\"ubuntu\"$' /etc/os-release",
+        )
+        return result.exitCode == 0
+    }
+
+    private suspend fun runLoggedRemoteCommand(
+        connection: SshConnection,
+        label: String,
+        command: String,
+    ): RemoteCommandResult {
+        emit(Phase.WIREGUARD, Status.RUNNING, "VM $label command: $command")
+        val result = runSshCommand(connection, command, label, maxAttempts = 1)
+        emit(Phase.WIREGUARD, if (result.exitCode == 0) Status.RUNNING else Status.WARNING, "VM $label exit=${result.exitCode}")
+        emitRemoteOutput(label, "stdout", result.stdout)
+        emitRemoteOutput(label, "stderr", result.stderr)
+        return result
+    }
+
+    private suspend fun emitRemoteOutput(label: String, stream: String, output: String) {
+        val lines = output.lineSequence()
+            .map { it.trimEnd() }
+            .filter { it.isNotBlank() }
+            .toList()
+            .takeLast(40)
+        lines.forEach { line ->
+            emit(Phase.WIREGUARD, Status.RUNNING, "VM $label $stream: $line")
+        }
+    }
+
     private suspend fun runSshCommand(
         connection: SshConnection,
         command: String,
@@ -1238,6 +1417,11 @@ class OciProvisioner(
         val sshPublicKey = sshKeyPair.first
         val sshPrivateKey = sshKeyPair.second
         val wireGuardClientKeys = generateWireGuardClientKeys()
+        val friendInvitePeers = listOf(
+            FriendInvitePeer(slotIndex = 1, tunnelIp = "10.66.66.3", keys = generateWireGuardClientKeys()),
+            FriendInvitePeer(slotIndex = 2, tunnelIp = "10.66.66.4", keys = generateWireGuardClientKeys()),
+            FriendInvitePeer(slotIndex = 3, tunnelIp = "10.66.66.5", keys = generateWireGuardClientKeys()),
+        )
 
         // Create network
         val rids = createNetwork(auth, homeRegion)
@@ -1246,7 +1430,14 @@ class OciProvisioner(
         val publicIp = launchVm(auth, homeRegion, rids, sshPublicKey)
 
         // Setup WireGuard via SSH
-        val provisionResult = setupWireGuard(auth, homeRegion, publicIp, sshPrivateKey, wireGuardClientKeys)
+        val provisionResult = setupWireGuard(
+            auth = auth,
+            homeRegion = homeRegion,
+            publicIp = publicIp,
+            sshPrivateKey = sshPrivateKey,
+            clientKeys = wireGuardClientKeys,
+            friendInvitePeers = friendInvitePeers,
+        )
 
         // Done
         emit(Phase.DONE, Status.SUCCESS, "Exit created: ${provisionResult.publicIp}:${provisionResult.wireGuardPort}")
@@ -1647,6 +1838,10 @@ if [ -z "${'$'}CLIENT_PUBLIC_KEY" ]; then
   echo "ERROR: CLIENT_PUBLIC_KEY is required" >&2
   exit 1
 fi
+if [ -z "${'$'}FRIEND_1_PUBLIC_KEY" ] || [ -z "${'$'}FRIEND_2_PUBLIC_KEY" ] || [ -z "${'$'}FRIEND_3_PUBLIC_KEY" ]; then
+  echo "ERROR: FRIEND_1_PUBLIC_KEY, FRIEND_2_PUBLIC_KEY, and FRIEND_3_PUBLIC_KEY are required" >&2
+  exit 1
+fi
 
 PUBLIC_IF=${'$'}(ip route show default | awk '{print ${'$'}5; exit}')
 if [ -z "${'$'}PUBLIC_IF" ]; then
@@ -1670,6 +1865,18 @@ PostDown = iptables -D INPUT -p udp --dport 51820 -j ACCEPT 2>/dev/null || true;
 [Peer]
 PublicKey = ${'$'}CLIENT_PUBLIC_KEY
 AllowedIPs = 10.66.66.2/32
+
+[Peer]
+PublicKey = ${'$'}FRIEND_1_PUBLIC_KEY
+AllowedIPs = 10.66.66.3/32
+
+[Peer]
+PublicKey = ${'$'}FRIEND_2_PUBLIC_KEY
+AllowedIPs = 10.66.66.4/32
+
+[Peer]
+PublicKey = ${'$'}FRIEND_3_PUBLIC_KEY
+AllowedIPs = 10.66.66.5/32
 EOF"
 sudo chmod 600 /etc/wireguard/wg0.conf
 

@@ -188,3 +188,70 @@ This planning pass did not add Android code because no clean maintained Maven
 dependency/AAR path was identified. The selected candidate is source-buildable,
 but adding native source/submodule build plumbing needs an explicit follow-up
 decision.
+
+## Decision: Native Source Integration Spike
+
+Decision date: 2026-06-22
+
+The follow-up spike approved native-source integration for
+`hev-socks5-tunnel`.
+
+Selected upstream:
+
+* repo: `https://github.com/heiher/hev-socks5-tunnel.git`
+* source management: git submodule at `android/native/hev-socks5-tunnel`
+* selected tag: `2.15.0`
+* selected commit: `00c7eb9ad7ca381b0f1fee880abc1077fe9b93be`
+* license: MIT
+
+Nested source pins from the selected tag:
+
+* `hev-socks5-core`: `ee0f24505d344f14b14624fa2249e6ccfaed138b`
+* `hev-task-system`: `8d83bbbf79557138726c8ee5a5fae99cbb978d61`
+* `lwip`: `8c69dfbe537835d5f2a5fd8c08c859f667b108ea`
+* `yaml`: `efa36117a8646d26d12b58e05bac472d7854a70d`
+
+Why this path:
+
+* `hev-socks5-tunnel` remains the lowest-risk technical candidate found for
+  Android because it has an Android `ndk-build` path, a TUN fd API, SOCKS5
+  support, TCP redirection, explicit UDP configuration, and `map-dns` support.
+* No maintained Maven/AAR route was found.
+* Manually adding prebuilt `.so` files is rejected because it would make the
+  dependency hard to audit and reproduce.
+* A pinned source submodule keeps upstream provenance visible without vendoring
+  generated binaries into the ZeroVPN repo.
+
+Attempted native build shape:
+
+* install Android NDK `27.0.12077973` into the repo-local Android SDK
+* configure Gradle `externalNativeBuild.ndkBuild`
+* use upstream `Android.mk`
+* override upstream `Application.mk` with an app-local wrapper so Gradle owns
+  ABI selection
+* start with `arm64-v8a`, `armeabi-v7a`, and `x86_64`
+* pass JNI macros for an internal
+  `com/zerovpn/app/volunteer/tun2socks/HevTun2SocksNative` class
+
+Result:
+
+* NDK installation succeeded.
+* The first Gradle/NDK configuration issue was solvable by avoiding upstream's
+  hard-coded multi-ABI `Application.mk`.
+* C compilation then failed on Windows because upstream nested dependency
+  `hev-task-system` uses symlinked headers under `include/`. This checkout
+  materialized those symlinks as text files such as
+  `../src/lib/object/hev-object-atomic.h`, which Clang reads as invalid C.
+* Re-checking out that nested submodule with `core.symlinks=true` failed with
+  Windows permission errors while creating symlinks.
+
+Current risk:
+
+* A clean source build on this Windows host needs either Windows symlink support
+  enabled for the checkout, a Linux/CI build environment, or a small reviewed
+  native-source workaround for the upstream symlinked include directory.
+* Patching/copying upstream headers manually was not done in this spike because
+  it would move beyond a clean source pin and needs an explicit decision.
+
+No Android `VpnService` or Volunteer Network routing code was added in this
+attempt.
