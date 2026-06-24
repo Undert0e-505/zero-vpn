@@ -29,6 +29,11 @@ ZeroVPN v0.2 is a release candidate for hardware-tested Oracle, Friends, Shared
 Exit, and Volunteer workflows. The app is still experimental and should not be
 treated as a polished or professionally audited security product.
 
+First-time Oracle Free Exit creation is slow by design. Expect about 5 minutes
+while Oracle creates the VM, networking comes up, SSH becomes available, and
+WireGuard is installed. Once the exit exists, reconnecting is fast because
+ZeroVPN is just bringing up an existing WireGuard tunnel.
+
 ## What Works In v0.2
 
 ### Oracle Free Exit
@@ -43,6 +48,10 @@ treated as a polished or professionally audited security product.
 - Connects Android traffic through the VM using Android `VpnService` and
   WireGuard.
 - Supports destroy and cleanup flows.
+- First creation typically takes several minutes while Oracle creates the VM,
+  networking, SSH access, WireGuard, and the owner/friend invite keys.
+- Reconnecting after setup is fast because the VM and WireGuard config already
+  exist.
 
 ### Friends / Share Exit
 
@@ -138,8 +147,13 @@ Useful Oracle links:
 3. Choose **Create Oracle Free Exit**.
 4. Sign in to Oracle when the browser opens.
 5. Return to ZeroVPN.
-6. Let ZeroVPN discover the region and provision the VM.
+6. Let ZeroVPN discover the region and provision the VM. First setup normally
+   takes about 5 minutes.
 7. Connect from Home.
+
+Do not assume the app is stuck just because first provisioning takes several
+minutes. The slow part is creating and configuring cloud infrastructure; normal
+reconnects after that are quick.
 
 ### Share With A Trusted Friend
 
@@ -189,6 +203,19 @@ Volunteer diagnostics build:
 cd android
 .\gradlew.bat assembleDebug -PenableVolunteerDebug=true
 ```
+
+v0.2 HEV-native candidate APKs should be produced on Linux/GitHub Actions:
+
+```bash
+cd android
+./gradlew assembleDebug -PenableHevNative=true
+```
+
+The HEV-native submodule uses symlink/header behavior that may not work on
+Windows checkouts. Use the `v0.2 candidate build` GitHub Actions workflow for
+candidate APKs; it checks out submodules recursively, builds with HEV native
+enabled, verifies the HEV `.so` libraries are packaged, and uploads the APK
+artifact.
 
 Release dry-run:
 
