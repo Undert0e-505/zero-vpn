@@ -104,6 +104,7 @@ fun ScanInviteScreen(
                 Log.d(TAG, "QR import confirmation cancelled")
                 decodedInvite = null
                 scanLocked = false
+                onCancel()
             },
             containerColor = Surface,
             titleContentColor = TextPrimary,
@@ -153,6 +154,7 @@ fun ScanInviteScreen(
                     Log.d(TAG, "QR import confirmation cancelled")
                     decodedInvite = null
                     scanLocked = false
+                    onCancel()
                 }) {
                     Text("Cancel", color = TextDim)
                 }

@@ -130,24 +130,18 @@ fun NavGraph() {
         }
     }
 
-    val navigateToTopLevel: (Screen) -> Unit = navigateToTopLevel@{ screen ->
+    val navigateToRootTab: (Screen) -> Unit = { screen ->
         if (screen == Screen.AddExit) {
             provisioningViewModel.prepareNewProvisioningFlow()
-            navController.navigate(Screen.AddExit.route) {
-                popUpTo(navController.graph.findStartDestination().id) {
-                    saveState = false
-                }
-                launchSingleTop = true
-                restoreState = false
-            }
-            return@navigateToTopLevel
         }
+        // Root tabs are deterministic escape hatches. Do not restore saved child
+        // routes here; provisioning, scanner, success, and failure states are transient.
         navController.navigate(screen.route) {
             popUpTo(navController.graph.findStartDestination().id) {
-                saveState = true
+                saveState = false
             }
             launchSingleTop = true
-            restoreState = true
+            restoreState = false
         }
     }
 
@@ -177,7 +171,7 @@ fun NavGraph() {
                         },
                         selected = selected,
                         onClick = {
-                            navigateToTopLevel(screen)
+                            navigateToRootTab(screen)
                         },
                         colors = NavigationBarItemDefaults.colors(
                             indicatorColor = Surface,
@@ -204,7 +198,7 @@ fun NavGraph() {
                     viewModel = provisioningViewModel,
                     vpnViewModel = vpnViewModel,
                     onDestroyStarted = { navController.navigate(Screen.OracleProvision.route) },
-                    onAddExit = { navigateToTopLevel(Screen.AddExit) },
+                    onAddExit = { navigateToRootTab(Screen.AddExit) },
                 )
             }
             composable(Screen.AddExit.route) {
@@ -226,15 +220,9 @@ fun NavGraph() {
             composable(Screen.ScanInvite.route) {
                 ScanInviteScreen(
                     viewModel = provisioningViewModel,
-                    onCancel = { navController.popBackStack() },
+                    onCancel = { navigateToRootTab(Screen.AddExit) },
                     onImported = {
-                        navController.navigate(Screen.Home.route) {
-                            popUpTo(navController.graph.findStartDestination().id) {
-                                saveState = false
-                            }
-                            launchSingleTop = true
-                            restoreState = false
-                        }
+                        navigateToRootTab(Screen.Home)
                     },
                 )
             }
@@ -256,15 +244,7 @@ fun NavGraph() {
                     provisioningViewModel = provisioningViewModel,
                     vpnViewModel = vpnViewModel,
                     onBack = { navController.popBackStack() },
-                    onHome = {
-                        navController.navigate(Screen.Home.route) {
-                            popUpTo(navController.graph.findStartDestination().id) {
-                                saveState = true
-                            }
-                            launchSingleTop = true
-                            restoreState = true
-                        }
-                    },
+                    onHome = { navigateToRootTab(Screen.Home) },
                 )
             }
             composable(Screen.OracleProvision.route) {
