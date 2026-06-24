@@ -90,6 +90,7 @@ class FriendsRepository(
         updateSharedExit(profileId) {
             it.copy(
                 displayName = name.trim().ifBlank { it.displayName },
+                updatedAt = System.currentTimeMillis(),
                 renamedAt = System.currentTimeMillis(),
             )
         }
@@ -203,6 +204,7 @@ class FriendsRepository(
         .put("endpointHost", endpointHost)
         .put("endpointIp", endpointIp)
         .put("importedAt", importedAt)
+        .put("updatedAt", updatedAt)
         .put("lastConnectedAt", lastConnectedAt)
         .put("renamedAt", renamedAt)
 
@@ -219,6 +221,7 @@ class FriendsRepository(
         endpointHost = optNullableString("endpointHost"),
         endpointIp = optNullableString("endpointIp"),
         importedAt = optLong("importedAt", System.currentTimeMillis()),
+        updatedAt = optLong("updatedAt", optLong("importedAt", System.currentTimeMillis())),
         lastConnectedAt = optLongOrNull("lastConnectedAt"),
         renamedAt = optLongOrNull("renamedAt"),
     )

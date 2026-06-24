@@ -263,7 +263,9 @@ private fun FriendsShareDebugCard(
             sharedExitProfiles
                 .sortedBy { it.importedAt }
                 .joinToString("\n") { profile ->
-                    "id=${profile.id} source=${profile.source.name} provider=${profile.providerType.name}"
+                    "id=${profile.id} name=${profile.displayName} source=${profile.source.name} " +
+                        "provider=${profile.providerType.name} endpoint=${profile.endpointHost ?: "N/A"} " +
+                        "importedAt=${profile.importedAt.formatDebugTime()}"
                 }
                 .ifBlank { "N/A" },
         )

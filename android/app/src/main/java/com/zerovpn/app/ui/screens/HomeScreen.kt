@@ -22,6 +22,7 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.TextField
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -78,6 +79,7 @@ fun HomeScreen(
 
     var showDestroyDialog by remember { mutableStateOf(false) }
     var destroyTarget by remember { mutableStateOf<ConfiguredExit?>(null) }
+    var renameTarget by remember { mutableStateOf<ConfiguredExit?>(null) }
     var pendingPermissionExit by remember { mutableStateOf<ConfiguredExit?>(null) }
     var missingExitMessage by remember { mutableStateOf<String?>(null) }
     var switchTargetExitId by remember { mutableStateOf<String?>(null) }
@@ -110,10 +112,10 @@ fun HomeScreen(
     val volunteerExit = exits.firstOrNull { it.provider == ExitProvider.VOLUNTEER }
     val activeExit = when {
         wireGuardKnownConnected -> wireGuardActiveExitId?.let { id -> exits.firstOrNull { it.id == id } }
-            ?: exits.firstOrNull { it.provider == ExitProvider.OCI }
+            ?: exits.firstOrNull { it.provider == ExitProvider.OCI || it.provider == ExitProvider.SHARED_WIREGUARD }
         volunteerConnected -> volunteerExit
         wireGuardIsActive -> wireGuardActiveExitId?.let { id -> exits.firstOrNull { it.id == id } }
-            ?: exits.firstOrNull { it.provider == ExitProvider.OCI }
+            ?: exits.firstOrNull { it.provider == ExitProvider.OCI || it.provider == ExitProvider.SHARED_WIREGUARD }
         else -> null
     }
     val bothProvidersReportedActive = wireGuardIsActive && volunteerConnected
@@ -164,11 +166,13 @@ fun HomeScreen(
         val target = exits.firstOrNull { it.id == targetId } ?: return@LaunchedEffect
         val targetConnected = when (target.provider) {
             ExitProvider.VOLUNTEER -> volunteerConnected
-            ExitProvider.OCI -> (vpnState as? VpnConnectionState.Connected)?.exitId == targetId
+            ExitProvider.OCI,
+            ExitProvider.SHARED_WIREGUARD -> (vpnState as? VpnConnectionState.Connected)?.exitId == targetId
         }
         val targetFailed = when (target.provider) {
             ExitProvider.VOLUNTEER -> volunteerState is VolunteerVpnState.Failed
-            ExitProvider.OCI -> vpnState is VpnConnectionState.Failed
+            ExitProvider.OCI,
+            ExitProvider.SHARED_WIREGUARD -> vpnState is VpnConnectionState.Failed
         }
         when {
             targetConnected -> {
@@ -180,8 +184,9 @@ fun HomeScreen(
                 lastProviderSwitchError = when (target.provider) {
                     ExitProvider.VOLUNTEER -> (volunteerState as? VolunteerVpnState.Failed)?.message
                         ?: "Volunteer Exit failed to connect."
-                    ExitProvider.OCI -> (vpnState as? VpnConnectionState.Failed)?.message
-                        ?: "Oracle exit failed to connect."
+                    ExitProvider.OCI,
+                    ExitProvider.SHARED_WIREGUARD -> (vpnState as? VpnConnectionState.Failed)?.message
+                        ?: "WireGuard exit failed to connect."
                 }
             }
         }
@@ -221,20 +226,28 @@ fun HomeScreen(
     }
 
     if (showDestroyDialog) {
+        val targetProvider = destroyTarget?.provider
         AlertDialog(
             onDismissRequest = { showDestroyDialog = false },
             title = {
                 Text(
-                    if (destroyTarget?.provider == ExitProvider.VOLUNTEER) "Remove Volunteer Exit?" else "Destroy ${destroyTarget?.name ?: "Exit"}?",
+                    when (targetProvider) {
+                        ExitProvider.VOLUNTEER -> "Remove Volunteer Exit?"
+                        ExitProvider.SHARED_WIREGUARD -> "Remove shared exit?"
+                        else -> "Destroy ${destroyTarget?.name ?: "Exit"}?"
+                    },
                     color = TextPrimary,
                 )
             },
             text = {
                 Text(
-                    if (destroyTarget?.provider == ExitProvider.VOLUNTEER) {
-                        "This removes the local Volunteer Exit profile from ZeroVPN. No cloud server will be deleted. If it is currently connected, ZeroVPN will disconnect it first."
-                    } else {
-                        "This will terminate only this Oracle VM, delete its API key, and remove its network resources. Other exits are preserved."
+                    when (targetProvider) {
+                        ExitProvider.VOLUNTEER ->
+                            "This removes the local Volunteer Exit profile from ZeroVPN. No cloud server will be deleted. If it is currently connected, ZeroVPN will disconnect it first."
+                        ExitProvider.SHARED_WIREGUARD ->
+                            "This removes the profile from this phone. It does not revoke access on the owner's server."
+                        else ->
+                            "This will terminate only this Oracle VM, delete its API key, and remove its network resources. Other exits are preserved."
                     },
                     color = TextDim,
                     fontSize = 14.sp,
@@ -254,12 +267,14 @@ fun HomeScreen(
                         } else {
                             val disconnected = vpnViewModel.disconnectIfActive(destroyExitId)
                             if (!disconnected) {
-                                snackbarHostState.showSnackbar("Disconnect failed. Node was not destroyed.")
+                                snackbarHostState.showSnackbar("Disconnect failed. Exit was not removed.")
                                 return@launch
                             }
                         }
                         if (destroyTarget?.provider == ExitProvider.VOLUNTEER && destroyExitId != null) {
                             viewModel.removeLocalExit(destroyExitId)
+                        } else if (destroyTarget?.provider == ExitProvider.SHARED_WIREGUARD && destroyExitId != null) {
+                            viewModel.removeSharedExitProfile(destroyExitId)
                         } else {
                             viewModel.destroyNode(context, destroyExitId)
                             onDestroyStarted()
@@ -267,11 +282,39 @@ fun HomeScreen(
                         destroyTarget = null
                     }
                 }) {
-                    Text(if (destroyTarget?.provider == ExitProvider.VOLUNTEER) "Remove exit" else "Destroy", color = Danger)
+                    Text(if (destroyTarget?.provider == ExitProvider.OCI) "Destroy" else "Remove exit", color = Danger)
                 }
             },
             dismissButton = {
                 TextButton(onClick = { showDestroyDialog = false }) {
+                    Text("Cancel", color = TextDim)
+                }
+            },
+        )
+    }
+
+    renameTarget?.let { target ->
+        var name by remember(target.id) { mutableStateOf(target.name) }
+        AlertDialog(
+            onDismissRequest = { renameTarget = null },
+            title = { Text("Rename shared exit", color = TextPrimary) },
+            text = {
+                TextField(
+                    value = name,
+                    onValueChange = { name = it },
+                    singleLine = true,
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    viewModel.renameSharedExitProfile(target.id, name)
+                    renameTarget = null
+                }) {
+                    Text("Save", color = Accent)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { renameTarget = null }) {
                     Text("Cancel", color = TextDim)
                 }
             },
@@ -338,7 +381,11 @@ fun HomeScreen(
                         "Switching to ${target?.name ?: "selected exit"}"
                     }
                     activeExit != null -> activeExit.let {
-                        if (it.provider == ExitProvider.VOLUNTEER) "${it.name} - Volunteer Network" else "${it.name} - WireGuard"
+                        when (it.provider) {
+                            ExitProvider.VOLUNTEER -> "${it.name} - Volunteer Network"
+                            ExitProvider.SHARED_WIREGUARD -> "${it.name} - Shared Exit"
+                            ExitProvider.OCI -> "${it.name} - WireGuard"
+                        }
                     }
                     selectedExit != null -> "Selected: ${selectedExit.name}"
                     else -> "Select an exit below"
@@ -436,7 +483,10 @@ fun HomeScreen(
                 color = TextDim,
                 modifier = Modifier.fillMaxWidth(),
             )
-        } else if (activeExit?.provider == ExitProvider.OCI && (vpnState !is VpnConnectionState.Disconnected || vpnDiagnostics.endpoint != null)) {
+        } else if (
+            (activeExit?.provider == ExitProvider.OCI || activeExit?.provider == ExitProvider.SHARED_WIREGUARD) &&
+            (vpnState !is VpnConnectionState.Disconnected || vpnDiagnostics.endpoint != null)
+        ) {
             Spacer(modifier = Modifier.height(8.dp))
             Text(
                 text = "VPN: ${vpnDiagnostics.backendState} | ${vpnDiagnostics.tunnelAddress ?: "no address"} -> ${vpnDiagnostics.endpoint ?: "no endpoint"} | DNS ${vpnDiagnostics.dns ?: "none"} | Allowed ${vpnDiagnostics.allowedIps ?: "none"}",
@@ -530,6 +580,11 @@ fun HomeScreen(
                         destroyTarget = exit
                         showDestroyDialog = true
                     },
+                    onRename = if (exit.provider == ExitProvider.SHARED_WIREGUARD) {
+                        { renameTarget = exit }
+                    } else {
+                        null
+                    },
                 )
                 Spacer(modifier = Modifier.height(10.dp))
             }
@@ -603,6 +658,7 @@ private fun ExitCard(
     onConnect: () -> Unit,
     onDisconnect: () -> Unit,
     onDestroy: () -> Unit,
+    onRename: (() -> Unit)?,
 ) {
     Column(
         modifier = Modifier
@@ -631,6 +687,8 @@ private fun ExitCard(
                 Text(
                     text = if (exit.provider == ExitProvider.VOLUNTEER) {
                         "Transport: Volunteer Network"
+                    } else if (exit.provider == ExitProvider.SHARED_WIREGUARD) {
+                        "Shared WireGuard exit"
                     } else {
                         "${exit.publicIp}:${exit.wireGuardPort}/udp"
                     },
@@ -652,6 +710,7 @@ private fun ExitCard(
                 text = when {
                     active -> "Connected"
                     switchingTarget -> "Switching"
+                    exit.provider == ExitProvider.SHARED_WIREGUARD -> "Shared Exit"
                     selected -> "Selected"
                     else -> ""
                 },
@@ -699,11 +758,22 @@ private fun ExitCard(
                 )
                 Spacer(modifier = Modifier.width(8.dp))
                 Text(
-                    if (exit.provider == ExitProvider.VOLUNTEER) "Remove" else "Destroy",
+                    if (exit.provider == ExitProvider.OCI) "Destroy" else "Remove",
                     fontSize = 13.sp,
                     fontWeight = FontWeight.Medium,
                     color = Danger,
                 )
+            }
+        }
+        if (onRename != null) {
+            Spacer(modifier = Modifier.height(10.dp))
+            OutlinedButton(
+                onClick = onRename,
+                enabled = !busy,
+                modifier = Modifier.fillMaxWidth().height(40.dp),
+                shape = RoundedCornerShape(8.dp),
+            ) {
+                Text("Rename", fontSize = 13.sp, fontWeight = FontWeight.Medium, color = Accent)
             }
         }
     }
@@ -731,6 +801,7 @@ private enum class ProviderType {
 
 private fun ExitProvider?.toProviderType(): ProviderType? = when (this) {
     ExitProvider.OCI -> ProviderType.ORACLE_WIREGUARD
+    ExitProvider.SHARED_WIREGUARD -> ProviderType.ORACLE_WIREGUARD
     ExitProvider.VOLUNTEER -> ProviderType.VOLUNTEER
     null -> null
 }
@@ -809,7 +880,7 @@ private suspend fun connectSelectedExit(
                 }
                 vpnViewModel.connect(selectedExit)
                 if (!waitForWireGuardConnected(vpnViewModel, selectedExit.id)) {
-                    onSwitchError("Oracle exit did not finish connecting.")
+                    onSwitchError("WireGuard exit did not finish connecting.")
                     return
                 }
                 onSwitchDone()

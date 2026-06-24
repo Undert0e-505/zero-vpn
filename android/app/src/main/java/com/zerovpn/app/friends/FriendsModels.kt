@@ -43,6 +43,7 @@ data class SharedExitProfile(
     val endpointHost: String? = null,
     val endpointIp: String? = null,
     val importedAt: Long = System.currentTimeMillis(),
+    val updatedAt: Long = importedAt,
     val lastConnectedAt: Long? = null,
     val renamedAt: Long? = null,
 )
