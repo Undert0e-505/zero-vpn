@@ -49,7 +49,7 @@ import kotlinx.coroutines.launch
 sealed class Screen(val route: String, val label: String, val icon: ImageVector) {
     data object Home : Screen("home", "Home", Icons.Default.Home)
     data object AddExit : Screen("add_exit", "Add Exit", Icons.Default.Add)
-    data object NodeInvite : Screen("node_invite", "Nodes", Icons.Default.Hub)
+    data object Friends : Screen("node_invite", "Friends", Icons.Default.Hub)
     data object Diagnostics : Screen("diagnostics", "Diagnostics", Icons.Default.Build)
     data object Settings : Screen("settings", "Settings", Icons.Default.Settings)
     data object OracleProvision : Screen("oracle_provision", "Provision", Icons.Default.Cloud)
@@ -60,7 +60,7 @@ sealed class Screen(val route: String, val label: String, val icon: ImageVector)
 private val screens = listOf(
     Screen.Home,
     Screen.AddExit,
-    Screen.NodeInvite,
+    Screen.Friends,
     Screen.Diagnostics,
     Screen.Settings,
 )
@@ -249,8 +249,13 @@ fun NavGraph() {
                     },
                 )
             }
-            composable(Screen.NodeInvite.route) {
-                NodeInviteScreen()
+            composable(Screen.Friends.route) {
+                FriendsScreen(
+                    onCreateOracleExit = {
+                        provisioningViewModel.prepareNewProvisioningFlow()
+                        navController.navigate(Screen.OracleProvision.route)
+                    },
+                )
             }
             composable(Screen.Diagnostics.route) {
                 DiagnosticsScreen(

@@ -43,6 +43,8 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.zerovpn.app.ui.provisioning.ProvisioningViewModel
 import com.zerovpn.app.BuildConfig
+import com.zerovpn.app.friends.InviteSlot
+import com.zerovpn.app.friends.SharedExitProfile
 import com.zerovpn.app.ui.theme.Accent
 import com.zerovpn.app.ui.theme.Bg
 import com.zerovpn.app.ui.theme.Border
@@ -83,6 +85,8 @@ fun DiagnosticsScreen(
     val isDevMode by provisioningViewModel.isDevMode.collectAsState()
     val sshDebugInfo by provisioningViewModel.sshDebugInfo.collectAsState()
     val exits by provisioningViewModel.configuredExits.collectAsState()
+    val inviteSlots by provisioningViewModel.inviteSlots.collectAsState()
+    val sharedExitProfiles by provisioningViewModel.sharedExitProfiles.collectAsState()
     val selectedExitId by provisioningViewModel.selectedExitId.collectAsState()
     val providerSwitchDiagnostics by provisioningViewModel.providerSwitchDiagnostics.collectAsState()
     val vpnState by vpnViewModel.state.collectAsState()
@@ -162,6 +166,11 @@ fun DiagnosticsScreen(
             WireGuardDebugCard(vpnDiagnostics)
             Spacer(modifier = Modifier.height(12.dp))
             ProviderSwitchDebugCard(providerSwitchDiagnostics)
+            Spacer(modifier = Modifier.height(12.dp))
+            FriendsShareDebugCard(
+                inviteSlots = inviteSlots,
+                sharedExitProfiles = sharedExitProfiles,
+            )
             if (BuildConfig.VOLUNTEER_DEBUG_ENABLED) {
                 Spacer(modifier = Modifier.height(12.dp))
                 VolunteerNetworkSpikeCard(
@@ -210,6 +219,52 @@ fun DiagnosticsScreen(
                 },
             )
         }
+    }
+}
+
+@Composable
+private fun FriendsShareDebugCard(
+    inviteSlots: List<InviteSlot>,
+    sharedExitProfiles: List<SharedExitProfile>,
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(Surface, RoundedCornerShape(8.dp))
+            .border(1.dp, Border, RoundedCornerShape(8.dp))
+            .padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        Text(
+            text = "FRIENDS / SHARED EXIT STATE",
+            style = SectionTitleStyle,
+        )
+        Text(
+            text = "Developer-mode metadata only. Private keys, configs, and QR payloads are not displayed.",
+            fontSize = 13.sp,
+            color = TextDim,
+            lineHeight = 18.sp,
+        )
+        DebugValue("Invite slot count", inviteSlots.size.toString())
+        DebugValue("Shared exit profile count", sharedExitProfiles.size.toString())
+        DebugBlock(
+            "Invite slot states",
+            inviteSlots
+                .sortedWith(compareBy<InviteSlot>({ it.ownerExitId }, { it.slotIndex }, { it.slotId }))
+                .joinToString("\n") { slot ->
+                    "owner=${slot.ownerExitId} slot=${slot.slotIndex} state=${slot.state.name}"
+                }
+                .ifBlank { "N/A" },
+        )
+        DebugBlock(
+            "Shared exit profiles",
+            sharedExitProfiles
+                .sortedBy { it.importedAt }
+                .joinToString("\n") { profile ->
+                    "id=${profile.id} source=${profile.source.name} provider=${profile.providerType.name}"
+                }
+                .ifBlank { "N/A" },
+        )
     }
 }
 
