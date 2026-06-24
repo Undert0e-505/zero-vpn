@@ -22,6 +22,7 @@ data class InviteSlot(
     val firstHandshakeAt: Long? = null,
     val lastHandshakeAt: Long? = null,
     val revokedAt: Long? = null,
+    val resetAt: Long? = null,
     val createdAt: Long = System.currentTimeMillis(),
     val updatedAt: Long = createdAt,
 )

@@ -42,6 +42,7 @@ import com.zerovpn.app.friends.InviteSlot
 import com.zerovpn.app.friends.InviteSlotState
 import com.zerovpn.app.friends.QrCodeGenerator
 import com.zerovpn.app.ui.provisioning.InviteClaimCheckResult
+import com.zerovpn.app.ui.provisioning.InviteResetResult
 import com.zerovpn.app.ui.provisioning.ProvisioningViewModel
 import com.zerovpn.app.ui.theme.*
 import com.zerovpn.app.vpn.ConfiguredExit
@@ -67,6 +68,8 @@ fun FriendsScreen(
     var errorMessage by remember { mutableStateOf<String?>(null) }
     var infoMessage by remember { mutableStateOf<String?>(null) }
     var checkingSlotId by remember { mutableStateOf<String?>(null) }
+    var resettingSlotId by remember { mutableStateOf<String?>(null) }
+    var resetTarget by remember { mutableStateOf<InviteSlot?>(null) }
 
     fun showQrForSlot(slot: InviteSlot, markPending: Boolean, name: String? = null) {
         if (slot.state == InviteSlotState.CLAIMED) {
@@ -96,7 +99,7 @@ fun FriendsScreen(
     }
 
     fun checkClaim(slot: InviteSlot) {
-        if (checkingSlotId != null) return
+        if (checkingSlotId != null || resettingSlotId != null) return
         checkingSlotId = slot.slotId
         viewModel.checkInviteSlotClaim(context, slot.slotId) { result ->
             checkingSlotId = null
@@ -108,6 +111,22 @@ fun FriendsScreen(
                     infoMessage = "Invite claimed. The QR has now been hidden."
                 }
                 is InviteClaimCheckResult.Error -> {
+                    errorMessage = result.message
+                }
+            }
+        }
+    }
+
+    fun resetInvite(slot: InviteSlot) {
+        if (checkingSlotId != null || resettingSlotId != null) return
+        resettingSlotId = slot.slotId
+        viewModel.resetInviteSlot(context, slot.slotId) { result ->
+            resettingSlotId = null
+            when (result) {
+                InviteResetResult.Reset -> {
+                    infoMessage = "Invite reset. This slot is ready to share again."
+                }
+                is InviteResetResult.Error -> {
                     errorMessage = result.message
                 }
             }
@@ -132,6 +151,17 @@ fun FriendsScreen(
             onConfirm = { name ->
                 renameTarget = null
                 viewModel.renameInviteSlot(slot.slotId, name.ifBlank { null })
+            },
+        )
+    }
+
+    resetTarget?.let { slot ->
+        ResetInviteDialog(
+            slot = slot,
+            onDismiss = { resetTarget = null },
+            onConfirm = {
+                resetTarget = null
+                resetInvite(slot)
             },
         )
     }
@@ -221,7 +251,9 @@ fun FriendsScreen(
                         onShowQrAgain = { showQrForSlot(slot = slot, markPending = false) },
                         onCheckClaim = { checkClaim(slot) },
                         onRename = { renameTarget = slot },
+                        onReset = { resetTarget = slot },
                         isCheckingClaim = checkingSlotId == slot.slotId,
+                        isResetting = resettingSlotId == slot.slotId,
                     )
                     Spacer(modifier = Modifier.height(10.dp))
                 }
@@ -310,7 +342,9 @@ private fun InviteSlotCard(
     onShowQrAgain: () -> Unit,
     onCheckClaim: () -> Unit,
     onRename: () -> Unit,
+    onReset: () -> Unit,
     isCheckingClaim: Boolean,
+    isResetting: Boolean,
 ) {
     Column(
         modifier = Modifier
@@ -393,7 +427,7 @@ private fun InviteSlotCard(
                     Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
                         Button(
                             onClick = onCheckClaim,
-                            enabled = !isCheckingClaim,
+                            enabled = !isCheckingClaim && !isResetting,
                             modifier = Modifier.weight(1f).height(44.dp),
                             colors = ButtonDefaults.buttonColors(containerColor = Accent, contentColor = Bg),
                             shape = RoundedCornerShape(8.dp),
@@ -406,7 +440,7 @@ private fun InviteSlotCard(
                         }
                         OutlinedButton(
                             onClick = onShowQrAgain,
-                            enabled = !isCheckingClaim,
+                            enabled = !isCheckingClaim && !isResetting,
                             modifier = Modifier.weight(1f).height(44.dp),
                             shape = RoundedCornerShape(8.dp),
                         ) {
@@ -415,11 +449,24 @@ private fun InviteSlotCard(
                     }
                     OutlinedButton(
                         onClick = onRename,
-                        enabled = !isCheckingClaim,
+                        enabled = !isCheckingClaim && !isResetting,
                         modifier = Modifier.fillMaxWidth().height(44.dp),
                         shape = RoundedCornerShape(8.dp),
                     ) {
                         Text("Rename", fontSize = 13.sp, fontWeight = FontWeight.Medium, color = Accent)
+                    }
+                    OutlinedButton(
+                        onClick = onReset,
+                        enabled = !isCheckingClaim && !isResetting,
+                        modifier = Modifier.fillMaxWidth().height(44.dp),
+                        shape = RoundedCornerShape(8.dp),
+                    ) {
+                        Text(
+                            if (isResetting) "Resetting..." else "Revoke and reset invite",
+                            fontSize = 13.sp,
+                            fontWeight = FontWeight.Medium,
+                            color = Danger,
+                        )
                     }
                 }
             }
@@ -427,18 +474,24 @@ private fun InviteSlotCard(
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
                     OutlinedButton(
                         onClick = onRename,
+                        enabled = !isResetting,
                         modifier = Modifier.fillMaxWidth().height(44.dp),
                         shape = RoundedCornerShape(8.dp),
                     ) {
                         Text("Rename", fontSize = 13.sp, fontWeight = FontWeight.Medium, color = Accent)
                     }
                     OutlinedButton(
-                        onClick = {},
-                        enabled = false,
+                        onClick = onReset,
+                        enabled = !isResetting,
                         modifier = Modifier.fillMaxWidth().height(44.dp),
                         shape = RoundedCornerShape(8.dp),
                     ) {
-                        Text("Revoke/reset coming next", fontSize = 13.sp, fontWeight = FontWeight.Medium, color = TextDim)
+                        Text(
+                            if (isResetting) "Resetting..." else "Revoke and reset invite",
+                            fontSize = 13.sp,
+                            fontWeight = FontWeight.Medium,
+                            color = Danger,
+                        )
                     }
                 }
             }
@@ -521,6 +574,46 @@ private fun RenameInviteDialog(
         confirmButton = {
             TextButton(onClick = { onConfirm(name) }) {
                 Text("Save", color = Accent)
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("Cancel", color = TextDim)
+            }
+        },
+    )
+}
+
+@Composable
+private fun ResetInviteDialog(
+    slot: InviteSlot,
+    onDismiss: () -> Unit,
+    onConfirm: () -> Unit,
+) {
+    val targetName = slot.displayName?.takeIf { it.isNotBlank() }
+        ?: "Friend slot ${slot.slotIndex}"
+    val body = if (slot.state == InviteSlotState.CLAIMED) {
+        "This will stop this shared exit from working for $targetName. ZeroVPN will create a new unused invite slot afterwards. The old QR will never work again."
+    } else {
+        "This will stop the current QR from working and create a fresh unused invite slot. The old QR will never work again."
+    }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = Surface,
+        titleContentColor = TextPrimary,
+        textContentColor = TextPrimary,
+        title = { Text("Revoke and reset invite?", fontSize = 18.sp, fontWeight = FontWeight.SemiBold) },
+        text = {
+            Text(
+                text = body,
+                fontSize = 14.sp,
+                color = TextPrimary,
+                lineHeight = 20.sp,
+            )
+        },
+        confirmButton = {
+            TextButton(onClick = onConfirm) {
+                Text("Revoke and reset", color = Danger)
             }
         },
         dismissButton = {
