@@ -152,5 +152,6 @@ dependencies {
     implementation(libs.androidx.browser)
     implementation(libs.wireguard.tunnel)
     implementation(libs.tor.android)
+    implementation(libs.zxing.core)
     debugImplementation(libs.androidx.compose.ui.tooling)
 }

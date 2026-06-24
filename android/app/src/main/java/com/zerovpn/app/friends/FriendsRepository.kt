@@ -38,7 +38,7 @@ class FriendsRepository(
         updateInviteSlot(slotId) {
             it.copy(
                 state = InviteSlotState.PENDING_CLAIM,
-                qrShownAt = qrShownAt,
+                qrShownAt = it.qrShownAt ?: qrShownAt,
                 updatedAt = System.currentTimeMillis(),
             )
         }
