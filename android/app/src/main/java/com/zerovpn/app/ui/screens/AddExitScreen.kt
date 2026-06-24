@@ -1,6 +1,8 @@
 package com.zerovpn.app.ui.screens
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.material.icons.filled.Cloud
 import androidx.compose.material.icons.filled.Add
@@ -33,6 +35,8 @@ fun AddExitScreen(
     modifier: Modifier = Modifier,
 ) {
     var disabledMessage by remember { mutableStateOf<String?>(null) }
+    val optionCardModifier = Modifier.height(112.dp)
+    val scrollState = rememberScrollState()
 
     disabledMessage?.let { message ->
         AlertDialog(
@@ -68,7 +72,8 @@ fun AddExitScreen(
             .fillMaxSize()
             .background(Bg)
             .padding(horizontal = 16.dp)
-            .padding(top = 4.dp, bottom = 40.dp),
+            .padding(top = 4.dp, bottom = 40.dp)
+            .verticalScroll(scrollState),
     ) {
         Text(
             text = "ADD EXIT",
@@ -81,6 +86,7 @@ fun AddExitScreen(
         OptionButton(
             icon = Icons.Default.Cloud,
             label = "Create Oracle Free Exit",
+            modifier = optionCardModifier,
             onClick = onNavigateToProvision,
         )
 
@@ -91,6 +97,7 @@ fun AddExitScreen(
             label = "Volunteer Exit",
             statusLabel = "Experimental",
             supportingText = "Use an experimental no-cloud exit. Slower, web-focused, and some sites may block it.",
+            modifier = optionCardModifier,
             onClick = onNavigateToVolunteer,
         )
 
@@ -99,6 +106,7 @@ fun AddExitScreen(
         OptionButton(
             icon = Icons.Default.QrCodeScanner,
             label = "Scan QR Invite",
+            modifier = optionCardModifier,
             onClick = onNavigateToScanInvite,
         )
 
@@ -109,6 +117,7 @@ fun AddExitScreen(
             label = "Import Config",
             enabled = false,
             statusLabel = "Coming Soon",
+            modifier = optionCardModifier,
             onClick = {},
             onDisabledClick = {
                 disabledMessage = "WireGuard config import is not implemented yet."
@@ -122,6 +131,7 @@ fun AddExitScreen(
             label = "Create Private Node",
             enabled = false,
             statusLabel = "Coming Soon",
+            modifier = optionCardModifier,
             onClick = {},
             onDisabledClick = {
                 disabledMessage = "Private node setup is not implemented yet."

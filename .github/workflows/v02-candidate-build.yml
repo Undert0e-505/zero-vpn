@@ -1,0 +1,60 @@
+name: v0.2 candidate build
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-v02-candidate:
+    name: Build v0.2 candidate APK with HEV native
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android NDK and CMake
+        run: |
+          set -euo pipefail
+          yes | sdkmanager --licenses >/dev/null
+          sdkmanager "ndk;27.0.12077973" "cmake;3.22.1"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.0.12077973" >> "$GITHUB_ENV"
+
+      - name: Build v0.2 candidate debug APK
+        working-directory: android
+        run: |
+          set -euo pipefail
+          chmod +x gradlew
+          ./gradlew assembleDebug -PenableHevNative=true
+
+      - name: Verify HEV native libraries are packaged
+        run: |
+          set -euo pipefail
+          APK="android/app/build/outputs/apk/debug/app-debug.apk"
+          unzip -l "$APK" | tee apk-contents.txt
+          grep -q "lib/arm64-v8a/libhev-socks5-tunnel.so" apk-contents.txt
+          grep -q "lib/armeabi-v7a/libhev-socks5-tunnel.so" apk-contents.txt
+          grep -q "lib/x86_64/libhev-socks5-tunnel.so" apk-contents.txt
+
+      - name: Prepare named APK artifact
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          cp android/app/build/outputs/apk/debug/app-debug.apk artifacts/ZeroVPN-v0.2-candidate-debug.apk
+
+      - name: Upload v0.2 candidate APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: ZeroVPN-v0.2-candidate-debug.apk
+          path: artifacts/ZeroVPN-v0.2-candidate-debug.apk
+          if-no-files-found: error
