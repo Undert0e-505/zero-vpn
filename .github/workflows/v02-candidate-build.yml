@@ -2,6 +2,14 @@ name: v0.2 candidate build
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - feature/friends-share-exit
+    paths:
+      - ".github/workflows/v02-candidate-build.yml"
+      - ".gitmodules"
+      - "android/app/**"
+      - "android/native/**"
 
 jobs:
   build-v02-candidate:
