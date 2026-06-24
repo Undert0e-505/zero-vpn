@@ -2,6 +2,7 @@ package com.zerovpn.app.ui.screens
 
 import android.Manifest
 import android.content.pm.PackageManager
+import android.util.Log
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.camera.core.CameraSelector
@@ -32,6 +33,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
@@ -63,6 +65,7 @@ import com.zerovpn.app.ui.theme.Surface
 import com.zerovpn.app.ui.theme.TextDim
 import com.zerovpn.app.ui.theme.TextPrimary
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
 
 @Composable
 fun ScanInviteScreen(
@@ -83,18 +86,22 @@ fun ScanInviteScreen(
     val permissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission(),
     ) { granted ->
+        Log.d(TAG, "QR scanner camera permission ${if (granted) "granted" else "denied"}")
         permissionGranted = granted
     }
 
     LaunchedEffect(Unit) {
         if (!permissionGranted) {
             permissionLauncher.launch(Manifest.permission.CAMERA)
+        } else {
+            Log.d(TAG, "QR scanner camera permission already granted")
         }
     }
 
     decodedInvite?.let { invite ->
         AlertDialog(
             onDismissRequest = {
+                Log.d(TAG, "QR import confirmation cancelled")
                 decodedInvite = null
                 scanLocked = false
             },
@@ -127,11 +134,13 @@ fun ScanInviteScreen(
             confirmButton = {
                 TextButton(onClick = {
                     if (viewModel.hasImportedSharedExit(invite)) {
+                        Log.d(TAG, "QR import duplicate detected")
                         errorMessage = "This shared exit already appears to be imported."
                         decodedInvite = null
                         scanLocked = true
                         return@TextButton
                     }
+                    Log.d(TAG, "QR import saved")
                     viewModel.importSharedExit(invite, importName)
                     decodedInvite = null
                     onImported()
@@ -141,6 +150,7 @@ fun ScanInviteScreen(
             },
             dismissButton = {
                 TextButton(onClick = {
+                    Log.d(TAG, "QR import confirmation cancelled")
                     decodedInvite = null
                     scanLocked = false
                 }) {
@@ -152,7 +162,11 @@ fun ScanInviteScreen(
 
     errorMessage?.let { message ->
         AlertDialog(
-            onDismissRequest = { errorMessage = null },
+            onDismissRequest = {
+                errorMessage = null
+                scanLocked = false
+                Log.d(TAG, "QR scanner retry after import error")
+            },
             containerColor = Surface,
             titleContentColor = TextPrimary,
             textContentColor = TextPrimary,
@@ -162,6 +176,7 @@ fun ScanInviteScreen(
                 TextButton(onClick = {
                     errorMessage = null
                     scanLocked = false
+                    Log.d(TAG, "QR scanner retry after import error")
                 }) {
                     Text("OK", color = Accent)
                 }
@@ -209,15 +224,19 @@ fun ScanInviteScreen(
             QrCameraPreview(
                 scanEnabled = !scanLocked && decodedInvite == null,
                 onPayload = { payload ->
+                    Log.d(TAG, "QR detected; scan guard set")
                     scanLocked = true
                     val parsed = WireGuardInviteParser.parse(payload).getOrElse {
+                        Log.d(TAG, "QR parse failed")
                         errorMessage = "This QR does not look like a ZeroVPN or WireGuard invite."
                         return@QrCameraPreview
                     }
                     if (viewModel.hasImportedSharedExit(parsed)) {
+                        Log.d(TAG, "QR scan matched an already imported shared exit")
                         errorMessage = "This shared exit already appears to be imported."
                         return@QrCameraPreview
                     }
+                    Log.d(TAG, "QR import confirmation shown")
                     decodedInvite = parsed
                     importName = "Shared Exit"
                 },
@@ -287,48 +306,98 @@ private fun QrCameraPreview(
     val executor = remember { Executors.newSingleThreadExecutor() }
     val scanEnabledState by rememberUpdatedState(scanEnabled)
     val onPayloadState by rememberUpdatedState(onPayload)
+    val delivered = remember { AtomicBoolean(false) }
+    var cameraProvider by remember { mutableStateOf<ProcessCameraProvider?>(null) }
+    var cameraBound by remember { mutableStateOf(false) }
 
-    DisposableEffect(Unit) {
-        onDispose { executor.shutdown() }
+    LaunchedEffect(scanEnabled) {
+        if (scanEnabled) {
+            delivered.set(false)
+            Log.d(TAG, "QR analyzer started")
+        } else {
+            delivered.set(true)
+            cameraProvider?.unbindAll()
+            cameraBound = false
+            Log.d(TAG, "QR camera unbound")
+        }
     }
 
-    AndroidView(
-        modifier = Modifier.fillMaxSize(),
-        factory = { ctx ->
-            val previewView = PreviewView(ctx)
-            val cameraProviderFuture = ProcessCameraProvider.getInstance(ctx)
-            cameraProviderFuture.addListener({
-                val provider = cameraProviderFuture.get()
-                val preview = Preview.Builder().build().also {
-                    it.setSurfaceProvider(previewView.surfaceProvider)
-                }
-                val analyzer = ImageAnalysis.Builder()
-                    .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                    .build()
-                    .also { analysis ->
-                        analysis.setAnalyzer(executor) { image ->
-                            if (!scanEnabledState) {
-                                image.close()
-                                return@setAnalyzer
-                            }
-                            val payload = decodeQrPayload(image)
-                            image.close()
-                            if (payload != null) {
-                                previewView.post { onPayloadState(payload) }
+    DisposableEffect(Unit) {
+        onDispose {
+            delivered.set(true)
+            cameraProvider?.unbindAll()
+            cameraBound = false
+            executor.shutdown()
+            Log.d(TAG, "QR scanner disposed; camera released")
+        }
+    }
+
+    key(scanEnabled) {
+        AndroidView(
+            modifier = Modifier.fillMaxSize(),
+            factory = { ctx ->
+                val previewView = PreviewView(ctx)
+                val cameraProviderFuture = ProcessCameraProvider.getInstance(ctx)
+                cameraProviderFuture.addListener({
+                    val provider = cameraProviderFuture.get()
+                    cameraProvider = provider
+                    if (!scanEnabledState || delivered.get()) {
+                        provider.unbindAll()
+                        cameraBound = false
+                        Log.d(TAG, "QR camera bind skipped because scan is complete")
+                        return@addListener
+                    }
+                    val preview = Preview.Builder().build().also {
+                        it.setSurfaceProvider(previewView.surfaceProvider)
+                    }
+                    val analyzer = ImageAnalysis.Builder()
+                        .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                        .build()
+                        .also { analysis ->
+                            analysis.setAnalyzer(executor) { image ->
+                                if (!scanEnabledState || delivered.get()) {
+                                    Log.d(TAG, "QR analyzer frame ignored after scan complete")
+                                    image.close()
+                                    return@setAnalyzer
+                                }
+                                try {
+                                    val payload = decodeQrPayload(image)
+                                    if (payload != null && delivered.compareAndSet(false, true)) {
+                                        Log.d(TAG, "QR detected by analyzer")
+                                        previewView.post {
+                                            provider.unbindAll()
+                                            cameraBound = false
+                                            Log.d(TAG, "QR camera unbound after successful capture")
+                                            onPayloadState(payload)
+                                        }
+                                    }
+                                } finally {
+                                    image.close()
+                                }
                             }
                         }
-                    }
-                provider.unbindAll()
-                provider.bindToLifecycle(
-                    lifecycleOwner,
-                    CameraSelector.DEFAULT_BACK_CAMERA,
-                    preview,
-                    analyzer,
-                )
-            }, ContextCompat.getMainExecutor(ctx))
-            previewView
-        },
-    )
+                    provider.unbindAll()
+                    provider.bindToLifecycle(
+                        lifecycleOwner,
+                        CameraSelector.DEFAULT_BACK_CAMERA,
+                        preview,
+                        analyzer,
+                    )
+                    cameraBound = true
+                    Log.d(TAG, "QR camera bound")
+                }, ContextCompat.getMainExecutor(ctx))
+                previewView
+            },
+            update = {
+                if (!scanEnabled && cameraBound) {
+                    delivered.set(true)
+                    cameraProvider?.unbindAll()
+                    cameraBound = false
+                    Log.d(TAG, "QR camera unbound from update")
+                }
+            },
+        )
+    }
 }
 
 private fun decodeQrPayload(image: ImageProxy): String? {
@@ -362,3 +431,5 @@ private fun decodeQrPayload(image: ImageProxy): String? {
         reader.reset()
     }
 }
+
+private const val TAG = "ZeroVpnQrScanner"
