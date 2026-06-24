@@ -40,6 +40,7 @@ import androidx.navigation.compose.rememberNavController
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.zerovpn.app.oci.OciAuthReturn
 import com.zerovpn.app.BuildConfig
+import com.zerovpn.app.ui.provisioning.ProvisioningState
 import com.zerovpn.app.ui.provisioning.ProvisioningViewModel
 import com.zerovpn.app.ui.screens.*
 import com.zerovpn.app.ui.theme.*
@@ -78,6 +79,7 @@ fun NavGraph() {
     val configuredExits by provisioningViewModel.configuredExits.collectAsState()
     val selectedExitId by provisioningViewModel.selectedExitId.collectAsState()
     val isDevMode by provisioningViewModel.isDevMode.collectAsState()
+    val provisioningState by provisioningViewModel.state.collectAsState()
 
     val navBackStackEntry by navController.currentBackStackEntryAsState()
     val currentDestination = navBackStackEntry?.destination
@@ -111,6 +113,23 @@ fun NavGraph() {
             lifecycleOwner.lifecycle.removeObserver(observer)
         }
     }
+
+    LaunchedEffect(currentDestination?.route, configuredExits, provisioningState) {
+        if (
+            currentDestination?.route == Screen.OracleProvision.route &&
+            configuredExits.isNotEmpty() &&
+            provisioningState is ProvisioningState.Idle
+        ) {
+            navController.navigate(Screen.Home.route) {
+                popUpTo(navController.graph.findStartDestination().id) {
+                    saveState = false
+                }
+                launchSingleTop = true
+                restoreState = false
+            }
+        }
+    }
+
     val navigateToTopLevel: (Screen) -> Unit = { screen ->
         if (screen == Screen.AddExit) {
             provisioningViewModel.prepareNewProvisioningFlow()
@@ -247,12 +266,13 @@ fun NavGraph() {
                     viewModel = provisioningViewModel,
                     vpnViewModel = vpnViewModel,
                     onConnectedHome = {
+                        provisioningViewModel.clearTransientProvisioningSuccess()
                         navController.navigate(Screen.Home.route) {
                             popUpTo(navController.graph.findStartDestination().id) {
-                                saveState = true
+                                saveState = false
                             }
                             launchSingleTop = true
-                            restoreState = true
+                            restoreState = false
                         }
                     },
                     onDestroy = {
@@ -270,6 +290,7 @@ fun NavGraph() {
             }
             composable(Screen.Friends.route) {
                 FriendsScreen(
+                    viewModel = provisioningViewModel,
                     onCreateOracleExit = {
                         provisioningViewModel.prepareNewProvisioningFlow()
                         navController.navigate(Screen.OracleProvision.route)
