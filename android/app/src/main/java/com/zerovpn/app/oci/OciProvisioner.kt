@@ -138,13 +138,27 @@ class OciProvisioner(
         val clientPublicKey: String,
         val serverPublicKey: String,
         val serverPeerPublicKey: String,
+        val inviteProfiles: List<InvitePeerProvisionResult> = emptyList(),
         val sshUsername: String,
         val sshPrivateKey: String,
+    )
+
+    data class InvitePeerProvisionResult(
+        val slotIndex: Int,
+        val tunnelIp: String,
+        val clientConfig: String,
+        val clientPublicKey: String,
     )
 
     private data class WireGuardClientKeys(
         val privateKey: String,
         val publicKey: String,
+    )
+
+    private data class FriendInvitePeer(
+        val slotIndex: Int,
+        val tunnelIp: String,
+        val keys: WireGuardClientKeys,
     )
 
     data class ResourceIds(
@@ -942,6 +956,7 @@ class OciProvisioner(
         publicIp: String,
         sshPrivateKey: String,
         clientKeys: WireGuardClientKeys,
+        friendInvitePeers: List<FriendInvitePeer>,
     ): ProvisionResult {
         val port = 51820
 
@@ -1024,9 +1039,14 @@ class OciProvisioner(
 
         // Fix line endings and run
         runSshCommand(sshConnection, "sed -i 's/\\r\$//' /tmp/setup-wg.sh", label = "normalize WireGuard setup script")
+        val friendPeerEnv = friendInvitePeers
+            .sortedBy { it.slotIndex }
+            .joinToString(" ") { peer ->
+                "FRIEND_${peer.slotIndex}_PUBLIC_KEY='${peer.keys.publicKey}'"
+            }
         val runResult = runSshCommand(
             sshConnection,
-            "CLIENT_PUBLIC_KEY='${clientKeys.publicKey}' bash /tmp/setup-wg.sh",
+            "CLIENT_PUBLIC_KEY='${clientKeys.publicKey}' $friendPeerEnv bash /tmp/setup-wg.sh",
             label = "run WireGuard setup script",
             maxAttempts = 1,
         )
@@ -1066,6 +1086,20 @@ class OciProvisioner(
             "[Peer]\nPublicKey = $serverPub\n" +
             "Endpoint = $publicIp:$port\n" +
             "AllowedIPs = 0.0.0.0/0\nPersistentKeepalive = 25\n"
+        val inviteProfiles = friendInvitePeers
+            .sortedBy { it.slotIndex }
+            .map { peer ->
+                InvitePeerProvisionResult(
+                    slotIndex = peer.slotIndex,
+                    tunnelIp = peer.tunnelIp,
+                    clientPublicKey = peer.keys.publicKey,
+                    clientConfig = "[Interface]\nPrivateKey = ${peer.keys.privateKey}\n" +
+                        "Address = ${peer.tunnelIp}/32\nDNS = 1.1.1.1\n\n" +
+                        "[Peer]\nPublicKey = $serverPub\n" +
+                        "Endpoint = $publicIp:$port\n" +
+                        "AllowedIPs = 0.0.0.0/0\nPersistentKeepalive = 25\n",
+                )
+            }
 
         emit(Phase.WIREGUARD, Status.SUCCESS, "WireGuard configured")
         return ProvisionResult(
@@ -1075,6 +1109,7 @@ class OciProvisioner(
             clientPublicKey = clientKeys.publicKey,
             serverPublicKey = serverPub,
             serverPeerPublicKey = serverPeerPub,
+            inviteProfiles = inviteProfiles,
             sshUsername = "ubuntu",
             sshPrivateKey = sshPrivateKey,
         )
@@ -1238,6 +1273,11 @@ class OciProvisioner(
         val sshPublicKey = sshKeyPair.first
         val sshPrivateKey = sshKeyPair.second
         val wireGuardClientKeys = generateWireGuardClientKeys()
+        val friendInvitePeers = listOf(
+            FriendInvitePeer(slotIndex = 1, tunnelIp = "10.66.66.3", keys = generateWireGuardClientKeys()),
+            FriendInvitePeer(slotIndex = 2, tunnelIp = "10.66.66.4", keys = generateWireGuardClientKeys()),
+            FriendInvitePeer(slotIndex = 3, tunnelIp = "10.66.66.5", keys = generateWireGuardClientKeys()),
+        )
 
         // Create network
         val rids = createNetwork(auth, homeRegion)
@@ -1246,7 +1286,14 @@ class OciProvisioner(
         val publicIp = launchVm(auth, homeRegion, rids, sshPublicKey)
 
         // Setup WireGuard via SSH
-        val provisionResult = setupWireGuard(auth, homeRegion, publicIp, sshPrivateKey, wireGuardClientKeys)
+        val provisionResult = setupWireGuard(
+            auth = auth,
+            homeRegion = homeRegion,
+            publicIp = publicIp,
+            sshPrivateKey = sshPrivateKey,
+            clientKeys = wireGuardClientKeys,
+            friendInvitePeers = friendInvitePeers,
+        )
 
         // Done
         emit(Phase.DONE, Status.SUCCESS, "Exit created: ${provisionResult.publicIp}:${provisionResult.wireGuardPort}")
@@ -1647,6 +1694,10 @@ if [ -z "${'$'}CLIENT_PUBLIC_KEY" ]; then
   echo "ERROR: CLIENT_PUBLIC_KEY is required" >&2
   exit 1
 fi
+if [ -z "${'$'}FRIEND_1_PUBLIC_KEY" ] || [ -z "${'$'}FRIEND_2_PUBLIC_KEY" ] || [ -z "${'$'}FRIEND_3_PUBLIC_KEY" ]; then
+  echo "ERROR: FRIEND_1_PUBLIC_KEY, FRIEND_2_PUBLIC_KEY, and FRIEND_3_PUBLIC_KEY are required" >&2
+  exit 1
+fi
 
 PUBLIC_IF=${'$'}(ip route show default | awk '{print ${'$'}5; exit}')
 if [ -z "${'$'}PUBLIC_IF" ]; then
@@ -1670,6 +1721,18 @@ PostDown = iptables -D INPUT -p udp --dport 51820 -j ACCEPT 2>/dev/null || true;
 [Peer]
 PublicKey = ${'$'}CLIENT_PUBLIC_KEY
 AllowedIPs = 10.66.66.2/32
+
+[Peer]
+PublicKey = ${'$'}FRIEND_1_PUBLIC_KEY
+AllowedIPs = 10.66.66.3/32
+
+[Peer]
+PublicKey = ${'$'}FRIEND_2_PUBLIC_KEY
+AllowedIPs = 10.66.66.4/32
+
+[Peer]
+PublicKey = ${'$'}FRIEND_3_PUBLIC_KEY
+AllowedIPs = 10.66.66.5/32
 EOF"
 sudo chmod 600 /etc/wireguard/wg0.conf
 

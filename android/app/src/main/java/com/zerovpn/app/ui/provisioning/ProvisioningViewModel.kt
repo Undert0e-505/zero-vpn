@@ -888,6 +888,10 @@ class ProvisioningViewModel : ViewModel() {
             )
             _configuredExits.value = _configuredExits.value + configuredExit
             _selectedExitId.value = configuredExit.id
+            createInviteSlotsForProvisionedExit(
+                ownerExitId = configuredExit.id,
+                inviteProfiles = result.inviteProfiles,
+            )
 
             _currentPhase.value = Phase.DONE
             _state.value = ProvisioningState.Success(
@@ -909,6 +913,36 @@ class ProvisioningViewModel : ViewModel() {
             }
             persistState()
         }
+    }
+
+    private fun createInviteSlotsForProvisionedExit(
+        ownerExitId: String,
+        inviteProfiles: List<OciProvisioner.InvitePeerProvisionResult>,
+    ) {
+        val repository = friendsRepository ?: return
+        if (inviteProfiles.isEmpty()) return
+        val now = System.currentTimeMillis()
+        var slots = _inviteSlots.value
+        inviteProfiles.sortedBy { it.slotIndex }.forEach { profile ->
+            slots = repository.upsertInviteSlot(
+                InviteSlot(
+                    slotId = "$ownerExitId:friend-${profile.slotIndex}",
+                    ownerExitId = ownerExitId,
+                    slotIndex = profile.slotIndex,
+                    displayName = null,
+                    state = InviteSlotState.UNUSED,
+                    tunnelIp = profile.tunnelIp,
+                    peerPublicKey = profile.clientPublicKey,
+                    // Stored using existing app persistence; migrate to encrypted storage
+                    // before public release of Friends feature.
+                    encryptedClientConfig = profile.clientConfig,
+                    encryptedClientPrivateKey = null,
+                    createdAt = now,
+                    updatedAt = now,
+                ),
+            )
+        }
+        _inviteSlots.value = slots
     }
 
     private fun openUrl(context: Context, url: String) {
