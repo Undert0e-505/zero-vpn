@@ -130,15 +130,16 @@ fun SettingsScreen(
                 .padding(16.dp),
         ) {
             Text(
-                text = "ZeroVPN is a community-driven VPN client built on WireGuard. It enables private, encrypted connections through volunteer-operated exit nodes.",
+                text = "ZeroVPN is an experimental open-source Android app for creating personal VPN exits. It can provision an Oracle Free Exit, import shared WireGuard exits by QR, share trusted friend invites, and use an experimental Volunteer Exit. ZeroVPN is not a VPN provider and does not operate central exit nodes.",
                 fontSize = 15.sp,
                 fontWeight = FontWeight.Normal,
                 color = TextPrimary,
                 modifier = Modifier.padding(bottom = 12.dp),
+                lineHeight = 20.sp,
             )
             Spacer(modifier = Modifier.height(4.dp))
             Text(
-                text = "Threat model: github.com/Undert0e-505/zero-vpn/blob/main/docs/THREAT-MODEL.md",
+                text = "Threat model: https://github.com/Undert0e-505/zero-vpn/blob/main/docs/THREAT_MODEL.md",
                 fontSize = 12.sp,
                 fontWeight = FontWeight.Normal,
                 color = TextDim,

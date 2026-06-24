@@ -3,81 +3,113 @@
 ZeroVPN is an experimental open-source Android app for creating and using
 personal VPN exits.
 
-The current v0.1.1 path provisions an Oracle Cloud Always Free VM, installs
-WireGuard, and connects the Android device through that VM using Android
-`VpnService`.
+ZeroVPN is not a commercial VPN provider. There are no ZeroVPN accounts, no
+subscription service, and no central ZeroVPN VPN backend. Traffic exits through
+infrastructure that you control or explicitly accept.
 
-ZeroVPN is not a VPN service provider. It does not operate exit nodes, collect
-ZeroVPN accounts, sell VPN subscriptions, or run a central VPN backend. Traffic
-exits through infrastructure that you control.
+## What It Is
 
-## Status
+- An Android app for creating a personal Oracle Free Exit.
+- A WireGuard-based VPN client using Android `VpnService`.
+- A trusted Friends sharing workflow for QR-based WireGuard invites.
+- An importer for shared WireGuard exits.
+- An experimental Volunteer Exit mode for no-cloud, web-focused routing.
 
-ZeroVPN v0.1.1 is an experimental public pre-release.
+## What It Is Not
 
-Currently working:
+- Not an anonymity guarantee.
+- Not a Tor Browser replacement.
+- Not a commercial VPN service.
+- Not a hosted ZeroVPN network.
+- Not a way to bypass Oracle account, billing, capacity, or MFA requirements.
 
-- Create an Oracle Free Exit.
-- Authenticate with Oracle Cloud.
-- Discover the OCI home region automatically.
-- Provision an Oracle Cloud VM.
-- Configure WireGuard on the VM.
-- Connect Android traffic through the VM.
-- Show basic connection diagnostics.
+## Current Status: v0.2 Candidate
 
-Known rough edges:
+ZeroVPN v0.2 is a release candidate for hardware-tested Oracle, Friends, Shared
+Exit, and Volunteer workflows. The app is still experimental and should not be
+treated as a polished or professionally audited security product.
 
-- Oracle account signup, login, and MFA are still awkward.
-- Users should create and verify their Oracle Cloud account before using the
-  app.
-- VM setup can still fail and diagnostics are still improving.
-- Destroy/recreate flow needs hardening.
-- Logs are not implemented yet.
-- Volunteer Network, QR Invite, Import Config, and Private Node are not
-  implemented yet.
+## What Works In v0.2
 
-## What Works In v0.1.1
+### Oracle Free Exit
 
-- Creates an Oracle Free Exit using your own Oracle Cloud account.
-- Provisions a small Oracle VM intended for Oracle Always Free usage.
-- Installs and configures WireGuard on the VM.
-- Starts an Android VPN tunnel using Android's `VpnService`.
-- Shows basic diagnostics such as exit IP, DNS configuration, and handshake
-  status.
+- Authenticates with Oracle Cloud from the Android app.
+- Discovers and uses the OCI region for the account.
+- Provisions an Oracle Cloud VM intended for Always Free usage.
+- Configures OCI networking and security rules.
+- Installs WireGuard on the VM.
+- Creates the owner WireGuard profile.
+- Creates three Friends invite WireGuard profiles.
+- Connects Android traffic through the VM using Android `VpnService` and
+  WireGuard.
+- Supports destroy and cleanup flows.
 
-## Planned / Not Implemented Yet
+### Friends / Share Exit
 
-- Volunteer Network Mode.
-- QR Invite / trusted operator invites.
-- Import existing WireGuard config.
-- Create Private Node.
-- In-app logs.
-- Better destroy/recreate lifecycle.
-- Better onboarding and failure recovery.
+- Each owner Oracle exit gets three invite slots.
+- The owner can name and share a slot by QR.
+- The recipient scans the QR in app and imports it as a Shared Exit.
+- The owner can check for the recipient's first WireGuard handshake.
+- After first successful handshake, ZeroVPN burns the local QR/private share
+  material.
+- The owner can revoke/reset a slot, remove the old peer, and create a fresh
+  unused invite for the same slot.
+
+### Shared Exit Import
+
+- Scans a WireGuard QR in app.
+- Adds the imported profile to Home as a Shared Exit.
+- Connects through the shared WireGuard server.
+- Supports rename and local removal.
+- Cannot manage, destroy, or reset the owner's VM.
+
+### Volunteer Exit
+
+- Works without an Oracle account or cloud VM.
+- Uses an embedded Tor plus Android `VpnService` / HEV-style tun2socks path.
+- Has produced non-local/non-UK public IPs in hardware testing.
+- Is experimental, slower, web/TCP-focused, and may be blocked by some sites.
+- Does not provide a fully hardened or audited anonymity system.
+- UDP is not supported or guaranteed.
+
+### Diagnostics
+
+- Shows connection state, selected exit details, exit IP, DNS status, and
+  handshake information.
+- Shows Friends/share metadata useful for v0.2 testing.
+- Does not display private keys, raw WireGuard configs, QR payloads, PSKs, or
+  SSH private keys.
 
 ## Important Limitations
 
-This is experimental software. It may fail during Oracle provisioning, VM
-setup, connection, or teardown.
+- ZeroVPN is experimental software.
+- A VPN changes the network exit path; it does not hide identity by itself.
+- Oracle exits are cloud VMs in the user's Oracle account.
+- The user is responsible for Oracle resources, invited users, and VM costs or
+  limits.
+- Friends sharing should only be used with people you trust.
+- Volunteer Exit is experimental and is not a full audited anonymity system.
+- UDP support is limited or unavailable in Volunteer Exit.
+- Android is the only supported client platform at present.
+- There is no commercial ZeroVPN service or hosted backend.
 
-ZeroVPN is not a privacy guarantee. A VPN changes your network exit, not your
-identity. Websites, apps, Oracle, the exit network, DNS infrastructure, and
-other systems may still observe traffic metadata.
+## Threat Model
 
-Use at your own risk. Do not use ZeroVPN for anything that requires a
-professionally audited security product.
+Read the current threat model before relying on ZeroVPN:
+
+https://github.com/Undert0e-505/zero-vpn/blob/main/docs/THREAT_MODEL.md
+
+The short version: ZeroVPN gives the user control over the traffic exit path,
+but the exit operator, cloud provider, destination services, apps, and device
+signals still matter.
 
 ## Installation
 
-Download the v0.1.1 pre-release APK from GitHub:
+Install the latest v0.2 candidate APK from GitHub Releases when it is published.
+Android will ask you to allow installation from the browser or file manager you
+use to open the APK.
 
-https://github.com/Undert0e-505/zero-vpn/releases/tag/v0.1.1
-
-Install `ZeroVPN-v0.1.1.apk`. The public release APK is signed. Android will ask
-you to allow installation from the browser or file manager you use to open the
-APK.
-
-## Before Using ZeroVPN
+## Before Using Oracle Free Exit
 
 You need:
 
@@ -88,7 +120,7 @@ You need:
 - An internet connection.
 
 ZeroVPN cannot create your Oracle account for you. It does not bypass Oracle
-login, payment-card verification, region checks, or MFA.
+login, payment-card verification, region checks, capacity limits, or MFA.
 
 Useful Oracle links:
 
@@ -99,18 +131,41 @@ Useful Oracle links:
 
 ## Basic Usage
 
-1. Install the APK from the v0.1.1 release.
-2. Open ZeroVPN.
-3. Choose **Add Exit**.
-4. Choose **Create Oracle Free Exit**.
-5. Sign in to Oracle when the browser opens.
-6. Return to ZeroVPN.
-7. Let ZeroVPN discover your Oracle account region and provision the VM.
-8. Connect.
+### Create Your Own Oracle Exit
 
-If region discovery fails, the app may ask you to choose your Oracle
-account/tenancy region manually. This is an Oracle account setting, not a
-statement about where you physically live.
+1. Open ZeroVPN.
+2. Choose **Add Exit**.
+3. Choose **Create Oracle Free Exit**.
+4. Sign in to Oracle when the browser opens.
+5. Return to ZeroVPN.
+6. Let ZeroVPN discover the region and provision the VM.
+7. Connect from Home.
+
+### Share With A Trusted Friend
+
+1. Create an Oracle Free Exit.
+2. Open **Friends**.
+3. Pick one of the three invite slots.
+4. Name the slot and show the QR.
+5. Have the recipient scan it using **Add Exit -> Scan QR Invite**.
+6. After the recipient connects, use **Check claim**.
+7. ZeroVPN burns the local QR/private share material after first handshake.
+8. Use **Revoke and reset invite** when that person should lose access.
+
+### Use A Shared Exit
+
+1. Choose **Add Exit -> Scan QR Invite**.
+2. Scan the WireGuard QR.
+3. Save the Shared Exit.
+4. Connect from Home.
+
+### Use Volunteer Exit
+
+1. Choose **Add Exit -> Volunteer Exit**.
+2. Create the local Volunteer Exit profile.
+3. Connect from Home.
+
+Expect slower web/TCP-focused behavior and possible site blocks.
 
 ## Build From Source
 
@@ -128,10 +183,17 @@ cd android
 .\gradlew.bat assembleDebug
 ```
 
+Volunteer diagnostics build:
+
+```powershell
+cd android
+.\gradlew.bat assembleDebug -PenableVolunteerDebug=true
+```
+
 Release dry-run:
 
 ```powershell
-.\scripts\build-apk.ps1 -Version 0.1.1 -DryRun -PreRelease -Clean
+.\scripts\build-apk.ps1 -Version 0.2 -DryRun -PreRelease -Clean
 ```
 
 Real release builds require local signing configuration and GitHub CLI
@@ -145,16 +207,10 @@ Local signing configuration is intentionally ignored by git. Use
 `android/signing.properties` or the supported signing environment variables.
 Do not commit `signing.properties`, keystores, passwords, APKs, or AAB files.
 
-## Privacy / Security Model
+## Attribution
 
-ZeroVPN's current model is bring your own exit.
-
-It reduces dependence on a commercial VPN provider, but it does not make you
-anonymous. The Oracle VM is still a cloud VM in your Oracle account, and traffic
-exits from that VM.
-
-You are responsible for your Oracle account and any infrastructure created in
-it. Destroy exits when you no longer need them.
+ZeroVPN is a project by Undert0e-505, built with Codex as an implementation
+partner. OpenAI does not own, host, operate, or endorse ZeroVPN.
 
 ## License
 

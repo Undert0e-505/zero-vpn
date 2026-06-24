@@ -39,7 +39,6 @@ import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.zerovpn.app.oci.OciAuthReturn
-import com.zerovpn.app.BuildConfig
 import com.zerovpn.app.ui.provisioning.ProvisioningState
 import com.zerovpn.app.ui.provisioning.ProvisioningViewModel
 import com.zerovpn.app.ui.screens.*
@@ -78,7 +77,6 @@ fun NavGraph() {
     val lifecycleOwner = LocalLifecycleOwner.current
     val configuredExits by provisioningViewModel.configuredExits.collectAsState()
     val selectedExitId by provisioningViewModel.selectedExitId.collectAsState()
-    val isDevMode by provisioningViewModel.isDevMode.collectAsState()
     val provisioningState by provisioningViewModel.state.collectAsState()
 
     val navBackStackEntry by navController.currentBackStackEntryAsState()
@@ -204,7 +202,6 @@ fun NavGraph() {
             composable(Screen.AddExit.route) {
                 AddExitScreen(
                     snackbarHostState = snackbarHostState,
-                    showVolunteerDebug = BuildConfig.VOLUNTEER_DEBUG_ENABLED && isDevMode,
                     onNavigateToProvision = {
                         provisioningViewModel.prepareNewProvisioningFlow()
                         navController.navigate(Screen.OracleProvision.route)
