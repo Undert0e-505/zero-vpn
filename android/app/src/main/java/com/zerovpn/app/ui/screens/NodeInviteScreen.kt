@@ -73,9 +73,9 @@ fun FriendsScreen(
             errorMessage = "This invite has already been claimed. The QR is no longer available."
             return
         }
-        val config = slot.encryptedClientConfig?.takeIf { it.isNotBlank() }
+        val config = viewModel.getInviteSlotClientConfig(slot.slotId)?.takeIf { it.isNotBlank() }
         if (config == null) {
-            errorMessage = "This invite slot does not have a share config yet. Create a new Oracle exit to generate share slots."
+            errorMessage = "This invite slot is missing its share config. Recreate the exit or wait for a future recovery flow."
             return
         }
         val bitmap = runCatching { QrCodeGenerator.generate(config) }

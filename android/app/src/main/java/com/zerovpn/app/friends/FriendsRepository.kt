@@ -57,6 +57,7 @@ class FriendsRepository(
                 state = InviteSlotState.CLAIMED,
                 firstHandshakeAt = it.firstHandshakeAt ?: firstHandshakeAt,
                 lastHandshakeAt = lastHandshakeAt,
+                clientConfigSecretKey = null,
                 encryptedClientConfig = null,
                 encryptedClientPrivateKey = null,
                 updatedAt = System.currentTimeMillis(),
@@ -66,6 +67,7 @@ class FriendsRepository(
     fun clearBurnedPrivateMaterial(slotId: String): List<InviteSlot> =
         updateInviteSlot(slotId) {
             it.copy(
+                clientConfigSecretKey = null,
                 encryptedClientConfig = null,
                 encryptedClientPrivateKey = null,
                 updatedAt = System.currentTimeMillis(),
@@ -178,8 +180,9 @@ class FriendsRepository(
         .put("state", state.name)
         .put("tunnelIp", tunnelIp)
         .put("peerPublicKey", peerPublicKey)
-        .put("encryptedClientConfig", encryptedClientConfig)
-        .put("encryptedClientPrivateKey", encryptedClientPrivateKey)
+        .put("clientConfigSecretKey", clientConfigSecretKey)
+        .put("encryptedClientConfig", JSONObject.NULL)
+        .put("encryptedClientPrivateKey", JSONObject.NULL)
         .put("qrShownAt", qrShownAt)
         .put("firstHandshakeAt", firstHandshakeAt)
         .put("lastHandshakeAt", lastHandshakeAt)
@@ -197,6 +200,7 @@ class FriendsRepository(
         }.getOrDefault(InviteSlotState.UNUSED),
         tunnelIp = optNullableString("tunnelIp"),
         peerPublicKey = optNullableString("peerPublicKey"),
+        clientConfigSecretKey = optNullableString("clientConfigSecretKey"),
         encryptedClientConfig = optNullableString("encryptedClientConfig"),
         encryptedClientPrivateKey = optNullableString("encryptedClientPrivateKey"),
         qrShownAt = optLongOrNull("qrShownAt"),
@@ -212,7 +216,9 @@ class FriendsRepository(
         .put("displayName", displayName)
         .put("source", source.name)
         .put("providerType", providerType.name)
-        .put("encryptedWireGuardConfig", encryptedWireGuardConfig)
+        .put("wireGuardConfigSecretKey", wireGuardConfigSecretKey)
+        .put("configHash", configHash)
+        .put("encryptedWireGuardConfig", JSONObject.NULL)
         .put("endpointHost", endpointHost)
         .put("endpointIp", endpointIp)
         .put("importedAt", importedAt)
@@ -229,6 +235,8 @@ class FriendsRepository(
         providerType = runCatching {
             SharedExitProviderType.valueOf(optString("providerType", SharedExitProviderType.SHARED_WIREGUARD.name))
         }.getOrDefault(SharedExitProviderType.SHARED_WIREGUARD),
+        wireGuardConfigSecretKey = optNullableString("wireGuardConfigSecretKey"),
+        configHash = optNullableString("configHash"),
         encryptedWireGuardConfig = optNullableString("encryptedWireGuardConfig"),
         endpointHost = optNullableString("endpointHost"),
         endpointIp = optNullableString("endpointIp"),
