@@ -3,6 +3,7 @@ package com.zerovpn.app.vpn
 enum class ExitProvider {
     OCI,
     VOLUNTEER,
+    SHARED_WIREGUARD,
 }
 
 enum class ExitLifecycleState {

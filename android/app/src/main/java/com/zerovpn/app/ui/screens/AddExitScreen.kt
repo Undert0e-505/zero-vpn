@@ -29,6 +29,7 @@ fun AddExitScreen(
     snackbarHostState: SnackbarHostState,
     onNavigateToProvision: () -> Unit,
     onNavigateToVolunteer: () -> Unit,
+    onNavigateToScanInvite: () -> Unit,
     showVolunteerDebug: Boolean,
     modifier: Modifier = Modifier,
 ) {
@@ -101,12 +102,7 @@ fun AddExitScreen(
         OptionButton(
             icon = Icons.Default.QrCodeScanner,
             label = "Scan QR Invite",
-            enabled = false,
-            statusLabel = "Coming Soon",
-            onClick = {},
-            onDisabledClick = {
-                disabledMessage = "QR invites are not implemented yet."
-            },
+            onClick = onNavigateToScanInvite,
         )
 
         Spacer(modifier = Modifier.height(8.dp))

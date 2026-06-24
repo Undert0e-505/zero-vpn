@@ -10,7 +10,10 @@ import androidx.browser.customtabs.CustomTabsIntent
 import com.zerovpn.app.friends.FriendsRepository
 import com.zerovpn.app.friends.InviteSlot
 import com.zerovpn.app.friends.InviteSlotState
+import com.zerovpn.app.friends.ParsedWireGuardInvite
+import com.zerovpn.app.friends.SharedExitProviderType
 import com.zerovpn.app.friends.SharedExitProfile
+import com.zerovpn.app.friends.SharedExitSource
 import com.zerovpn.app.oci.OciProvisioner
 import com.zerovpn.app.oci.OciRegion
 import com.zerovpn.app.oci.OciRegions
@@ -472,6 +475,84 @@ class ProvisioningViewModel : ViewModel() {
         friendsRepository?.let { repository ->
             _sharedExitProfiles.value = repository.removeSharedExit(profileId)
         }
+    }
+
+    fun hasImportedSharedExit(invite: ParsedWireGuardInvite): Boolean =
+        _configuredExits.value.any { exit ->
+            exit.provider == ExitProvider.SHARED_WIREGUARD &&
+                exit.wireGuardConfig.trim() == invite.rawConfig.trim()
+        }
+
+    fun importSharedExit(invite: ParsedWireGuardInvite, displayName: String): ConfiguredExit? {
+        if (hasImportedSharedExit(invite)) return null
+        val now = System.currentTimeMillis()
+        val profileId = "shared:${UUID.randomUUID()}"
+        val name = displayName.trim().ifBlank { "Shared Exit" }
+        val profile = SharedExitProfile(
+            id = profileId,
+            displayName = name,
+            source = SharedExitSource.IMPORTED_QR,
+            providerType = SharedExitProviderType.SHARED_WIREGUARD,
+            // Stored using existing app persistence in this spike; migrate to encrypted
+            // storage before public release.
+            encryptedWireGuardConfig = invite.rawConfig,
+            endpointHost = invite.endpointHost,
+            endpointIp = invite.endpointHost,
+            importedAt = now,
+            updatedAt = now,
+        )
+        val exit = ConfiguredExit(
+            id = profileId,
+            name = name,
+            publicIp = invite.endpointHost,
+            wireGuardPort = invite.endpointPort,
+            region = "Shared Exit",
+            wireGuardConfig = invite.rawConfig,
+            provider = ExitProvider.SHARED_WIREGUARD,
+            endpointHost = invite.endpointHost,
+            endpointPort = invite.endpointPort,
+            lifecycleState = ExitLifecycleState.READY,
+            createdAt = now,
+            serverPublicKey = invite.peerPublicKey,
+            serverPeerPublicKey = invite.clientPublicKey,
+            clientPublicKey = invite.clientPublicKey,
+            transportLabel = "Shared WireGuard exit",
+            tcpSupported = true,
+            udpSupported = true,
+            destroyMeaning = "removeLocalProfile",
+        )
+        friendsRepository?.let { repository ->
+            _sharedExitProfiles.value = repository.addSharedExit(profile)
+        }
+        _configuredExits.value = _configuredExits.value + exit
+        _selectedExitId.value = exit.id
+        restoreStateFromSelectedExitOrIdle()
+        persistState()
+        return exit
+    }
+
+    fun renameSharedExitProfile(profileId: String, name: String) {
+        val trimmed = name.trim().ifBlank { "Shared Exit" }
+        friendsRepository?.let { repository ->
+            _sharedExitProfiles.value = repository.renameSharedExit(profileId, trimmed)
+        }
+        updateExit(profileId) { exit ->
+            if (exit.provider == ExitProvider.SHARED_WIREGUARD) exit.copy(name = trimmed) else exit
+        }
+    }
+
+    fun removeSharedExitProfile(profileId: String) {
+        friendsRepository?.let { repository ->
+            _sharedExitProfiles.value = repository.removeSharedExit(profileId)
+        }
+        _configuredExits.value = _configuredExits.value.filterNot {
+            it.id == profileId && it.provider == ExitProvider.SHARED_WIREGUARD
+        }
+        if (_selectedExitId.value == profileId) {
+            _selectedExitId.value = _configuredExits.value.firstOrNull()?.id
+        }
+        restoreStateFromSelectedExitOrIdle()
+        persistState()
     }
 
     fun createVolunteerExit(): ConfiguredExit {

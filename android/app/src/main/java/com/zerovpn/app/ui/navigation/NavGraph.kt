@@ -53,6 +53,7 @@ sealed class Screen(val route: String, val label: String, val icon: ImageVector)
     data object Diagnostics : Screen("diagnostics", "Diagnostics", Icons.Default.Build)
     data object Settings : Screen("settings", "Settings", Icons.Default.Settings)
     data object OracleProvision : Screen("oracle_provision", "Provision", Icons.Default.Cloud)
+    data object ScanInvite : Screen("scan_invite", "Scan", Icons.Default.Add)
     data object VolunteerIntro : Screen("volunteer_intro", "Volunteer", Icons.Default.VolunteerActivism)
     data object VolunteerDetails : Screen("volunteer_details", "Volunteer", Icons.Default.VolunteerActivism)
 }
@@ -189,6 +190,24 @@ fun NavGraph() {
                     },
                     onNavigateToVolunteer = {
                         navController.navigate(Screen.VolunteerIntro.route)
+                    },
+                    onNavigateToScanInvite = {
+                        navController.navigate(Screen.ScanInvite.route)
+                    },
+                )
+            }
+            composable(Screen.ScanInvite.route) {
+                ScanInviteScreen(
+                    viewModel = provisioningViewModel,
+                    onCancel = { navController.popBackStack() },
+                    onImported = {
+                        navController.navigate(Screen.Home.route) {
+                            popUpTo(navController.graph.findStartDestination().id) {
+                                saveState = true
+                            }
+                            launchSingleTop = true
+                            restoreState = true
+                        }
                     },
                 )
             }

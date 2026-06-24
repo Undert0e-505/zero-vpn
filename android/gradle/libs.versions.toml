@@ -4,6 +4,7 @@ kotlin = "2.1.0"
 coreKtx = "1.15.0"
 lifecycle = "2.8.7"
 activityCompose = "1.9.3"
+cameraX = "1.4.1"
 composeBom = "2024.12.01"
 navigationCompose = "2.8.5"
  okhttp = "4.12.0"
@@ -35,7 +36,10 @@ androidx-navigation-compose = { group = "androidx.navigation", name = "navigatio
  jsch = { group = "com.github.mwiede", name = "jsch", version.ref = "jsch" }
 bcprov = { group = "org.bouncycastle", name = "bcprov-jdk15to18", version.ref = "bcprov" }
 bcpkix = { group = "org.bouncycastle", name = "bcpkix-jdk15to18", version.ref = "bcpkix" }
- androidx-browser = { group = "androidx.browser", name = "browser", version.ref = "browser" }
+androidx-browser = { group = "androidx.browser", name = "browser", version.ref = "browser" }
+androidx-camera-camera2 = { group = "androidx.camera", name = "camera-camera2", version.ref = "cameraX" }
+androidx-camera-lifecycle = { group = "androidx.camera", name = "camera-lifecycle", version.ref = "cameraX" }
+androidx-camera-view = { group = "androidx.camera", name = "camera-view", version.ref = "cameraX" }
 wireguard-tunnel = { group = "com.wireguard.android", name = "tunnel", version.ref = "wireguardTunnel" }
 tor-android = { group = "info.guardianproject", name = "tor-android", version.ref = "torAndroid" }
 zxing-core = { group = "com.google.zxing", name = "core", version.ref = "zxingCore" }
