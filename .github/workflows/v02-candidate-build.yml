@@ -1,4 +1,4 @@
-name: v0.2 candidate build
+name: v0.2.0 candidate build
 
 on:
   workflow_dispatch:
@@ -13,7 +13,7 @@ on:
 
 jobs:
   build-v02-candidate:
-    name: Build v0.2 candidate APK with HEV native
+    name: Build v0.2.0 candidate APK with HEV native
     runs-on: ubuntu-latest
 
     steps:
@@ -38,7 +38,7 @@ jobs:
           sdkmanager "ndk;27.0.12077973" "cmake;3.22.1"
           echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.0.12077973" >> "$GITHUB_ENV"
 
-      - name: Build v0.2 candidate debug APK
+      - name: Build v0.2.0 debug APK
         working-directory: android
         run: |
           set -euo pipefail
@@ -58,11 +58,11 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p artifacts
-          cp android/app/build/outputs/apk/debug/app-debug.apk artifacts/ZeroVPN-v0.2-candidate-debug.apk
+          cp android/app/build/outputs/apk/debug/app-debug.apk artifacts/ZeroVPN-v0.2.0-debug.apk
 
-      - name: Upload v0.2 candidate APK
+      - name: Upload v0.2.0 APK
         uses: actions/upload-artifact@v4
         with:
-          name: ZeroVPN-v0.2-candidate-debug.apk
-          path: artifacts/ZeroVPN-v0.2-candidate-debug.apk
+          name: ZeroVPN-v0.2.0-debug.apk
+          path: artifacts/ZeroVPN-v0.2.0-debug.apk
           if-no-files-found: error
