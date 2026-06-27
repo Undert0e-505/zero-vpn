@@ -1,11 +1,70 @@
 # ZeroVPN
 
-ZeroVPN is an experimental open-source Android app for creating and using
-personal VPN exits.
+[![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Latest Release](https://img.shields.io/github/v/release/Undert0e-505/zero-vpn)](https://github.com/Undert0e-505/zero-vpn/releases)
+[![Platform](https://img.shields.io/badge/platform-Android-green.svg)](https://github.com/Undert0e-505/zero-vpn)
+[![Oracle Cloud](https://img.shields.io/badge/cloud-Oracle%20Cloud%20Free%20Tier-F80000.svg)](https://www.oracle.com/cloud/free/)
+[![WireGuard](https://img.shields.io/badge/VPN-WireGuard-88171A.svg)](https://www.wireguard.com/)
 
-ZeroVPN is not a commercial VPN provider. There are no ZeroVPN accounts, no
-subscription service, and no central ZeroVPN VPN backend. Traffic exits through
-infrastructure that you control or explicitly accept.
+ZeroVPN is an open-source Android app for creating and managing a personal VPN server on Oracle Cloud from your phone. It provisions a WireGuard-based VPN on an Oracle Cloud Free Tier VM, connects your Android traffic through it, and lets you share trusted access with friends via QR invites.
+
+It is designed for people who want a small, inspectable, self-hosted VPN setup without manually working through cloud-console steps every time.
+
+- **Android only** — no iOS support planned
+- **MIT licensed** — forkable, modifiable, self-hostable
+- **Self-hosted backend** — your own Oracle Cloud VM, no central ZeroVPN server
+- **Not a commercial VPN** — no accounts, no subscriptions, no hosted backend
+
+## Screenshots
+
+![ZeroVPN Android home screen with WireGuard VPN connected](docs/screenshots/home-connected.jpg)
+
+*Home — VPN connected through an Oracle Cloud WireGuard exit*
+
+![ZeroVPN Oracle Cloud exit management screen](docs/screenshots/oracle-exit.jpg)
+
+*Exit management — Oracle Cloud exit with disconnect and destroy controls*
+
+## Features
+
+- Create a personal WireGuard VPN server on Oracle Cloud Free Tier from your phone
+- Connect Android traffic through your own cloud VM using Android `VpnService`
+- Share VPN access with trusted friends via QR-based WireGuard invites (3 slots per exit)
+- Import shared WireGuard exits by scanning a QR code
+- Experimental Volunteer Exit mode using embedded Tor for web/TCP traffic (no cloud VM needed)
+- Disconnect, destroy, and cleanup Oracle Cloud resources from the app
+- Diagnostics screen showing connection state, exit IP, DNS status, and handshake info
+- MIT licensed and forkable
+
+## Why ZeroVPN?
+
+Commercial VPN providers are convenient, but they require trusting a company with your traffic data. ZeroVPN gives you a personal VPN on infrastructure you control — an Oracle Cloud Free Tier VM that you own and can destroy at any time. No ZeroVPN accounts, no subscription service, no central backend.
+
+**Note:** ZeroVPN is not an anonymity guarantee. It does not hide your identity by itself. The exit operator, cloud provider, destination services, apps, and device signals still matter. See the [threat model](docs/THREAT_MODEL.md) for details.
+
+## Tech Stack
+
+| Layer | Technology |
+|-------|-----------|
+| Android app | Kotlin, Jetpack Compose |
+| VPN tunnel | WireGuard via Android `VpnService` |
+| Cloud VM | Oracle Cloud Infrastructure (Free Tier) |
+| Cloud SDK | OCI Java SDK |
+| Volunteer Exit | Embedded Tor + HEV tun2socks |
+| Sharing | QR-based WireGuard invite import |
+| License | MIT |
+
+## Project Status
+
+**Experimental — v0.2.0 released.**
+
+- Oracle Free Exit creation, Friends sharing, Shared Exit import, and Volunteer Exit are all hardware-tested.
+- First-time Oracle VM creation takes ~5 minutes (VM provisioning, networking, SSH, WireGuard install). Reconnecting after setup is fast.
+- The app is experimental and should not be treated as a polished or professionally audited security product.
+- See the full [threat model](docs/THREAT_MODEL.md) before relying on ZeroVPN.
+- Android is the only supported platform.
+
+---
 
 ## What It Is
 
@@ -23,20 +82,9 @@ infrastructure that you control or explicitly accept.
 - Not a hosted ZeroVPN network.
 - Not a way to bypass Oracle account, billing, capacity, or MFA requirements.
 
-## Current Status: v0.2.0
+### What Works In v0.2.0
 
-ZeroVPN v0.2.0 is a release for hardware-tested Oracle, Friends, Shared
-Exit, and Volunteer workflows. The app is still experimental and should not be
-treated as a polished or professionally audited security product.
-
-First-time Oracle Free Exit creation is slow by design. Expect about 5 minutes
-while Oracle creates the VM, networking comes up, SSH becomes available, and
-WireGuard is installed. Once the exit exists, reconnecting is fast because
-ZeroVPN is just bringing up an existing WireGuard tunnel.
-
-## What Works In v0.2.0
-
-### Oracle Free Exit
+#### Oracle Free Exit
 
 - Authenticates with Oracle Cloud from the Android app.
 - Discovers and uses the OCI region for the account.
@@ -53,7 +101,7 @@ ZeroVPN is just bringing up an existing WireGuard tunnel.
 - Reconnecting after setup is fast because the VM and WireGuard config already
   exist.
 
-### Friends / Share Exit
+#### Friends / Share Exit
 
 - Each owner Oracle exit gets three invite slots.
 - The owner can name and share a slot by QR.
@@ -64,7 +112,7 @@ ZeroVPN is just bringing up an existing WireGuard tunnel.
 - The owner can revoke/reset a slot, remove the old peer, and create a fresh
   unused invite for the same slot.
 
-### Shared Exit Import
+#### Shared Exit Import
 
 - Scans a WireGuard QR in app.
 - Adds the imported profile to Home as a Shared Exit.
@@ -72,7 +120,7 @@ ZeroVPN is just bringing up an existing WireGuard tunnel.
 - Supports rename and local removal.
 - Cannot manage, destroy, or reset the owner's VM.
 
-### Volunteer Exit
+#### Volunteer Exit
 
 - Works without an Oracle account or cloud VM.
 - Uses an embedded Tor plus Android `VpnService` / HEV-style tun2socks path.
@@ -81,7 +129,7 @@ ZeroVPN is just bringing up an existing WireGuard tunnel.
 - Does not provide a fully hardened or audited anonymity system.
 - UDP is not supported or guaranteed.
 
-### Diagnostics
+#### Diagnostics
 
 - Shows connection state, selected exit details, exit IP, DNS status, and
   handshake information.
