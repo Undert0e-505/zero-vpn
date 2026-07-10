@@ -72,6 +72,7 @@ class SecureSecretStore(context: Context) {
 
         fun oracleSshPrivateKey(exitId: String): String = "oracle:$exitId:sshPrivateKey"
         fun oracleOwnerWireGuardConfig(exitId: String): String = "oracle:$exitId:ownerWireGuardConfig"
+        fun privateChatOwnerCredentials(exitId: String): String = "oracle:$exitId:privateChatOwnerCredentials"
         fun inviteClientConfig(slotId: String): String = "invite:$slotId:clientConfig"
         fun sharedWireGuardConfig(sharedExitId: String): String = "shared:$sharedExitId:wireGuardConfig"
     }

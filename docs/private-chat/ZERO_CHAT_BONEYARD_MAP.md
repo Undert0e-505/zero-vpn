@@ -1,9 +1,9 @@
 # Zero Chat Boneyard Map
 
-Status: Phase 0 audit  
-Date: 2026-07-10  
-Zero Chat revision audited: fad89a4a75951b8373020c2c4732dc2146fedb99  
-ZeroVPN revision audited: 85f2e847bc656adde9090e9499be8bc759044697
+- Status: Phase 0 audit
+- Date: 2026-07-10
+- Zero Chat revision audited: fad89a4a75951b8373020c2c4732dc2146fedb99
+- ZeroVPN revision audited: 85f2e847bc656adde9090e9499be8bc759044697
 
 ## 1. Purpose and legal boundary
 
@@ -191,3 +191,15 @@ Proceed by:
 3. implementing independently against the private WireGuard/TLS/bootstrap lifecycle;
 4. translating the behavioral test matrix into new tests;
 5. retaining provenance notes for every dependency and any material later accepted under an explicit license grant.
+
+## 12. Phase 1 implementation record
+
+The Phase 1 implementation was written independently in ZeroVPN; no Zero Chat source was copied or made a build/runtime dependency.
+
+| Behavioral reference | ZeroVPN implementation | Treatment | Material differences and proof |
+|---|---|---|---|
+| `interop/scripts/start-synapse.ps1` | `server/private-chat/installer`, `synapse`, `postgres`, `firewall`, and `health` | REWRITTEN FROM BEHAVIOR | Ubuntu/systemd/PostgreSQL deployment rather than Windows-local disposable Synapse; WireGuard-only TLS; durable stages; root/systemd credentials; removal preserves VPN. Proved by private-chat unit/contract suite and documented real-VM matrix. |
+| `interop/src/test/kotlin/org/zerochat/interop/RealMatrixInteropTest.kt` | `server/private-chat/tests/encrypted_self_test.py` | REWRITTEN FROM BEHAVIOR | Two independent matrix-nio identities against real local Synapse; encryption in initial state; exact bidirectional decrypt; raw ciphertext/plaintext-absence assertions; additionally purges room and deactivates both accounts. `test_encrypted_self_test_contract.py` guards the shipped procedure; real execution is an installer stage. |
+| `app/src/main/java/org/zerochat/rail/matrix/MatrixRail.kt` | `android/app/src/main/java/com/zerovpn/app/chat/node/PrivateChatOwnerVerifier.kt` (narrow Phase 1 status check only) | REWRITTEN FROM SECURITY INVARIANTS | No Matrix rail/UI was ported. The Phase 1 app performs only node-scoped SPKI validation, `/versions`, owner login, and immediate logout over the active WireGuard route. Trixnity/Vodozemac session work remains a later phase. |
+
+Reference revision remains `fad89a4a75951b8373020c2c4732dc2146fedb99`.

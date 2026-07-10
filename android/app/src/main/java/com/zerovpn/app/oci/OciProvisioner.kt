@@ -848,11 +848,17 @@ class OciProvisioner(
 
     // --- Phase 5: VM Launch ---
 
-    private suspend fun launchVm(auth: AuthResult, homeRegion: String, rids: ResourceIds,
-                                  sshPublicKey: String): String {
+    private suspend fun launchVm(
+        auth: AuthResult,
+        homeRegion: String,
+        rids: ResourceIds,
+        sshPublicKey: String,
+        privateChatRequested: Boolean,
+    ): String {
         val cid = auth.tenancyOcid
         val idHost = OciEndpoints.identityHost(homeRegion)
         val iaasHost = OciEndpoints.iaasHost(homeRegion)
+        val shape = if (privateChatRequested) "VM.Standard.A1.Flex" else "VM.Standard.E2.1.Micro"
         emit(
             Phase.VM_LAUNCH,
             Status.RUNNING,
@@ -869,7 +875,7 @@ class OciProvisioner(
         emit(Phase.VM_LAUNCH, Status.RUNNING, "Finding Ubuntu 22.04 image...")
         val imgPath = "/20160918/images?compartmentId=${URLEncoder.encode(cid, "UTF-8")}" +
             "&operatingSystem=Canonical+Ubuntu&operatingSystemVersion=22.04" +
-            "&shape=VM.Standard.E2.1.Micro&sortBy=TIMECREATED&sortOrder=DESC"
+            "&shape=$shape&sortBy=TIMECREATED&sortOrder=DESC"
         val imgResp = ociGetArray(auth, iaasHost, imgPath)
         var imageId: String
         if (imgResp.length() > 0) {
@@ -878,21 +884,29 @@ class OciProvisioner(
             emit(Phase.VM_LAUNCH, Status.RUNNING, "Trying Ubuntu 24.04...")
             val imgPath24 = "/20160918/images?compartmentId=${URLEncoder.encode(cid, "UTF-8")}" +
                 "&operatingSystem=Canonical+Ubuntu&operatingSystemVersion=24.04" +
-                "&shape=VM.Standard.E2.1.Micro&sortBy=TIMECREATED&sortOrder=DESC"
+                "&shape=$shape&sortBy=TIMECREATED&sortOrder=DESC"
             val imgResp24 = ociGetArray(auth, iaasHost, imgPath24)
             if (imgResp24.length() == 0) {
-                throw Exception("No Ubuntu image found for VM.Standard.E2.1.Micro")
+                throw Exception("No supported Ubuntu image found for $shape")
             }
             imageId = imgResp24.getJSONObject(0).getString("id")
         }
 
         // Launch instance
-        emit(Phase.VM_LAUNCH, Status.RUNNING, "Launching instance (VM.Standard.E2.1.Micro)...")
+        if (privateChatRequested) {
+            emit(
+                Phase.VM_LAUNCH,
+                Status.RUNNING,
+                "Private Chat requested: using VM.Standard.A1.Flex with 1 OCPU and 6 GB RAM. " +
+                    "Requested resources appear Free Tier eligible. Oracle, not ZeroVPN, determines actual billing.",
+            )
+        }
+        emit(Phase.VM_LAUNCH, Status.RUNNING, "Launching instance ($shape)...")
         val launchBody = JSONObject()
             .put("availabilityDomain", adName)
             .put("compartmentId", cid)
             .put("displayName", "zerovpn-exit-01")
-            .put("shape", "VM.Standard.E2.1.Micro")
+            .put("shape", shape)
             .put("subnetId", rids.subnetId)
             .put("sourceDetails", JSONObject()
                 .put("imageId", imageId)
@@ -902,9 +916,17 @@ class OciProvisioner(
                 .put("subnetId", rids.subnetId)
                 .put("assignPublicIp", true))
             .put("metadata", JSONObject().put("ssh_authorized_keys", sshPublicKey))
-            .toString()
+        if (privateChatRequested) {
+            launchBody.put(
+                "shapeConfig",
+                JSONObject()
+                    .put("ocpus", 1)
+                    .put("memoryInGBs", 6),
+            )
+        }
+        val launchBodyJson = launchBody.toString()
 
-        val launchResp = ociPost(auth, iaasHost, "/20160918/instances", launchBody)
+        val launchResp = ociPost(auth, iaasHost, "/20160918/instances", launchBodyJson)
         val instanceId = launchResp.getString("id")
         rids.instanceId = instanceId
 
@@ -1395,7 +1417,11 @@ class OciProvisioner(
 
     // --- Full provisioning pipeline ---
 
-    suspend fun provision(auth: AuthResult, preflight: PreflightResult): Pair<ResourceIds, ProvisionResult> {
+    suspend fun provision(
+        auth: AuthResult,
+        preflight: PreflightResult,
+        privateChatRequested: Boolean = false,
+    ): Pair<ResourceIds, ProvisionResult> {
         val homeRegion = preflight.homeRegion
 
         // Upload API key
@@ -1427,7 +1453,7 @@ class OciProvisioner(
         val rids = createNetwork(auth, homeRegion)
 
         // Launch VM
-        val publicIp = launchVm(auth, homeRegion, rids, sshPublicKey)
+        val publicIp = launchVm(auth, homeRegion, rids, sshPublicKey, privateChatRequested)
 
         // Setup WireGuard via SSH
         val provisionResult = setupWireGuard(

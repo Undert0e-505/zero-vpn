@@ -111,6 +111,19 @@ android {
         buildConfig = true
     }
 
+    // The Ubuntu installer is authored and tested under server/private-chat and
+    // packaged as an APK asset. There is no runtime or build dependency on zero-chat.
+    sourceSets.getByName("main").assets.apply {
+        srcDir(rootProject.file("../server"))
+        exclude(
+            "**/__pycache__/**",
+            "**/*.pyc",
+            "private-chat/tests/installer_test_imports.py",
+            "private-chat/tests/run-tests.ps1",
+            "private-chat/tests/test_*.py",
+        )
+    }
+
     packaging {
         resources {
             excludes += "/META-INF/{AL2.0,LGPL2.1,DEPENDENCIES,LICENSE,LICENSE.txt,NOTICE,NOTICE.txt,*.kotlin_module,/*.properties}"

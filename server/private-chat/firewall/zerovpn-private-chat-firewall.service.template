@@ -1,0 +1,15 @@
+[Unit]
+Description=ZeroVPN private-chat firewall policy
+After=wg-quick@wg0.service
+Requires=wg-quick@wg0.service
+Before=nginx.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/opt/zerovpn/private-chat/firewall/apply.sh
+ExecStop=/opt/zerovpn/private-chat/firewall/remove.sh
+
+[Install]
+WantedBy=multi-user.target
+

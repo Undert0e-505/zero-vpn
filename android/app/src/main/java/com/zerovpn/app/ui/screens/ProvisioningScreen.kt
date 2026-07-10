@@ -24,6 +24,7 @@ import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -50,6 +51,7 @@ import com.zerovpn.app.ui.provisioning.ProvisioningState
 import com.zerovpn.app.ui.provisioning.ProvisioningViewModel
 import com.zerovpn.app.ui.provisioning.Status
 import com.zerovpn.app.ui.theme.*
+import com.zerovpn.app.chat.node.PrivateChatInstallStatus
 import com.zerovpn.app.oci.OciRegion
 import com.zerovpn.app.oci.OciRegions
 import com.zerovpn.app.vpn.VpnConnectionState
@@ -79,6 +81,7 @@ fun ProvisioningScreen(
     val publicIp by viewModel.publicIp.collectAsState()
     val wireGuardPort by viewModel.wireGuardPort.collectAsState()
     val isDevMode by viewModel.isDevMode.collectAsState()
+    val privateChatRequested by viewModel.privateChatRequested.collectAsState()
     val onboardingState by viewModel.oracleOnboardingState.collectAsState()
     val selectedOracleRegion by viewModel.selectedOracleRegion.collectAsState()
     val exits by viewModel.configuredExits.collectAsState()
@@ -171,7 +174,7 @@ fun ProvisioningScreen(
             )
             Spacer(modifier = Modifier.width(12.dp))
             Text(
-                text = "Create Oracle Free Exit",
+                text = "Create Oracle Exit",
                 style = SectionTitleStyle,
             )
             Spacer(modifier = Modifier.weight(1f))
@@ -183,6 +186,8 @@ fun ProvisioningScreen(
                     onboardingState = onboardingState,
                     selectedRegion = selectedOracleRegion,
                     regions = viewModel.oracleRegions,
+                    privateChatRequested = privateChatRequested,
+                    onPrivateChatRequestedChange = viewModel::setPrivateChatRequested,
                     onSelectRegion = viewModel::selectOracleRegion,
                     onExistingAccount = { viewModel.startProvisioning(context) },
                     onCreateAccount = { viewModel.launchOracleSignup(context) },
@@ -199,6 +204,8 @@ fun ProvisioningScreen(
                     onboardingState = onboardingState,
                     selectedRegion = selectedOracleRegion,
                     regions = viewModel.oracleRegions,
+                    privateChatRequested = privateChatRequested,
+                    onPrivateChatRequestedChange = viewModel::setPrivateChatRequested,
                     onSelectRegion = viewModel::selectOracleRegion,
                     onExistingAccount = { viewModel.startProvisioning(context) },
                     onCreateAccount = { viewModel.launchOracleSignup(context) },
@@ -241,6 +248,8 @@ fun ProvisioningScreen(
                     wireGuardPort = s.wireGuardPort,
                     region = s.region,
                     isDevMode = s.isDevMode,
+                    privateChatStatus = s.privateChatStatus,
+                    privateChatError = s.privateChatError,
                     vpnState = vpnState,
                     onConnect = {
                         scope.launch {
@@ -262,6 +271,14 @@ fun ProvisioningScreen(
                                 },
                             )
                         }
+                    },
+                    onRetryPrivateChat = {
+                        val exit = exits.firstOrNull { it.id == selectedExitId } ?: exits.lastOrNull()
+                        if (exit != null) viewModel.retryPrivateChat(context, exit.id)
+                    },
+                    onRemovePrivateChat = {
+                        val exit = exits.firstOrNull { it.id == selectedExitId } ?: exits.lastOrNull()
+                        if (exit != null) viewModel.removePrivateChat(context, exit.id)
                     },
                     onDestroy = { showDestroyDialog = true },
                 )
@@ -304,6 +321,8 @@ private fun OracleOnboardingContent(
     onboardingState: OracleOnboardingState,
     selectedRegion: String?,
     regions: List<OciRegion>,
+    privateChatRequested: Boolean,
+    onPrivateChatRequestedChange: (Boolean) -> Unit,
     onSelectRegion: (String?) -> Unit,
     onExistingAccount: () -> Unit,
     onCreateAccount: () -> Unit,
@@ -317,21 +336,25 @@ private fun OracleOnboardingContent(
         verticalArrangement = Arrangement.spacedBy(16.dp),
     ) {
         Text(
-            text = "Create Oracle Free Exit",
+            text = "Create Oracle Exit",
             fontSize = 18.sp,
             fontWeight = FontWeight.SemiBold,
             color = TextPrimary,
         )
 
         Text(
-            text = "ZeroVPN creates your own Oracle Always Free VM and turns it into a WireGuard exit. To do that, you need an Oracle Cloud account.",
+            text = "ZeroVPN creates your own Oracle VM and turns it into a WireGuard exit. To do that, you need an Oracle Cloud account.",
             fontSize = 14.sp,
             color = TextDim,
             lineHeight = 20.sp,
         )
 
         Text(
-            text = "First-time setup takes about 5 minutes. ZeroVPN has to create an Oracle VM, configure networking, wait for SSH, install WireGuard, and create your owner and friend invite keys. Once this exit exists, reconnecting is fast.",
+            text = if (privateChatRequested) {
+                "ZeroVPN first creates and saves a working WireGuard exit, then installs PostgreSQL, Synapse, private TLS, and runs a real encrypted Matrix self-test. Chat failure does not remove the VPN."
+            } else {
+                "First-time setup takes about 5 minutes. ZeroVPN creates an Oracle VM, configures networking, waits for SSH, installs WireGuard, and creates your owner and friend invite keys. Once this exit exists, reconnecting is fast."
+            },
             fontSize = 14.sp,
             color = TextPrimary,
             lineHeight = 20.sp,
@@ -340,6 +363,46 @@ private fun OracleOnboardingContent(
                 .background(Surface, RoundedCornerShape(8.dp))
                 .padding(12.dp),
         )
+
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .background(Surface, RoundedCornerShape(8.dp))
+                .padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = "Private Chat Node (Phase 1)",
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = TextPrimary,
+                    )
+                    Text(
+                        text = "Optional owner node, private to WireGuard. No invitations or public Matrix access yet.",
+                        fontSize = 12.sp,
+                        color = TextDim,
+                        lineHeight = 17.sp,
+                    )
+                }
+                Switch(
+                    checked = privateChatRequested,
+                    onCheckedChange = onPrivateChatRequestedChange,
+                )
+            }
+            if (privateChatRequested) {
+                Text(
+                    text = "Uses VM.Standard.A1.Flex with 1 OCPU, 6 GB RAM, and a 50 GB boot volume. Requested resources appear Free Tier eligible. Oracle, not ZeroVPN, determines actual billing. Review the Oracle cost estimate before creating the VM. ZeroVPN will not resize or recreate it silently.",
+                    fontSize = 12.sp,
+                    color = WarningYellow,
+                    lineHeight = 17.sp,
+                )
+            }
+        }
 
         Column(
             modifier = Modifier.fillMaxWidth(),
@@ -462,7 +525,7 @@ private fun OracleOnboardingContent(
                 BulletPoint("Oracle may require MFA or two-factor authentication setup.")
                 BulletPoint("Complete those steps in Oracle.")
                 BulletPoint("Return to ZeroVPN.")
-                BulletPoint("ZeroVPN will then create the API key and provision the Always Free VM exit.")
+                BulletPoint("ZeroVPN will then create the API key and provision the selected Oracle VM exit.")
                 BulletPoint("The first provisioning run usually takes several minutes; later reconnects use the existing WireGuard tunnel and are fast.")
             }
         }
@@ -622,9 +685,8 @@ private fun UkWarningContent(
 
         Text(
             text = "Your Oracle home region is $homeRegion. " +
-                "This can be used for development/testing, but not as a non-UK " +
-                "Always Free exit. Create an Oracle account with a non-UK home region " +
-                "(e.g., us-ashburn-1, eu-frankfurt-1) for a production exit.",
+                "This can be used for development/testing. Region capacity and Free Tier eligibility " +
+                "are determined by Oracle. Choose the region shown in Oracle and review its cost estimate.",
             fontSize = 14.sp,
             color = TextDim,
             lineHeight = 20.sp,
@@ -673,8 +735,9 @@ private fun ProgressContent(
 
     // Phase progress indicator
     if (currentPhase != null && currentPhase != Phase.DONE) {
+        val totalPhases = if (currentPhase.isPrivateChat) 16 else 6
         Text(
-            text = "Phase ${currentPhase.number}/6: ${currentPhase.label}",
+            text = "Phase ${currentPhase.number}/$totalPhases: ${currentPhase.label}",
             fontSize = 14.sp,
             fontWeight = FontWeight.SemiBold,
             color = Accent,
@@ -714,7 +777,8 @@ private fun ProgressContent(
 
         events.forEach { event ->
             val timeStr = timeFormat.format(Date(event.timestamp))
-            val phaseStr = "[${event.phase.number}/${Phase.entries.size}]"
+            val phaseTotal = if (event.phase.isPrivateChat) 16 else 6
+            val phaseStr = "[${event.phase.number}/$phaseTotal]"
             val statusColor = when (event.status) {
                 Status.RUNNING -> Accent
                 Status.SUCCESS -> SuccessGreen
@@ -766,8 +830,12 @@ private fun SuccessContent(
     wireGuardPort: Int,
     region: String,
     isDevMode: Boolean,
+    privateChatStatus: PrivateChatInstallStatus?,
+    privateChatError: String?,
     vpnState: VpnConnectionState,
     onConnect: () -> Unit,
+    onRetryPrivateChat: () -> Unit,
+    onRemovePrivateChat: () -> Unit,
     onDestroy: () -> Unit,
 ) {
     val connecting = vpnState is VpnConnectionState.Connecting ||
@@ -806,6 +874,47 @@ private fun SuccessContent(
             InfoRow("WireGuard Port", "$wireGuardPort/udp")
             val regionLabel = if (isDevMode) "$region (dev/test mode)" else region
             InfoRow("Region", regionLabel)
+            if (privateChatStatus != null) {
+                InfoRow(
+                    "Private Chat",
+                    when (privateChatStatus) {
+                        PrivateChatInstallStatus.HEALTHY -> "Healthy - encrypted self-test passed"
+                        PrivateChatInstallStatus.FAILED -> "Install failed - VPN retained"
+                        PrivateChatInstallStatus.INSTALLING -> "Installing"
+                        PrivateChatInstallStatus.REMOVING -> "Removing"
+                    },
+                )
+            }
+        }
+
+        if (privateChatError != null) {
+            Text(
+                text = privateChatError,
+                fontSize = 12.sp,
+                color = Danger,
+                lineHeight = 17.sp,
+                modifier = Modifier.fillMaxWidth(),
+            )
+        }
+
+        if (privateChatStatus == PrivateChatInstallStatus.FAILED) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                OutlinedButton(
+                    onClick = onRetryPrivateChat,
+                    modifier = Modifier.weight(1f).height(44.dp),
+                ) {
+                    Text("Retry Chat", color = Accent)
+                }
+                OutlinedButton(
+                    onClick = onRemovePrivateChat,
+                    modifier = Modifier.weight(1f).height(44.dp),
+                ) {
+                    Text("Remove Chat", color = Danger)
+                }
+            }
         }
 
         Spacer(modifier = Modifier.height(8.dp))

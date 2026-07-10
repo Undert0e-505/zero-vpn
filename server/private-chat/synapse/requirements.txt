@@ -1,0 +1,4 @@
+# Pinned to the release exercised by the Phase 0 Zero Chat interoperability harness.
+# Synapse's upstream Debian repository is amd64-only; this venv path also supports OCI A1 arm64.
+matrix-synapse[postgres]==1.156.0
+

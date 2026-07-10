@@ -120,9 +120,20 @@ The following questions are carried forward from [section 18 of the governing pl
 9. Can chat be enabled on an already provisioned ZeroVPN VM in the first release?
 10. How should the app handle Oracle A1 capacity unavailability without weakening the feature?
 
+## Phase 1 implementation decisions
+
+Phase 1 resolves the installer-specific subset of those questions as follows:
+
+- The private Matrix URL is `https://10.66.66.1`, the existing WireGuard gateway. Synapse itself remains on loopback behind nginx.
+- The stable server name is generated once as `node-<first-12-node-UUID-hex>.zerovpn` and is never derived from the Oracle public IP.
+- The node uses a self-signed P-256 certificate with IP/name SANs. Android's Phase 1 owner verifier uses a dedicated SPKI-pinned trust manager for this endpoint and retains certificate-validity and hostname checks; global TLS validation is unchanged.
+- Oracle A1 provisioning requests 1 OCPU and 6 GB RAM only when Private Chat is selected. The existing E2 Micro path remains unchanged when it is not selected. Capacity errors are surfaced and no automatic resize/recreate occurs.
+- Synapse is installed in a pinned virtual environment rather than Ubuntu's outdated package or the upstream amd64-only Debian repository, allowing the same installer to support Oracle A1 Arm64 and x86_64.
+- Private Chat is a separate, durable post-WireGuard workload. The VPN exit is persisted first, and chat retry/removal cannot enter OCI cleanup or edit WireGuard state.
+- No bootstrap listener, invitation service, chat-only peer, Android Matrix session, or chat UI is introduced in Phase 1.
+
 ## References
 
 - [ZeroVPN Private Chat Node Plan](../ZEROVPN_PRIVATE_CHAT_NODE_PLAN.md)
 - [ZeroVPN Private Chat Integration Architecture](ARCHITECTURE.md)
 - [Zero Chat Boneyard Map](ZERO_CHAT_BONEYARD_MAP.md)
-

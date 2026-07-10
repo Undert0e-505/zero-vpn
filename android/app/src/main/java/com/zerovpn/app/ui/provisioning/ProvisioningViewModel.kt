@@ -8,6 +8,14 @@ import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.browser.customtabs.CustomTabsIntent
+import com.zerovpn.app.chat.node.PrivateChatInstallStatus
+import com.zerovpn.app.chat.node.PrivateChatNodeManifest
+import com.zerovpn.app.chat.node.PrivateChatNodeProvisioner
+import com.zerovpn.app.chat.node.PrivateChatNodeState
+import com.zerovpn.app.chat.node.PrivateChatOwnerVerificationResult
+import com.zerovpn.app.chat.node.PrivateChatOwnerVerifier
+import com.zerovpn.app.chat.node.PrivateChatProvisioningException
+import com.zerovpn.app.chat.node.PrivateChatRemoteEvent
 import com.zerovpn.app.friends.FriendsRepository
 import com.zerovpn.app.friends.HandshakeQueryResult
 import com.zerovpn.app.friends.InviteHandshakeChecker
@@ -88,6 +96,9 @@ class ProvisioningViewModel : ViewModel() {
     private val _isDevMode = MutableStateFlow(false)
     val isDevMode: StateFlow<Boolean> = _isDevMode.asStateFlow()
 
+    private val _privateChatRequested = MutableStateFlow(false)
+    val privateChatRequested: StateFlow<Boolean> = _privateChatRequested.asStateFlow()
+
     private val _oracleOnboardingState = MutableStateFlow(OracleOnboardingState.NotStarted)
     val oracleOnboardingState: StateFlow<OracleOnboardingState> = _oracleOnboardingState.asStateFlow()
 
@@ -144,6 +155,7 @@ class ProvisioningViewModel : ViewModel() {
     private var apiKeyFingerprint: String? = null
     private var pendingProvisionExitId: String? = null
     private var provisioningJob: Job? = null
+    private var privateChatJob: Job? = null
     private var pendingOracleOperation = PendingOracleOperation.None
     private var failedOracleOperation = PendingOracleOperation.None
     private var lastOracleOperationError: String? = null
@@ -216,6 +228,7 @@ class ProvisioningViewModel : ViewModel() {
     private fun loadPersistedState() {
         if (!::prefs.isInitialized) return
         _isDevMode.value = prefs.getBoolean("is_dev_mode", false)
+        _privateChatRequested.value = prefs.getBoolean("private_chat_requested", false)
         _oracleOnboardingState.value = runCatching {
             OracleOnboardingState.valueOf(
                 prefs.getString("oracle_onboarding_state", OracleOnboardingState.NotStarted.name)
@@ -234,7 +247,22 @@ class ProvisioningViewModel : ViewModel() {
         failedOracleOperation = loadOracleOperation("failed_oracle_operation")
         refreshOracleOperationDiagnostics()
 
-        val exits = loadConfiguredExits()
+        val exits = loadConfiguredExits().map { exit ->
+            val chat = exit.privateChat
+            if (chat?.status == PrivateChatInstallStatus.INSTALLING ||
+                chat?.status == PrivateChatInstallStatus.REMOVING
+            ) {
+                exit.copy(
+                    privateChat = chat.copy(
+                        status = PrivateChatInstallStatus.FAILED,
+                        lastError = "The Private Chat operation was interrupted. Retry resumes from the VM stage ledger.",
+                        lastUpdatedAt = System.currentTimeMillis(),
+                    ),
+                )
+            } else {
+                exit
+            }
+        }
         if (exits.isNotEmpty()) {
             _configuredExits.value = exits
             _selectedExitId.value = prefs.getString("selected_exit_id", null)
@@ -323,6 +351,7 @@ class ProvisioningViewModel : ViewModel() {
             putString("state", _state.value::class.simpleName)
             putString("oracle_onboarding_state", _oracleOnboardingState.value.name)
             putBoolean("is_dev_mode", _isDevMode.value)
+            putBoolean("private_chat_requested", _privateChatRequested.value)
             homeRegion?.let { putString("home_region", it) }
             _selectedOracleRegion.value?.let { putString("selected_oracle_region", it) }
             apiKeyUserOcid?.let { putString("api_key_user_ocid", it) }
@@ -495,6 +524,7 @@ class ProvisioningViewModel : ViewModel() {
         apiKeyTenancyOcid = null
         apiKeyFingerprint = null
         pendingProvisionExitId = null
+        _privateChatRequested.value = false
         clearOracleOperationState()
         _state.value = ProvisioningState.PreStart
         _oracleOnboardingState.value = OracleOnboardingState.NotStarted
@@ -505,6 +535,12 @@ class ProvisioningViewModel : ViewModel() {
         _oracleOnboardingState.value = OracleOnboardingState.SignupLaunched
         persistState()
         openUrl(context, ORACLE_SIGNUP_URL)
+    }
+
+    fun setPrivateChatRequested(requested: Boolean) {
+        if (_state.value is ProvisioningState.Running || _state.value is ProvisioningState.Destroying) return
+        _privateChatRequested.value = requested
+        persistState()
     }
 
     fun acknowledgeAccountCreated() {
@@ -1143,6 +1179,239 @@ class ProvisioningViewModel : ViewModel() {
         }
     }
 
+    fun retryPrivateChat(context: Context, exitId: String) {
+        if (privateChatJob?.isActive == true) return
+        val exit = _configuredExits.value.firstOrNull { it.id == exitId }
+        if (exit?.provider != ExitProvider.OCI) return
+        _events.value = emptyList()
+        updateExit(exitId) {
+            it.copy(
+                lifecycleState = ExitLifecycleState.READY,
+                privateChat = (it.privateChat ?: PrivateChatNodeState.installing()).copy(
+                    status = PrivateChatInstallStatus.INSTALLING,
+                    lastError = null,
+                    lastUpdatedAt = System.currentTimeMillis(),
+                ),
+            )
+        }
+        (_state.value as? ProvisioningState.Success)?.let { success ->
+            _state.value = success.copy(
+                privateChatStatus = PrivateChatInstallStatus.INSTALLING,
+                privateChatError = null,
+            )
+        }
+        privateChatJob = viewModelScope.launch {
+            val finalState = installPrivateChatForExit(context, exitId)
+            (_state.value as? ProvisioningState.Success)?.let { success ->
+                _state.value = success.copy(
+                    privateChatStatus = finalState.status,
+                    privateChatError = finalState.lastError,
+                )
+            }
+        }
+    }
+
+    fun refreshPrivateChatHealth(context: Context, exitId: String) {
+        if (privateChatJob?.isActive == true) return
+        val exit = _configuredExits.value.firstOrNull { it.id == exitId } ?: return
+        val sshPrivateKey = exit.sshPrivateKeySecretKey
+            ?.let { secretStore.getSecret(it) }
+            ?.takeIf { it.isNotBlank() }
+        if (sshPrivateKey == null) {
+            updateExit(exitId) { current ->
+                current.copy(
+                    privateChat = current.privateChat?.copy(
+                        status = PrivateChatInstallStatus.FAILED,
+                        lastError = "The saved Oracle SSH key is missing; health could not be refreshed.",
+                        lastUpdatedAt = System.currentTimeMillis(),
+                    ),
+                )
+            }
+            return
+        }
+        privateChatJob = viewModelScope.launch {
+            try {
+                val manifest = PrivateChatNodeProvisioner(context).refreshHealth(exit, sshPrivateKey)
+                val credentialsKey = exit.privateChat?.ownerCredentialsSecretKey
+                    ?: SecureSecretStore.privateChatOwnerCredentials(exitId)
+                val refreshed = manifest.toNodeState(credentialsKey).copy(
+                    ownerLoginVerifiedAt = exit.privateChat?.ownerLoginVerifiedAt,
+                )
+                updateExit(exitId) {
+                    it.copy(
+                        privateChat = if (manifest.healthStatus == "unhealthy") {
+                            refreshed.copy(
+                                status = PrivateChatInstallStatus.FAILED,
+                                lastError = "Private Chat health checks report an unhealthy node.",
+                            )
+                        } else {
+                            refreshed
+                        },
+                    )
+                }
+            } catch (error: PrivateChatProvisioningException) {
+                updateExit(exitId) { current ->
+                    current.copy(
+                        privateChat = current.privateChat?.copy(
+                            status = PrivateChatInstallStatus.FAILED,
+                            currentStage = error.failedStage,
+                            lastError = error.message?.take(600) ?: "Private Chat health refresh failed.",
+                            lastUpdatedAt = System.currentTimeMillis(),
+                        ),
+                    )
+                }
+            } catch (_: Exception) {
+                val message = "Private Chat health refresh failed without changing WireGuard."
+                updateExit(exitId) { current ->
+                    current.copy(
+                        privateChat = current.privateChat?.copy(
+                            status = PrivateChatInstallStatus.FAILED,
+                            currentStage = "PRIVATE_CHAT_HEALTH",
+                            lastError = message,
+                            lastUpdatedAt = System.currentTimeMillis(),
+                        ),
+                    )
+                }
+            }
+        }
+    }
+
+    fun verifyPrivateChatOwnerLogin(exitId: String) {
+        if (privateChatJob?.isActive == true) return
+        val exit = _configuredExits.value.firstOrNull { it.id == exitId } ?: return
+        val chat = exit.privateChat ?: return
+        val credentialsKey = chat.ownerCredentialsSecretKey
+            ?: SecureSecretStore.privateChatOwnerCredentials(exitId)
+        val credentials = secretStore.getSecret(credentialsKey)
+        if (credentials.isNullOrBlank()) {
+            updateExit(exitId) { current ->
+                current.copy(
+                    privateChat = current.privateChat?.copy(
+                        lastError = "The saved owner Matrix credentials are missing.",
+                        lastUpdatedAt = System.currentTimeMillis(),
+                    ),
+                )
+            }
+            return
+        }
+        privateChatJob = viewModelScope.launch {
+            when (val result = PrivateChatOwnerVerifier().verify(chat, credentials)) {
+                PrivateChatOwnerVerificationResult.Verified -> updateExit(exitId) { current ->
+                    current.copy(
+                        privateChat = current.privateChat?.copy(
+                            ownerLoginVerifiedAt = System.currentTimeMillis(),
+                            lastError = null,
+                            lastUpdatedAt = System.currentTimeMillis(),
+                        ),
+                    )
+                }
+
+                is PrivateChatOwnerVerificationResult.Failed -> updateExit(exitId) { current ->
+                    current.copy(
+                        privateChat = current.privateChat?.copy(
+                            lastError = result.message,
+                            lastUpdatedAt = System.currentTimeMillis(),
+                        ),
+                    )
+                }
+            }
+        }
+    }
+
+    fun removePrivateChat(context: Context, exitId: String) {
+        if (privateChatJob?.isActive == true) return
+        val exit = _configuredExits.value.firstOrNull { it.id == exitId } ?: return
+        val sshPrivateKey = exit.sshPrivateKeySecretKey
+            ?.let { secretStore.getSecret(it) }
+            ?.takeIf { it.isNotBlank() }
+        if (sshPrivateKey == null) {
+            updateExit(exitId) { current ->
+                current.copy(
+                    privateChat = current.privateChat?.copy(
+                        status = PrivateChatInstallStatus.FAILED,
+                        lastError = "The saved Oracle SSH key is missing; chat removal was not started.",
+                        lastUpdatedAt = System.currentTimeMillis(),
+                    ),
+                )
+            }
+            return
+        }
+        updateExit(exitId) { current ->
+            current.copy(
+                lifecycleState = ExitLifecycleState.READY,
+                privateChat = current.privateChat?.copy(
+                    status = PrivateChatInstallStatus.REMOVING,
+                    lastError = null,
+                    lastUpdatedAt = System.currentTimeMillis(),
+                ),
+            )
+        }
+        (_state.value as? ProvisioningState.Success)?.let { success ->
+            _state.value = success.copy(
+                privateChatStatus = PrivateChatInstallStatus.REMOVING,
+                privateChatError = null,
+            )
+        }
+        privateChatJob = viewModelScope.launch {
+            try {
+                PrivateChatNodeProvisioner(context).remove(
+                    exit = exit,
+                    sshPrivateKey = sshPrivateKey,
+                    onEvent = { remoteEvent -> recordPrivateChatEvent(exitId, remoteEvent) },
+                )
+                exit.privateChat?.ownerCredentialsSecretKey?.let { secretStore.removeSecret(it) }
+                secretStore.removeSecret(SecureSecretStore.privateChatOwnerCredentials(exitId))
+                updateExit(exitId) { current ->
+                    current.copy(
+                        lifecycleState = ExitLifecycleState.READY,
+                        lastError = null,
+                        privateChat = null,
+                    )
+                }
+                (_state.value as? ProvisioningState.Success)?.let { success ->
+                    _state.value = success.copy(privateChatStatus = null, privateChatError = null)
+                }
+            } catch (error: PrivateChatProvisioningException) {
+                updateExit(exitId) { current ->
+                    current.copy(
+                        lifecycleState = ExitLifecycleState.READY,
+                        privateChat = current.privateChat?.copy(
+                            status = PrivateChatInstallStatus.FAILED,
+                            currentStage = error.failedStage,
+                            lastError = error.message?.take(600) ?: "Private Chat removal failed; WireGuard was retained.",
+                            lastUpdatedAt = System.currentTimeMillis(),
+                        ),
+                    )
+                }
+                (_state.value as? ProvisioningState.Success)?.let { success ->
+                    _state.value = success.copy(
+                        privateChatStatus = PrivateChatInstallStatus.FAILED,
+                        privateChatError = error.message?.take(600),
+                    )
+                }
+            } catch (_: Exception) {
+                val message = "Private Chat removal could not finish local cleanup; WireGuard was retained."
+                updateExit(exitId) { current ->
+                    current.copy(
+                        lifecycleState = ExitLifecycleState.READY,
+                        privateChat = current.privateChat?.copy(
+                            status = PrivateChatInstallStatus.FAILED,
+                            currentStage = "PRIVATE_CHAT_COMPLETE",
+                            lastError = message,
+                            lastUpdatedAt = System.currentTimeMillis(),
+                        ),
+                    )
+                }
+                (_state.value as? ProvisioningState.Success)?.let { success ->
+                    _state.value = success.copy(
+                        privateChatStatus = PrivateChatInstallStatus.FAILED,
+                        privateChatError = message,
+                    )
+                }
+            }
+        }
+    }
+
     fun destroyNode(context: Context, exitId: String? = _selectedExitId.value) {
         if (_state.value is ProvisioningState.Running || _state.value is ProvisioningState.Destroying) return
         val targetExit = exitId?.let { id -> _configuredExits.value.firstOrNull { it.id == id } }
@@ -1422,7 +1691,7 @@ class ProvisioningViewModel : ViewModel() {
                 Phase.VM_LAUNCH -> Phase.NETWORK
                 Phase.WAIT_SSH -> Phase.VM_LAUNCH
                 Phase.WIREGUARD -> Phase.WAIT_SSH
-                else -> null
+                else -> if (_currentPhase.value?.isPrivateChat == true) Phase.WIREGUARD else null
             }
             _state.value = ProvisioningState.Failure(
                 failedPhase = _currentPhase.value ?: Phase.AUTH,
@@ -1469,6 +1738,7 @@ class ProvisioningViewModel : ViewModel() {
         try {
             val auth = authResult!!
             val preflight = preflightResult!!
+            val privateChatRequested = _privateChatRequested.value
             homeRegion = preflight.homeRegion
             _selectedOracleRegion.value = preflight.homeRegion
             apiKeyUserOcid = auth.userOcid
@@ -1476,7 +1746,11 @@ class ProvisioningViewModel : ViewModel() {
             apiKeyFingerprint = auth.fingerprint
             persistState()
 
-            val (rids, result) = prov.provision(auth, preflight)
+            val (rids, result) = prov.provision(
+                auth = auth,
+                preflight = preflight,
+                privateChatRequested = privateChatRequested,
+            )
             resourceIds = rids
             clientConfig = result.clientConfig
             wireGuardClientPublicKey = result.clientPublicKey
@@ -1500,6 +1774,7 @@ class ProvisioningViewModel : ViewModel() {
                 sshUsername = result.sshUsername,
                 sshPrivateKey = result.sshPrivateKey,
                 createdAt = System.currentTimeMillis(),
+                privateChat = if (privateChatRequested) PrivateChatNodeState.installing() else null,
             )
             _configuredExits.value = _configuredExits.value + configuredExit
             _selectedExitId.value = configuredExit.id
@@ -1508,15 +1783,32 @@ class ProvisioningViewModel : ViewModel() {
                 inviteProfiles = result.inviteProfiles,
             )
 
+            // WireGuard is a committed, independently usable exit before the optional
+            // workload starts. From this point, chat errors must never enter OCI cleanup.
+            _oracleOnboardingState.value = OracleOnboardingState.NotStarted
+            clearOracleOperationState()
+            persistState()
+
+            val privateChatState = if (privateChatRequested) {
+                _currentPhase.value = Phase.PRIVATE_CHAT_PRECHECK
+                emit(
+                    Phase.PRIVATE_CHAT_PRECHECK,
+                    Status.RUNNING,
+                    "Working WireGuard exit saved. Starting the optional Private Chat workload.",
+                )
+                installPrivateChatForExit(context, configuredExit.id)
+            } else {
+                null
+            }
             _currentPhase.value = Phase.DONE
             _state.value = ProvisioningState.Success(
                 publicIp = result.publicIp,
                 wireGuardPort = result.wireGuardPort,
                 region = preflight.homeRegion,
                 isDevMode = _isDevMode.value,
+                privateChatStatus = privateChatState?.status,
+                privateChatError = privateChatState?.lastError,
             )
-            _oracleOnboardingState.value = OracleOnboardingState.NotStarted
-            clearOracleOperationState()
             persistState()
         } catch (e: Exception) {
             setFailedOracleOperation(PendingOracleOperation.Provision, e.message)
@@ -1531,6 +1823,131 @@ class ProvisioningViewModel : ViewModel() {
             persistState()
         }
     }
+
+    private suspend fun installPrivateChatForExit(context: Context, exitId: String): PrivateChatNodeState {
+        val exit = _configuredExits.value.firstOrNull { it.id == exitId }
+            ?: return PrivateChatNodeState(
+                status = PrivateChatInstallStatus.FAILED,
+                currentStage = "PRIVATE_CHAT_PRECHECK",
+                lastError = "The working VPN exit could not be found for Private Chat installation.",
+            )
+        val sshPrivateKey = exit.sshPrivateKeySecretKey
+            ?.let { secretStore.getSecret(it) }
+            ?.takeIf { it.isNotBlank() }
+        if (sshPrivateKey == null) {
+            val failed = PrivateChatNodeState(
+                status = PrivateChatInstallStatus.FAILED,
+                currentStage = "PRIVATE_CHAT_PRECHECK",
+                lastError = "The saved Oracle SSH key is missing. The working VPN profile was retained.",
+            )
+            updateExit(exitId) { it.copy(privateChat = failed) }
+            return failed
+        }
+        updateExit(exitId) {
+            it.copy(
+                lifecycleState = ExitLifecycleState.READY,
+                privateChat = (it.privateChat ?: PrivateChatNodeState.installing()).copy(
+                    status = PrivateChatInstallStatus.INSTALLING,
+                    lastError = null,
+                    lastUpdatedAt = System.currentTimeMillis(),
+                ),
+            )
+        }
+        return try {
+            val result = PrivateChatNodeProvisioner(context).install(
+                exit = exit,
+                sshPrivateKey = sshPrivateKey,
+                onEvent = { remoteEvent -> recordPrivateChatEvent(exitId, remoteEvent) },
+            )
+            val credentialSecretKey = SecureSecretStore.privateChatOwnerCredentials(exitId)
+            secretStore.putSecret(credentialSecretKey, result.ownerCredentials.toSecretJson())
+            val healthy = result.manifest.toNodeState(credentialSecretKey)
+            updateExit(exitId) {
+                it.copy(
+                    lifecycleState = ExitLifecycleState.READY,
+                    lastError = null,
+                    privateChat = healthy,
+                )
+            }
+            healthy
+        } catch (error: PrivateChatProvisioningException) {
+            val failed = (_configuredExits.value.firstOrNull { it.id == exitId }?.privateChat
+                ?: PrivateChatNodeState.installing()).copy(
+                status = PrivateChatInstallStatus.FAILED,
+                currentStage = error.failedStage,
+                lastError = error.message?.take(600) ?: "Private Chat installation failed.",
+                lastUpdatedAt = System.currentTimeMillis(),
+            )
+            updateExit(exitId) {
+                it.copy(
+                    lifecycleState = ExitLifecycleState.READY,
+                    lastError = null,
+                    privateChat = failed,
+                )
+            }
+            failed
+        } catch (_: Exception) {
+            val failed = (_configuredExits.value.firstOrNull { it.id == exitId }?.privateChat
+                ?: PrivateChatNodeState.installing()).copy(
+                status = PrivateChatInstallStatus.FAILED,
+                currentStage = "PRIVATE_CHAT_COMPLETE",
+                lastError = "Private Chat could not finish importing its validated node state. The VPN was retained.",
+                lastUpdatedAt = System.currentTimeMillis(),
+            )
+            updateExit(exitId) {
+                it.copy(
+                    lifecycleState = ExitLifecycleState.READY,
+                    lastError = null,
+                    privateChat = failed,
+                )
+            }
+            failed
+        }
+    }
+
+    private fun recordPrivateChatEvent(exitId: String, remoteEvent: PrivateChatRemoteEvent) {
+        val phase = Phase.entries.firstOrNull { it.name == remoteEvent.stage }
+            ?: Phase.PRIVATE_CHAT_PRECHECK
+        val status = when (remoteEvent.status.lowercase()) {
+            "success" -> Status.SUCCESS
+            "warning" -> Status.WARNING
+            "error" -> Status.ERROR
+            else -> Status.RUNNING
+        }
+        _currentPhase.value = phase
+        _events.value = _events.value + ProvisioningEvent(
+            timestamp = System.currentTimeMillis(),
+            phase = phase,
+            status = status,
+            message = remoteEvent.message.take(600),
+        )
+        updateExit(exitId) { exit ->
+            val chat = exit.privateChat ?: PrivateChatNodeState.installing()
+            exit.copy(
+                privateChat = chat.copy(
+                    currentStage = remoteEvent.stage,
+                    lastError = if (status == Status.ERROR) remoteEvent.message.take(600) else chat.lastError,
+                    lastUpdatedAt = System.currentTimeMillis(),
+                ),
+            )
+        }
+    }
+
+    private fun PrivateChatNodeManifest.toNodeState(credentialsSecretKey: String): PrivateChatNodeState =
+        PrivateChatNodeState(
+            status = PrivateChatInstallStatus.HEALTHY,
+            currentStage = "PRIVATE_CHAT_COMPLETE",
+            nodeId = nodeId,
+            serverName = serverName,
+            matrixPrivateUrl = matrixPrivateUrl,
+            tlsSpkiSha256 = tlsSpkiSha256,
+            ownerMatrixUserId = ownerMatrixUserId,
+            ownerCredentialsSecretKey = credentialsSecretKey,
+            installedAt = installedAt,
+            healthStatus = healthStatus,
+            componentVersions = componentVersions,
+            lastUpdatedAt = System.currentTimeMillis(),
+        )
 
     private fun createInviteSlotsForProvisionedExit(
         ownerExitId: String,
@@ -1653,6 +2070,7 @@ class ProvisioningViewModel : ViewModel() {
         sshUsername: String?,
         sshPrivateKey: String?,
         createdAt: Long,
+        privateChat: PrivateChatNodeState? = null,
     ): ConfiguredExit {
         val wireGuardSecretKey = SecureSecretStore.oracleOwnerWireGuardConfig(exitId)
         if (wireGuardConfig.isNotBlank()) {
@@ -1685,6 +2103,7 @@ class ProvisioningViewModel : ViewModel() {
             serverPublicKey = wireGuardServerPublicKey ?: parseWireGuardValue(wireGuardConfig, "Peer", "PublicKey"),
             serverPeerPublicKey = wireGuardServerPeerPublicKey ?: wireGuardClientPublicKey,
             clientPublicKey = wireGuardClientPublicKey,
+            privateChat = privateChat,
         )
     }
 
@@ -1725,6 +2144,8 @@ class ProvisioningViewModel : ViewModel() {
     private fun cleanupOwnerExitLocalState(exit: ConfiguredExit) {
         exit.wireGuardConfigSecretKey?.let { secretStore.removeSecret(it) }
         exit.sshPrivateKeySecretKey?.let { secretStore.removeSecret(it) }
+        exit.privateChat?.ownerCredentialsSecretKey?.let { secretStore.removeSecret(it) }
+        secretStore.removeSecret(SecureSecretStore.privateChatOwnerCredentials(exit.id))
         _inviteSlots.value
             .filter { it.ownerExitId == exit.id }
             .mapNotNull { it.clientConfigSecretKey }
@@ -1859,6 +2280,7 @@ class ProvisioningViewModel : ViewModel() {
         .put("udpSupported", udpSupported)
         .put("dnsStatus", dnsStatus)
         .put("destroyMeaning", destroyMeaning)
+        .put("privateChat", privateChat?.toJson())
         .put("ociResourceIds", ociResourceIds?.toJson())
 
     private fun OciResourceIds.toJson(): JSONObject = JSONObject()
@@ -1867,6 +2289,26 @@ class ProvisioningViewModel : ViewModel() {
         .put("subnetId", subnetId)
         .put("internetGatewayId", internetGatewayId)
         .put("instanceId", instanceId)
+
+    private fun PrivateChatNodeState.toJson(): JSONObject {
+        val versions = JSONObject()
+        componentVersions.toSortedMap().forEach { (name, version) -> versions.put(name, version) }
+        return JSONObject()
+            .put("status", status.name)
+            .put("currentStage", currentStage)
+            .put("lastError", lastError)
+            .put("nodeId", nodeId)
+            .put("serverName", serverName)
+            .put("matrixPrivateUrl", matrixPrivateUrl)
+            .put("tlsSpkiSha256", tlsSpkiSha256)
+            .put("ownerMatrixUserId", ownerMatrixUserId)
+            .put("ownerCredentialsSecretKey", ownerCredentialsSecretKey)
+            .put("installedAt", installedAt)
+            .put("healthStatus", healthStatus)
+            .put("componentVersions", versions)
+            .put("ownerLoginVerifiedAt", ownerLoginVerifiedAt)
+            .put("lastUpdatedAt", lastUpdatedAt)
+    }
 
     private fun JSONObject.toConfiguredExit(): ConfiguredExit {
         val exitId = getString("id")
@@ -1896,6 +2338,7 @@ class ProvisioningViewModel : ViewModel() {
             secretStore.putSecret(sshSecretKey, legacySshPrivateKey)
         }
         val resourceJson = optJSONObject("ociResourceIds")
+        val privateChatJson = optJSONObject("privateChat")
         return ConfiguredExit(
             id = exitId,
             name = optString("name").takeIf { it.isNotBlank() } ?: "Exit 1",
@@ -1938,6 +2381,34 @@ class ProvisioningViewModel : ViewModel() {
             udpSupported = optBooleanOrNull("udpSupported"),
             dnsStatus = optNullableString("dnsStatus"),
             destroyMeaning = optNullableString("destroyMeaning"),
+            privateChat = privateChatJson?.toPrivateChatNodeState(),
+        )
+    }
+
+    private fun JSONObject.toPrivateChatNodeState(): PrivateChatNodeState {
+        val versionsJson = optJSONObject("componentVersions")
+        val versions = buildMap {
+            versionsJson?.keys()?.forEach { name ->
+                versionsJson.optString(name).takeIf { it.isNotBlank() }?.let { put(name, it) }
+            }
+        }
+        return PrivateChatNodeState(
+            status = runCatching {
+                PrivateChatInstallStatus.valueOf(optString("status", PrivateChatInstallStatus.FAILED.name))
+            }.getOrDefault(PrivateChatInstallStatus.FAILED),
+            currentStage = optNullableString("currentStage"),
+            lastError = optNullableString("lastError"),
+            nodeId = optNullableString("nodeId"),
+            serverName = optNullableString("serverName"),
+            matrixPrivateUrl = optNullableString("matrixPrivateUrl"),
+            tlsSpkiSha256 = optNullableString("tlsSpkiSha256"),
+            ownerMatrixUserId = optNullableString("ownerMatrixUserId"),
+            ownerCredentialsSecretKey = optNullableString("ownerCredentialsSecretKey"),
+            installedAt = optNullableString("installedAt"),
+            healthStatus = optNullableString("healthStatus"),
+            componentVersions = versions,
+            ownerLoginVerifiedAt = optLongOrNull("ownerLoginVerifiedAt"),
+            lastUpdatedAt = optLong("lastUpdatedAt", System.currentTimeMillis()),
         )
     }
 

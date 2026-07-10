@@ -1,9 +1,9 @@
 # ZeroVPN Private Chat Integration Architecture
 
-Status: Phase 0 repository audit  
-Date: 2026-07-10  
-ZeroVPN revision: 85f2e847bc656adde9090e9499be8bc759044697  
-Zero Chat reference revision: fad89a4a75951b8373020c2c4732dc2146fedb99
+- Status: Phase 0 repository audit
+- Date: 2026-07-10
+- ZeroVPN revision: 85f2e847bc656adde9090e9499be8bc759044697
+- Zero Chat reference revision: fad89a4a75951b8373020c2c4732dc2146fedb99
 
 ## 1. Scope
 

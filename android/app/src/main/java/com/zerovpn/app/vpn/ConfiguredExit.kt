@@ -1,5 +1,7 @@
 package com.zerovpn.app.vpn
 
+import com.zerovpn.app.chat.node.PrivateChatNodeState
+
 enum class ExitProvider {
     OCI,
     VOLUNTEER,
@@ -53,4 +55,5 @@ data class ConfiguredExit(
     val udpSupported: Boolean? = null,
     val dnsStatus: String? = null,
     val destroyMeaning: String? = null,
+    val privateChat: PrivateChatNodeState? = null,
 )

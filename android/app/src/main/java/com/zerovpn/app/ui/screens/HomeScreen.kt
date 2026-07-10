@@ -39,6 +39,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.zerovpn.app.ui.components.StatusCard
+import com.zerovpn.app.chat.node.PrivateChatInstallStatus
 import com.zerovpn.app.ui.provisioning.ProvisioningViewModel
 import com.zerovpn.app.ui.theme.*
 import com.zerovpn.app.vpn.ConfiguredExit
@@ -79,6 +80,7 @@ fun HomeScreen(
 
     var showDestroyDialog by remember { mutableStateOf(false) }
     var destroyTarget by remember { mutableStateOf<ConfiguredExit?>(null) }
+    var privateChatRemoveTarget by remember { mutableStateOf<ConfiguredExit?>(null) }
     var renameTarget by remember { mutableStateOf<ConfiguredExit?>(null) }
     var pendingPermissionExit by remember { mutableStateOf<ConfiguredExit?>(null) }
     var missingExitMessage by remember { mutableStateOf<String?>(null) }
@@ -132,6 +134,34 @@ fun HomeScreen(
         else -> "Connect"
     }
     val connectedForStatus = activeExit != null
+
+    privateChatRemoveTarget?.let { target ->
+        AlertDialog(
+            onDismissRequest = { privateChatRemoveTarget = null },
+            title = { Text("Remove Private Chat?", color = TextPrimary) },
+            text = {
+                Text(
+                    "This removes Synapse, its dedicated database, TLS identity, and owner Matrix account data from the VM. The WireGuard exit and owner VPN profile stay available.",
+                    color = TextDim,
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        privateChatRemoveTarget = null
+                        viewModel.removePrivateChat(context, target.id)
+                    },
+                ) {
+                    Text("Remove Chat", color = Danger)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { privateChatRemoveTarget = null }) {
+                    Text("Cancel", color = TextDim)
+                }
+            },
+        )
+    }
 
     LaunchedEffect(
         selectedExitId,
@@ -591,6 +621,26 @@ fun HomeScreen(
                         destroyTarget = exit
                         showDestroyDialog = true
                     },
+                    onRetryPrivateChat = if (exit.provider == ExitProvider.OCI) {
+                        { viewModel.retryPrivateChat(context, exit.id) }
+                    } else {
+                        null
+                    },
+                    onRefreshPrivateChat = if (exit.provider == ExitProvider.OCI) {
+                        { viewModel.refreshPrivateChatHealth(context, exit.id) }
+                    } else {
+                        null
+                    },
+                    onVerifyPrivateChatOwner = if (exit.provider == ExitProvider.OCI && exitIsActive) {
+                        { viewModel.verifyPrivateChatOwnerLogin(exit.id) }
+                    } else {
+                        null
+                    },
+                    onRemovePrivateChat = if (exit.provider == ExitProvider.OCI) {
+                        { privateChatRemoveTarget = exit }
+                    } else {
+                        null
+                    },
                     onRename = if (exit.provider == ExitProvider.SHARED_WIREGUARD) {
                         { renameTarget = exit }
                     } else {
@@ -669,6 +719,10 @@ private fun ExitCard(
     onConnect: () -> Unit,
     onDisconnect: () -> Unit,
     onDestroy: () -> Unit,
+    onRetryPrivateChat: (() -> Unit)?,
+    onRefreshPrivateChat: (() -> Unit)?,
+    onVerifyPrivateChatOwner: (() -> Unit)?,
+    onRemovePrivateChat: (() -> Unit)?,
     onRename: (() -> Unit)?,
 ) {
     Column(
@@ -730,6 +784,102 @@ private fun ExitCard(
                 color = if (active || switchingTarget) Accent else TextDim,
             )
         }
+        exit.privateChat?.let { chat ->
+            Spacer(modifier = Modifier.height(10.dp))
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(Bg.copy(alpha = 0.45f), RoundedCornerShape(6.dp))
+                    .padding(10.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                Text(
+                    text = "Private Chat: ${privateChatStatusText(chat.status, chat.healthStatus)}",
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = if (chat.status == PrivateChatInstallStatus.HEALTHY) Accent else TextDim,
+                )
+                chat.ownerMatrixUserId?.let { ownerId ->
+                    Text(text = ownerId, fontSize = 11.sp, color = TextDim)
+                }
+                chat.lastError?.let { error ->
+                    Text(text = error, fontSize = 11.sp, color = Danger, lineHeight = 15.sp)
+                }
+                when (chat.status) {
+                    PrivateChatInstallStatus.FAILED -> {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            onRetryPrivateChat?.let { retry ->
+                                OutlinedButton(
+                                    onClick = retry,
+                                    modifier = Modifier.weight(1f).height(36.dp),
+                                ) {
+                                    Text("Retry", fontSize = 12.sp, color = Accent)
+                                }
+                            }
+                            onRemovePrivateChat?.let { remove ->
+                                OutlinedButton(
+                                    onClick = remove,
+                                    modifier = Modifier.weight(1f).height(36.dp),
+                                ) {
+                                    Text("Remove", fontSize = 12.sp, color = Danger)
+                                }
+                            }
+                        }
+                    }
+
+                    PrivateChatInstallStatus.HEALTHY -> {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            onRefreshPrivateChat?.let { refresh ->
+                                OutlinedButton(
+                                    onClick = refresh,
+                                    modifier = Modifier.weight(1f).height(36.dp),
+                                ) {
+                                    Text("Health", fontSize = 12.sp, color = Accent)
+                                }
+                            }
+                            onRemovePrivateChat?.let { remove ->
+                                OutlinedButton(
+                                    onClick = remove,
+                                    modifier = Modifier.weight(1f).height(36.dp),
+                                ) {
+                                    Text("Remove", fontSize = 12.sp, color = Danger)
+                                }
+                            }
+                        }
+                        if (onVerifyPrivateChatOwner != null) {
+                            OutlinedButton(
+                                onClick = onVerifyPrivateChatOwner,
+                                modifier = Modifier.fillMaxWidth().height(36.dp),
+                            ) {
+                                Text("Verify owner login through VPN", fontSize = 11.sp, color = Accent)
+                            }
+                        } else {
+                            Text(
+                                text = "Connect this VPN to verify the owner login from the app.",
+                                fontSize = 11.sp,
+                                color = TextDim,
+                            )
+                        }
+                        if (chat.ownerLoginVerifiedAt != null) {
+                            Text(
+                                text = "Owner login verified through WireGuard.",
+                                fontSize = 11.sp,
+                                color = Accent,
+                            )
+                        }
+                    }
+
+                    PrivateChatInstallStatus.INSTALLING,
+                    PrivateChatInstallStatus.REMOVING -> Unit
+                }
+            }
+        }
         Spacer(modifier = Modifier.height(12.dp))
         Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
             Button(
@@ -788,6 +938,16 @@ private fun ExitCard(
             }
         }
     }
+}
+
+private fun privateChatStatusText(status: PrivateChatInstallStatus, healthStatus: String?): String = when (status) {
+    PrivateChatInstallStatus.INSTALLING -> "Installing (VPN remains usable)"
+    PrivateChatInstallStatus.HEALTHY -> when (healthStatus) {
+        "degraded" -> "Degraded"
+        else -> "Healthy"
+    }
+    PrivateChatInstallStatus.FAILED -> "Failed (VPN retained)"
+    PrivateChatInstallStatus.REMOVING -> "Removing (VPN retained)"
 }
 
 private fun exitStatusText(
