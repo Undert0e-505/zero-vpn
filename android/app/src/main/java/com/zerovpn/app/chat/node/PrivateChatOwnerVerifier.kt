@@ -42,7 +42,14 @@ class PrivateChatOwnerVerifier {
             val credentials = JSONObject(credentialsJson)
             val userId = credentials.getString("userId")
             val password = credentials.getString("password")
-            if (userId != node.ownerMatrixUserId || password.length < 32) {
+            val credentialUrl = credentials.getString("matrixPrivateUrl")
+            val credentialPin = credentials.getString("tlsSpkiSha256")
+            if (
+                userId != node.ownerMatrixUserId ||
+                password.length < 32 ||
+                credentialUrl != url ||
+                credentialPin != pin
+            ) {
                 return@withContext PrivateChatOwnerVerificationResult.Failed(
                     "The saved owner Matrix credentials do not match this node.",
                 )

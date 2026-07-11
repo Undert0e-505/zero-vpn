@@ -987,11 +987,11 @@ class OciProvisioner(
         emit(Phase.WAIT_SSH, Status.RUNNING, "Phase region trace: provisioningRegion=$homeRegion publicIp=$publicIp")
         val jsch = JSch()
         val keyTempFile = java.io.File(context.cacheDir, "ssh_key_${System.currentTimeMillis()}")
-        keyTempFile.writeText(sshPrivateKey)
-        keyTempFile.deleteOnExit()
-        jsch.addIdentity(keyTempFile.absolutePath)
+        try {
+            keyTempFile.writeText(sshPrivateKey)
+            jsch.addIdentity(keyTempFile.absolutePath)
 
-        val sshConnection = SshConnection(jsch = jsch, username = "ubuntu", host = publicIp)
+            val sshConnection = SshConnection(jsch = jsch, username = "ubuntu", host = publicIp)
         val sshTimeoutMs = 10 * 60 * 1000L
         val sshStart = System.currentTimeMillis()
         var sshAttempt = 0
@@ -1123,17 +1123,20 @@ class OciProvisioner(
             }
 
         emit(Phase.WIREGUARD, Status.SUCCESS, "WireGuard configured")
-        return ProvisionResult(
-            publicIp = publicIp,
-            wireGuardPort = port,
-            clientConfig = clientConfig,
-            clientPublicKey = clientKeys.publicKey,
-            serverPublicKey = serverPub,
-            serverPeerPublicKey = serverPeerPub,
-            inviteProfiles = inviteProfiles,
-            sshUsername = "ubuntu",
-            sshPrivateKey = sshPrivateKey,
-        )
+            return ProvisionResult(
+                publicIp = publicIp,
+                wireGuardPort = port,
+                clientConfig = clientConfig,
+                clientPublicKey = clientKeys.publicKey,
+                serverPublicKey = serverPub,
+                serverPeerPublicKey = serverPeerPub,
+                inviteProfiles = inviteProfiles,
+                sshUsername = "ubuntu",
+                sshPrivateKey = sshPrivateKey,
+            )
+        } finally {
+            keyTempFile.delete()
+        }
     }
 
     private data class RemoteCommandResult(

@@ -34,6 +34,10 @@ class VpnSurvivalContractTests(unittest.TestCase):
         self.assertNotIn("wg-quick", removal)
         self.assertNotIn("wg set", removal)
 
+    def test_chat_install_does_not_disable_the_unrelated_default_nginx_site(self) -> None:
+        source = (ROOT / "installer/install.py").read_text(encoding="utf-8")
+        self.assertNotIn('Path("/etc/nginx/sites-enabled/default")', source)
+
 
 if __name__ == "__main__":
     unittest.main()

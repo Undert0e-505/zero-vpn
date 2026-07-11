@@ -1,0 +1,2 @@
+# Ordinary host-side unit tests. Install only inside .venv-test.
+pytest==9.1.1

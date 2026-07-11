@@ -250,6 +250,7 @@ fun ProvisioningScreen(
                     isDevMode = s.isDevMode,
                     privateChatStatus = s.privateChatStatus,
                     privateChatError = s.privateChatError,
+                    events = visibleEvents,
                     vpnState = vpnState,
                     onConnect = {
                         scope.launch {
@@ -818,6 +819,16 @@ private fun ProgressContent(
                     color = statusColor,
                 )
             }
+            event.technicalDetail?.let { detail ->
+                Text(
+                    text = "  $detail",
+                    modifier = Modifier.padding(start = 78.dp, bottom = 2.dp),
+                    fontSize = 10.sp,
+                    fontFamily = FontFamily.Monospace,
+                    color = TextDim,
+                    lineHeight = 14.sp,
+                )
+            }
         }
     }
 }
@@ -832,6 +843,7 @@ private fun SuccessContent(
     isDevMode: Boolean,
     privateChatStatus: PrivateChatInstallStatus?,
     privateChatError: String?,
+    events: List<ProvisioningEvent>,
     vpnState: VpnConnectionState,
     onConnect: () -> Unit,
     onRetryPrivateChat: () -> Unit,
@@ -842,7 +854,9 @@ private fun SuccessContent(
         vpnState is VpnConnectionState.PermissionRequired
     val connectionError = (vpnState as? VpnConnectionState.Failed)?.message
     Column(
-        modifier = Modifier.fillMaxWidth(),
+        modifier = Modifier
+            .fillMaxWidth()
+            .verticalScroll(rememberScrollState()),
         verticalArrangement = Arrangement.spacedBy(16.dp),
     ) {
         Row(
@@ -917,6 +931,15 @@ private fun SuccessContent(
             }
         }
 
+        val privateChatEvents = events.filter { it.phase.isPrivateChat }
+        if (isDevMode && privateChatEvents.isNotEmpty()) {
+            Text(
+                text = "PRIVATE CHAT PROVISIONING LOG",
+                style = SectionTitleStyle,
+            )
+            PrivateChatProvisioningLog(privateChatEvents)
+        }
+
         Spacer(modifier = Modifier.height(8.dp))
 
         if (connectionError != null) {
@@ -977,6 +1000,55 @@ private fun SuccessContent(
                 )
                 Spacer(modifier = Modifier.width(8.dp))
                 Text("Destroy Node", fontSize = 14.sp, fontWeight = FontWeight.Medium)
+            }
+        }
+    }
+}
+
+@Composable
+private fun PrivateChatProvisioningLog(events: List<ProvisioningEvent>) {
+    val scrollState = rememberScrollState()
+    val timeFormat = SimpleDateFormat("HH:mm:ss", Locale.getDefault())
+    LaunchedEffect(events.size) {
+        scrollState.scrollTo(scrollState.maxValue)
+    }
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(260.dp)
+            .background(Surface, RoundedCornerShape(8.dp))
+            .padding(12.dp)
+            .verticalScroll(scrollState),
+    ) {
+        events.forEach { event ->
+            val statusColor = when (event.status) {
+                Status.RUNNING -> Accent
+                Status.SUCCESS -> SuccessGreen
+                Status.WARNING -> WarningYellow
+                Status.ERROR -> Danger
+            }
+            val status = when (event.status) {
+                Status.RUNNING -> "START"
+                Status.SUCCESS -> "PASS"
+                Status.WARNING -> "WARN"
+                Status.ERROR -> "FAIL"
+            }
+            Text(
+                text = "${timeFormat.format(Date(event.timestamp))} [$status] ${event.phase.label}: ${event.message}",
+                fontSize = 11.sp,
+                fontFamily = FontFamily.Monospace,
+                color = statusColor,
+                lineHeight = 15.sp,
+            )
+            event.technicalDetail?.let { detail ->
+                Text(
+                    text = "  $detail",
+                    fontSize = 10.sp,
+                    fontFamily = FontFamily.Monospace,
+                    color = TextDim,
+                    lineHeight = 14.sp,
+                    modifier = Modifier.padding(bottom = 3.dp),
+                )
             }
         }
     }
@@ -1148,6 +1220,16 @@ private fun FailureContent(
                         fontSize = 12.sp,
                         fontFamily = FontFamily.Monospace,
                         color = statusColor,
+                    )
+                }
+                event.technicalDetail?.let { detail ->
+                    Text(
+                        text = "  $detail",
+                        modifier = Modifier.padding(start = 78.dp, bottom = 2.dp),
+                        fontSize = 10.sp,
+                        fontFamily = FontFamily.Monospace,
+                        color = TextDim,
+                        lineHeight = 14.sp,
                     )
                 }
             }

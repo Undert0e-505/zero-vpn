@@ -93,7 +93,7 @@ fun SettingsScreen(
                     Spacer(modifier = Modifier.height(4.dp))
                     Text(
                         text = if (isDevMode)
-                            "Shows detailed telemetry: wire tap, signing strings, HTTP headers"
+                            "Shows detailed telemetry: OCI wire tap plus Private Chat stage timing, health, and manifest summary"
                         else
                             "Streamlined progress view — no technical details",
                         fontSize = 12.sp,

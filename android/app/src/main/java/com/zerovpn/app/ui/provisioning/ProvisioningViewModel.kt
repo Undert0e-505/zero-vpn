@@ -9,6 +9,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.browser.customtabs.CustomTabsIntent
 import com.zerovpn.app.chat.node.PrivateChatInstallStatus
+import com.zerovpn.app.chat.node.PrivateChatHealthChecks
 import com.zerovpn.app.chat.node.PrivateChatNodeManifest
 import com.zerovpn.app.chat.node.PrivateChatNodeProvisioner
 import com.zerovpn.app.chat.node.PrivateChatNodeState
@@ -16,6 +17,11 @@ import com.zerovpn.app.chat.node.PrivateChatOwnerVerificationResult
 import com.zerovpn.app.chat.node.PrivateChatOwnerVerifier
 import com.zerovpn.app.chat.node.PrivateChatProvisioningException
 import com.zerovpn.app.chat.node.PrivateChatRemoteEvent
+import com.zerovpn.app.chat.node.PrivateChatSelfTestStatus
+import com.zerovpn.app.chat.node.PrivateChatStageState
+import com.zerovpn.app.chat.node.PrivateChatStageStatus
+import com.zerovpn.app.chat.node.PRIVATE_CHAT_STAGE_ORDER
+import com.zerovpn.app.chat.node.redactPrivateChatDiagnostic
 import com.zerovpn.app.friends.FriendsRepository
 import com.zerovpn.app.friends.HandshakeQueryResult
 import com.zerovpn.app.friends.InviteHandshakeChecker
@@ -1543,7 +1549,7 @@ class ProvisioningViewModel : ViewModel() {
                 }
                 persistState()
             } finally {
-                eventJob.cancel()
+                eventJob?.cancel()
             }
         }
     }
@@ -1594,6 +1600,7 @@ class ProvisioningViewModel : ViewModel() {
     }
 
     private suspend fun runProvisioning(context: Context) {
+        var eventJob: Job? = null
         try {
             if (pendingOracleOperation.type != OracleOperationType.PROVISION) {
                 val message = "Provisioning was not the pending Oracle operation."
@@ -1616,12 +1623,9 @@ class ProvisioningViewModel : ViewModel() {
 
             // Collect events from provisioner
             val prov = provisioner!!
-            val eventJob = viewModelScope.launch {
+            eventJob = viewModelScope.launch {
                 prov.events.collect { event ->
-                    _events.value = _events.value + classifyEvent(event)
-                    if (event.phase != Phase.DONE) {
-                        _currentPhase.value = event.phase
-                    }
+                    appendProvisionerEvent(event)
                 }
             }
 
@@ -1658,7 +1662,7 @@ class ProvisioningViewModel : ViewModel() {
             preflightResult = prov.preflight(authResult!!, preferredRegion, preferredSource)
 
             if (!preflightResult!!.success) {
-                eventJob.cancel()
+                eventJob?.cancel()
                 setFailedOracleOperation(PendingOracleOperation.Provision, preflightResult!!.error)
                 _state.value = ProvisioningState.Failure(
                     failedPhase = Phase.API_KEY,
@@ -1671,7 +1675,7 @@ class ProvisioningViewModel : ViewModel() {
 
             // UK region warning
             if (preflightResult!!.isUkRegion) {
-                eventJob.cancel()
+                eventJob?.cancel()
                 homeRegion = preflightResult!!.homeRegion
                 _selectedOracleRegion.value = preflightResult!!.homeRegion
                 _state.value = ProvisioningState.UkWarning(preflightResult!!.homeRegion)
@@ -1702,10 +1706,13 @@ class ProvisioningViewModel : ViewModel() {
                 _oracleOnboardingState.value = OracleOnboardingState.AuthFailed
             }
             persistState()
+        } finally {
+            eventJob?.cancel()
         }
     }
 
     private suspend fun continueProvisioningAfterWarning(context: Context) {
+        var eventJob: Job? = null
         try {
             setPendingOracleOperation(PendingOracleOperation.Provision)
             val warningRegion = preflightResult?.homeRegion ?: homeRegion ?: _selectedOracleRegion.value
@@ -1713,12 +1720,9 @@ class ProvisioningViewModel : ViewModel() {
             val prov = provisioner ?: OciProvisioner(context, warningRegion, _isDevMode.value).also { provisioner = it }
             val auth = authResult ?: return
 
-            val eventJob = viewModelScope.launch {
+            eventJob = viewModelScope.launch {
                 prov.events.collect { event ->
-                    _events.value = _events.value + classifyEvent(event)
-                    if (event.phase != Phase.DONE) {
-                        _currentPhase.value = event.phase
-                    }
+                    appendProvisionerEvent(event)
                 }
             }
 
@@ -1731,6 +1735,8 @@ class ProvisioningViewModel : ViewModel() {
                 errorMessage = e.message,
             )
             persistState()
+        } finally {
+            eventJob?.cancel()
         }
     }
 
@@ -1829,7 +1835,9 @@ class ProvisioningViewModel : ViewModel() {
             ?: return PrivateChatNodeState(
                 status = PrivateChatInstallStatus.FAILED,
                 currentStage = "PRIVATE_CHAT_PRECHECK",
-                lastError = "The working VPN exit could not be found for Private Chat installation.",
+                lastError = privateChatFailureMessage(
+                    "The working VPN exit could not be found for Private Chat installation.",
+                ),
             )
         val sshPrivateKey = exit.sshPrivateKeySecretKey
             ?.let { secretStore.getSecret(it) }
@@ -1838,7 +1846,9 @@ class ProvisioningViewModel : ViewModel() {
             val failed = PrivateChatNodeState(
                 status = PrivateChatInstallStatus.FAILED,
                 currentStage = "PRIVATE_CHAT_PRECHECK",
-                lastError = "The saved Oracle SSH key is missing. The working VPN profile was retained.",
+                lastError = privateChatFailureMessage(
+                    "The saved Oracle SSH key is missing. The working VPN profile was retained.",
+                ),
             )
             updateExit(exitId) { it.copy(privateChat = failed) }
             return failed
@@ -1861,6 +1871,7 @@ class ProvisioningViewModel : ViewModel() {
             )
             val credentialSecretKey = SecureSecretStore.privateChatOwnerCredentials(exitId)
             secretStore.putSecret(credentialSecretKey, result.ownerCredentials.toSecretJson())
+            recordPrivateChatInstallEvidence(result.manifest)
             val healthy = result.manifest.toNodeState(credentialSecretKey)
             updateExit(exitId) {
                 it.copy(
@@ -1875,7 +1886,7 @@ class ProvisioningViewModel : ViewModel() {
                 ?: PrivateChatNodeState.installing()).copy(
                 status = PrivateChatInstallStatus.FAILED,
                 currentStage = error.failedStage,
-                lastError = error.message?.take(600) ?: "Private Chat installation failed.",
+                lastError = privateChatFailureMessage(error.message),
                 lastUpdatedAt = System.currentTimeMillis(),
             )
             updateExit(exitId) {
@@ -1891,7 +1902,9 @@ class ProvisioningViewModel : ViewModel() {
                 ?: PrivateChatNodeState.installing()).copy(
                 status = PrivateChatInstallStatus.FAILED,
                 currentStage = "PRIVATE_CHAT_COMPLETE",
-                lastError = "Private Chat could not finish importing its validated node state. The VPN was retained.",
+                lastError = privateChatFailureMessage(
+                    "Private Chat could not finish importing its validated node state. The VPN was retained.",
+                ),
                 lastUpdatedAt = System.currentTimeMillis(),
             )
             updateExit(exitId) {
@@ -1914,23 +1927,137 @@ class ProvisioningViewModel : ViewModel() {
             "error" -> Status.ERROR
             else -> Status.RUNNING
         }
+        val safeMessage = redactPrivateChatDiagnostic(remoteEvent.message)
+        val duration = remoteEvent.durationMillis?.let(::formatPrivateChatDuration)
+        val displayMessage = when (status) {
+            Status.RUNNING -> "${phase.label} started."
+            Status.SUCCESS -> "${phase.label} completed${duration?.let { " in $it" }.orEmpty()}."
+            Status.WARNING -> "${phase.label} warning: $safeMessage"
+            Status.ERROR -> "${phase.label} failed${duration?.let { " after $it" }.orEmpty()}: " +
+                privateChatFailureMessage(safeMessage)
+        }
+        val technicalDetail = if (_isDevMode.value) {
+            buildString {
+                append("stage=").append(remoteEvent.stage)
+                append(" status=").append(remoteEvent.status.lowercase())
+                append(" duration=").append(duration ?: "not-reported")
+                append(" detail=").append(safeMessage)
+            }
+        } else {
+            null
+        }
         _currentPhase.value = phase
         _events.value = _events.value + ProvisioningEvent(
             timestamp = System.currentTimeMillis(),
             phase = phase,
             status = status,
-            message = remoteEvent.message.take(600),
+            message = displayMessage,
+            technicalDetail = technicalDetail,
         )
         updateExit(exitId) { exit ->
             val chat = exit.privateChat ?: PrivateChatNodeState.installing()
+            val existingStage = chat.stageStates[remoteEvent.stage] ?: PrivateChatStageState()
+            val nextStage = when (status) {
+                Status.RUNNING -> existingStage.copy(
+                    status = PrivateChatStageStatus.RUNNING,
+                    attempts = existingStage.attempts + 1,
+                    lastError = null,
+                )
+                Status.SUCCESS -> existingStage.copy(
+                    status = PrivateChatStageStatus.COMPLETE,
+                    lastError = null,
+                )
+                Status.WARNING -> existingStage
+                Status.ERROR -> existingStage.copy(
+                    status = PrivateChatStageStatus.FAILED,
+                    lastError = safeMessage,
+                )
+            }
             exit.copy(
                 privateChat = chat.copy(
                     currentStage = remoteEvent.stage,
-                    lastError = if (status == Status.ERROR) remoteEvent.message.take(600) else chat.lastError,
+                    lastError = if (status == Status.ERROR) privateChatFailureMessage(safeMessage) else chat.lastError,
+                    stageStates = chat.stageStates + (remoteEvent.stage to nextStage),
+                    lastSelfTestStatus = when {
+                        remoteEvent.stage != "PRIVATE_CHAT_ENCRYPTION_SELF_TEST" -> chat.lastSelfTestStatus
+                        status == Status.SUCCESS -> PrivateChatSelfTestStatus.PASS
+                        status == Status.ERROR -> PrivateChatSelfTestStatus.FAIL
+                        else -> chat.lastSelfTestStatus
+                    },
                     lastUpdatedAt = System.currentTimeMillis(),
                 ),
             )
         }
+    }
+
+    private fun recordPrivateChatInstallEvidence(manifest: PrivateChatNodeManifest) {
+        val checks = manifest.healthChecks
+        val postgresql = combineHealthChecks(
+            checks.postgresqlProcessOk,
+            checks.postgresqlConnectionOk,
+        )
+        val healthStatus = if (manifest.healthStatus == "healthy") Status.SUCCESS else Status.WARNING
+        _events.value = _events.value + ProvisioningEvent(
+            timestamp = System.currentTimeMillis(),
+            phase = Phase.PRIVATE_CHAT_HEALTH,
+            status = healthStatus,
+            message = "Private Chat health checks: PostgreSQL=$postgresql, " +
+                "Synapse=${combineHealthChecks(checks.synapseProcessOk, checks.synapseLoopbackListenerOk)}, " +
+                "TLS endpoint=${healthWord(checks.tlsEndpointOk)}, " +
+                "Matrix /versions=${healthWord(checks.matrixVersionsOk)}, " +
+                "owner account=${if (checks.ownerAccountExists == true) "exists" else healthWord(checks.ownerAccountExists)}, " +
+                "firewall=${healthWord(checks.privateFirewallPolicyActive)}, " +
+                "self-test=${manifest.lastSelfTestStatus.name.lowercase().replace('_', '-')}.",
+            technicalDetail = if (_isDevMode.value) {
+                "checkedAt=${manifest.healthCheckedAt ?: "not-reported"} " +
+                    "firewallService=${healthWord(checks.firewallServiceActive)} " +
+                    "chatOnlyPolicyChains=${healthWord(checks.chatOnlyPolicyChainsReady)} " +
+                    "chatOnlyPeerRulesActive=${checks.chatOnlyPeerRulesActive ?: false}"
+            } else {
+                null
+            },
+        )
+        _events.value = _events.value + ProvisioningEvent(
+            timestamp = System.currentTimeMillis(),
+            phase = Phase.PRIVATE_CHAT_COMPLETE,
+            status = Status.SUCCESS,
+            message = "Private Chat node manifest validated.",
+            technicalDetail = if (_isDevMode.value) {
+                "server_name=${manifest.serverName} private_url=${manifest.matrixPrivateUrl} " +
+                    "tls_fingerprint=${manifest.tlsSpkiSha256} versions=" +
+                    manifest.componentVersions.toSortedMap().entries.joinToString(",") { "${it.key}:${it.value}" }
+            } else {
+                null
+            },
+        )
+    }
+
+    private fun privateChatFailureMessage(message: String?): String {
+        val safe = redactPrivateChatDiagnostic(message ?: "Private Chat installation failed.")
+        val guidance = "Retry Private Chat to resume from the saved VM stage; WireGuard remains available."
+        if (safe.contains(guidance)) return safe.take(600)
+        return "${safe.take(600 - guidance.length - 1)} $guidance"
+    }
+
+    private fun formatPrivateChatDuration(milliseconds: Long): String =
+        if (milliseconds < 1_000L) {
+            "$milliseconds ms"
+        } else {
+            val wholeSeconds = milliseconds / 1_000L
+            val tenths = (milliseconds % 1_000L) / 100L
+            "$wholeSeconds.$tenths s"
+        }
+
+    private fun combineHealthChecks(first: Boolean?, second: Boolean?): String = when {
+        first == false || second == false -> "fail"
+        first == true && second == true -> "pass"
+        else -> "unknown"
+    }
+
+    private fun healthWord(value: Boolean?): String = when (value) {
+        true -> "pass"
+        false -> "fail"
+        null -> "unknown"
     }
 
     private fun PrivateChatNodeManifest.toNodeState(credentialsSecretKey: String): PrivateChatNodeState =
@@ -1945,6 +2072,11 @@ class ProvisioningViewModel : ViewModel() {
             ownerCredentialsSecretKey = credentialsSecretKey,
             installedAt = installedAt,
             healthStatus = healthStatus,
+            healthCheckedAt = healthCheckedAt,
+            healthChecks = healthChecks,
+            stageStates = stageStates,
+            lastSelfTestStatus = lastSelfTestStatus,
+            lastSelfTestCheckedAt = lastSelfTestCheckedAt,
             componentVersions = componentVersions,
             lastUpdatedAt = System.currentTimeMillis(),
         )
@@ -2012,6 +2144,22 @@ class ProvisioningViewModel : ViewModel() {
         } else {
             event
         }
+
+    private fun appendProvisionerEvent(event: ProvisioningEvent) {
+        val classified = classifyEvent(event)
+        val alreadyRecorded = _events.value.any { existing ->
+            existing.timestamp == classified.timestamp &&
+                existing.phase == classified.phase &&
+                existing.status == classified.status &&
+                existing.message == classified.message
+        }
+        if (!alreadyRecorded) {
+            _events.value = _events.value + classified
+        }
+        if (classified.phase != Phase.DONE) {
+            _currentPhase.value = classified.phase
+        }
+    }
 
     private fun isDeveloperDiagnostic(message: String, status: Status): Boolean {
         if (status == Status.ERROR) return false
@@ -2293,6 +2441,19 @@ class ProvisioningViewModel : ViewModel() {
     private fun PrivateChatNodeState.toJson(): JSONObject {
         val versions = JSONObject()
         componentVersions.toSortedMap().forEach { (name, version) -> versions.put(name, version) }
+        val stages = JSONObject()
+        stageStates.toSortedMap().forEach { (name, stage) ->
+            stages.put(
+                name,
+                JSONObject()
+                    .put("status", stage.status.name)
+                    .put("attempts", stage.attempts)
+                    .put("startedAt", stage.startedAt)
+                    .put("completedAt", stage.completedAt)
+                    .put("lastError", stage.lastError)
+                    .put("probeSatisfied", stage.probeSatisfied),
+            )
+        }
         return JSONObject()
             .put("status", status.name)
             .put("currentStage", currentStage)
@@ -2305,10 +2466,28 @@ class ProvisioningViewModel : ViewModel() {
             .put("ownerCredentialsSecretKey", ownerCredentialsSecretKey)
             .put("installedAt", installedAt)
             .put("healthStatus", healthStatus)
+            .put("healthCheckedAt", healthCheckedAt)
+            .put("healthChecks", healthChecks.toJson())
+            .put("stageStates", stages)
+            .put("lastSelfTestStatus", lastSelfTestStatus.name)
+            .put("lastSelfTestCheckedAt", lastSelfTestCheckedAt)
             .put("componentVersions", versions)
             .put("ownerLoginVerifiedAt", ownerLoginVerifiedAt)
             .put("lastUpdatedAt", lastUpdatedAt)
     }
+
+    private fun PrivateChatHealthChecks.toJson(): JSONObject = JSONObject()
+        .put("postgresqlProcessOk", postgresqlProcessOk)
+        .put("postgresqlConnectionOk", postgresqlConnectionOk)
+        .put("synapseProcessOk", synapseProcessOk)
+        .put("synapseLoopbackListenerOk", synapseLoopbackListenerOk)
+        .put("tlsEndpointOk", tlsEndpointOk)
+        .put("matrixVersionsOk", matrixVersionsOk)
+        .put("ownerAccountExists", ownerAccountExists)
+        .put("firewallServiceActive", firewallServiceActive)
+        .put("privateFirewallPolicyActive", privateFirewallPolicyActive)
+        .put("chatOnlyPolicyChainsReady", chatOnlyPolicyChainsReady)
+        .put("chatOnlyPeerRulesActive", chatOnlyPeerRulesActive)
 
     private fun JSONObject.toConfiguredExit(): ConfiguredExit {
         val exitId = getString("id")
@@ -2392,12 +2571,48 @@ class ProvisioningViewModel : ViewModel() {
                 versionsJson.optString(name).takeIf { it.isNotBlank() }?.let { put(name, it) }
             }
         }
+        val healthJson = optJSONObject("healthChecks")
+        val healthChecks = PrivateChatHealthChecks(
+            postgresqlProcessOk = healthJson?.optBooleanOrNull("postgresqlProcessOk"),
+            postgresqlConnectionOk = healthJson?.optBooleanOrNull("postgresqlConnectionOk"),
+            synapseProcessOk = healthJson?.optBooleanOrNull("synapseProcessOk"),
+            synapseLoopbackListenerOk = healthJson?.optBooleanOrNull("synapseLoopbackListenerOk"),
+            tlsEndpointOk = healthJson?.optBooleanOrNull("tlsEndpointOk"),
+            matrixVersionsOk = healthJson?.optBooleanOrNull("matrixVersionsOk"),
+            ownerAccountExists = healthJson?.optBooleanOrNull("ownerAccountExists"),
+            firewallServiceActive = healthJson?.optBooleanOrNull("firewallServiceActive"),
+            privateFirewallPolicyActive = healthJson?.optBooleanOrNull("privateFirewallPolicyActive"),
+            chatOnlyPolicyChainsReady = healthJson?.optBooleanOrNull("chatOnlyPolicyChainsReady"),
+            chatOnlyPeerRulesActive = healthJson?.optBooleanOrNull("chatOnlyPeerRulesActive"),
+        )
+        val stagesJson = optJSONObject("stageStates")
+        val stages = buildMap {
+            PRIVATE_CHAT_STAGE_ORDER.forEach { name ->
+                val stage = stagesJson?.optJSONObject(name) ?: return@forEach
+                put(
+                    name,
+                    PrivateChatStageState(
+                        status = runCatching {
+                            PrivateChatStageStatus.valueOf(
+                                stage.optString("status", PrivateChatStageStatus.PENDING.name),
+                            )
+                        }.getOrDefault(PrivateChatStageStatus.PENDING),
+                        attempts = stage.optInt("attempts", 0).coerceAtLeast(0),
+                        startedAt = stage.optNullableString("startedAt"),
+                        completedAt = stage.optNullableString("completedAt"),
+                        lastError = stage.optNullableString("lastError")
+                            ?.let(::redactPrivateChatDiagnostic),
+                        probeSatisfied = stage.optBoolean("probeSatisfied", false),
+                    ),
+                )
+            }
+        }
         return PrivateChatNodeState(
             status = runCatching {
                 PrivateChatInstallStatus.valueOf(optString("status", PrivateChatInstallStatus.FAILED.name))
             }.getOrDefault(PrivateChatInstallStatus.FAILED),
-            currentStage = optNullableString("currentStage"),
-            lastError = optNullableString("lastError"),
+            currentStage = optNullableString("currentStage")?.takeIf { it in PRIVATE_CHAT_STAGE_ORDER },
+            lastError = optNullableString("lastError")?.let(::redactPrivateChatDiagnostic),
             nodeId = optNullableString("nodeId"),
             serverName = optNullableString("serverName"),
             matrixPrivateUrl = optNullableString("matrixPrivateUrl"),
@@ -2406,6 +2621,15 @@ class ProvisioningViewModel : ViewModel() {
             ownerCredentialsSecretKey = optNullableString("ownerCredentialsSecretKey"),
             installedAt = optNullableString("installedAt"),
             healthStatus = optNullableString("healthStatus"),
+            healthCheckedAt = optNullableString("healthCheckedAt"),
+            healthChecks = healthChecks,
+            stageStates = stages,
+            lastSelfTestStatus = runCatching {
+                PrivateChatSelfTestStatus.valueOf(
+                    optString("lastSelfTestStatus", PrivateChatSelfTestStatus.NOT_RUN.name),
+                )
+            }.getOrDefault(PrivateChatSelfTestStatus.NOT_RUN),
+            lastSelfTestCheckedAt = optNullableString("lastSelfTestCheckedAt"),
             componentVersions = versions,
             ownerLoginVerifiedAt = optLongOrNull("ownerLoginVerifiedAt"),
             lastUpdatedAt = optLong("lastUpdatedAt", System.currentTimeMillis()),

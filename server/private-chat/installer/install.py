@@ -45,6 +45,9 @@ try:
         StageLedger,
         StageRunner,
         evaluate_preflight,
+        installation_summary,
+        listeners_are_loopback_only,
+        listening_hosts,
         render_firewall_remove_script,
         render_firewall_script,
         sanitize_error,
@@ -64,6 +67,9 @@ except ImportError:  # Executed directly on the provisioned VM.
         StageLedger,
         StageRunner,
         evaluate_preflight,
+        installation_summary,
+        listeners_are_loopback_only,
+        listening_hosts,
         render_firewall_remove_script,
         render_firewall_script,
         sanitize_error,
@@ -211,11 +217,32 @@ def read_json(path: Path) -> dict[str, Any]:
 
 
 def source_path(relative: str) -> Path:
+    source = SOURCE_ROOT / relative
     installed = INSTALL_ROOT / relative
-    return installed if installed.exists() else SOURCE_ROOT / relative
+    return source if source.exists() else installed
 
 
-def emit_event(stage: Stage, status: str, message: str) -> None:
+def installed_bundle_matches_source() -> bool:
+    if SOURCE_ROOT.resolve() == INSTALL_ROOT.resolve():
+        return True
+    for source in SOURCE_ROOT.rglob("*"):
+        if not source.is_file():
+            continue
+        relative = source.relative_to(SOURCE_ROOT)
+        if any(part in {"__pycache__", ".pytest_cache", ".runtime"} for part in relative.parts):
+            continue
+        if source.suffix == ".pyc":
+            continue
+        installed = INSTALL_ROOT / relative
+        try:
+            if not installed.is_file() or source.read_bytes() != installed.read_bytes():
+                return False
+        except OSError:
+            return False
+    return True
+
+
+def emit_event(stage: Stage, status: str, message: str, duration_ms: int | None = None) -> None:
     safe_message = sanitize_error(message)
     payload = {
         "stage": stage.value,
@@ -223,12 +250,15 @@ def emit_event(stage: Stage, status: str, message: str) -> None:
         "message": safe_message,
         "timestamp": utc_timestamp(),
     }
+    if duration_ms is not None:
+        payload["durationMs"] = max(0, int(duration_ms))
     try:
         LOG_ROOT.mkdir(parents=True, exist_ok=True)
         LOG_ROOT.chmod(0o700)
         event_log = LOG_ROOT / f"{stage.value.lower()}.log"
         with event_log.open("a", encoding="utf-8", newline="\n") as handle:
-            handle.write(f"{payload['timestamp']} event status={status} message={safe_message}\n")
+            duration = f" durationMs={payload['durationMs']}" if "durationMs" in payload else ""
+            handle.write(f"{payload['timestamp']} event status={status}{duration} message={safe_message}\n")
         event_log.chmod(0o600)
     except OSError:
         # The durable ledger still records the stage. A log write failure must not
@@ -328,7 +358,8 @@ def listening_port_owners() -> dict[int, str]:
 
 def postgres_has_public_listener() -> bool:
     output = run_command("inspect PostgreSQL listener scope", ["ss", "-H", "-ltn"], check=False, timeout=30).stdout
-    return any(marker in output for marker in ("0.0.0.0:5432", "[::]:5432", "*:5432"))
+    hosts = listening_hosts(output, 5432)
+    return bool(hosts) and not listeners_are_loopback_only(output, 5432)
 
 
 def partial_install_paths() -> tuple[str, ...]:
@@ -476,11 +507,8 @@ def postgres_ready() -> bool:
         database = psql_scalar(f"SELECT 1 FROM pg_database WHERE datname='{POSTGRES_DATABASE}';") == "1"
         role = psql_scalar(f"SELECT 1 FROM pg_roles WHERE rolname='{POSTGRES_ROLE}';") == "1"
         listeners = run_command("probe PostgreSQL listeners", ["ss", "-H", "-ltn"], check=False).stdout
-        public_listener = any(
-            marker in listeners
-            for marker in ("0.0.0.0:5432", "[::]:5432", "*:5432")
-        )
-        return database and role and not public_listener and POSTGRES_PASSWORD_FILE.exists()
+        loopback_only = listeners_are_loopback_only(listeners, 5432)
+        return database and role and loopback_only and POSTGRES_PASSWORD_FILE.exists()
     except InstallerError:
         return False
 
@@ -508,6 +536,83 @@ def systemd_active(unit: str) -> bool:
         check=False,
         timeout=30,
     ).returncode == 0
+
+
+def iptables_rule_present(chain: str, *rule: str) -> bool:
+    return run_command(
+        f"probe {chain} firewall rule",
+        ["iptables", "-w", "-C", chain, *rule],
+        check=False,
+        timeout=30,
+    ).returncode == 0
+
+
+def firewall_health(interface: str, address: str) -> dict[str, Any]:
+    network = str(ipaddress.ip_network(f"{address}/24", strict=False))
+    service_active = systemd_active(FIREWALL_SERVICE)
+    private_policy = (
+        iptables_rule_present("INPUT", "-j", "ZEROVPN_PRIVATE_CHAT_INPUT")
+        and iptables_rule_present(
+            "ZEROVPN_PRIVATE_CHAT_INPUT",
+            "-i",
+            interface,
+            "-d",
+            address,
+            "-p",
+            "tcp",
+            "--dport",
+            "443",
+            "-j",
+            "ACCEPT",
+        )
+    )
+    chat_input = run_command(
+        "inspect chat-only input policy",
+        ["iptables", "-w", "-S", "ZEROVPN_CHAT_PEER_INPUT"],
+        check=False,
+        timeout=30,
+    )
+    chat_forward = run_command(
+        "inspect chat-only forward policy",
+        ["iptables", "-w", "-S", "ZEROVPN_CHAT_PEER_FORWARD"],
+        check=False,
+        timeout=30,
+    )
+    policy_chains_ready = (
+        chat_input.returncode == 0
+        and "--dport 443 -j ACCEPT" in chat_input.stdout
+        and "-j REJECT" in chat_input.stdout
+        and chat_forward.returncode == 0
+        and "169.254.169.254/32 -j REJECT" in chat_forward.stdout
+        and f"{network} -j REJECT" in chat_forward.stdout
+        and "-j REJECT" in chat_forward.stdout
+    )
+    input_rules = run_command(
+        "inspect chat-only input attachments",
+        ["iptables", "-w", "-S", "INPUT"],
+        check=False,
+        timeout=30,
+    ).stdout
+    forward_rules = run_command(
+        "inspect chat-only forward attachments",
+        ["iptables", "-w", "-S", "FORWARD"],
+        check=False,
+        timeout=30,
+    ).stdout
+    input_attached = any(
+        " -s " in line and " -j ZEROVPN_CHAT_PEER_INPUT" in line
+        for line in input_rules.splitlines()
+    )
+    forward_attached = any(
+        " -s " in line and " -j ZEROVPN_CHAT_PEER_FORWARD" in line
+        for line in forward_rules.splitlines()
+    )
+    return {
+        "serviceActive": service_active,
+        "privatePolicyActive": private_policy,
+        "chatOnlyPolicyChainsReady": policy_chains_ready,
+        "chatOnlyPeerRulesActive": input_attached and forward_attached,
+    }
 
 
 def synapse_ready() -> bool:
@@ -662,22 +767,38 @@ def collect_health(address: str, ledger: StageLedger | None = None) -> dict[str,
     server_name = SERVER_NAME_FILE.read_text(encoding="utf-8").strip() if SERVER_NAME_FILE.exists() else ""
     owner_account = bool(server_name) and owner_exists(server_name)
     listener_output = run_command("inspect Matrix listeners", ["ss", "-H", "-ltn"], check=False).stdout
-    private_listener = f"{address}:443" in listener_output
-    no_public_listener = not any(marker in listener_output for marker in ("0.0.0.0:443", "[::]:443", "*:443"))
-    self_test = ledger.data.get("selfTest") if ledger else None
-    self_test_ok = isinstance(self_test, dict) and self_test.get("status") == "success"
+    private_listener = listening_hosts(listener_output, 443) == frozenset({address})
+    synapse_loopback_listener = listeners_are_loopback_only(listener_output, 8008)
+    options = read_json(OPTIONS_FILE) if OPTIONS_FILE.exists() else {}
+    interface = str(options.get("wireguardInterface", "wg0"))
+    firewall = firewall_health(interface, address)
+    install_state = installation_summary(ledger.data if ledger else {})
+    self_test = install_state["lastSelfTest"]
+    self_test_ok = self_test["status"] == "pass"
     checks.update(
         postgresqlProcess={"ok": postgres_process},
         postgresqlConnection={"ok": postgres_check},
         synapseProcess={"ok": synapse_process},
         matrixVersions={"ok": matrix_versions, "url": f"{LOCAL_MATRIX_URL}/_matrix/client/versions"},
         privateTls={"ok": tls_endpoint, "url": f"https://{address}/_matrix/client/versions"},
-        privateListener={"ok": private_listener and no_public_listener},
+        privateListener={"ok": private_listener},
+        synapseLoopbackListener={"ok": synapse_loopback_listener},
         disk={"ok": disk_percent < 95.0, "usedPercent": disk_percent, "freeBytes": disk.free},
         ownerAccount={"ok": owner_account, "userId": f"@owner:{server_name}" if server_name else None},
+        privateChatFirewall={
+            "ok": firewall["serviceActive"] and firewall["privatePolicyActive"],
+            "serviceActive": firewall["serviceActive"],
+            "privatePolicyActive": firewall["privatePolicyActive"],
+        },
+        chatOnlyPeerRules={
+            "ok": firewall["chatOnlyPolicyChainsReady"],
+            "policyChainsReady": firewall["chatOnlyPolicyChainsReady"],
+            "active": firewall["chatOnlyPeerRulesActive"],
+        },
         encryptionSelfTest={
             "ok": self_test_ok,
-            "checkedAt": self_test.get("checkedAt") if isinstance(self_test, dict) else None,
+            "status": self_test["status"],
+            "checkedAt": self_test["checkedAt"],
         },
     )
     critical = (
@@ -686,11 +807,19 @@ def collect_health(address: str, ledger: StageLedger | None = None) -> dict[str,
         synapse_process,
         matrix_versions,
         tls_endpoint,
-        private_listener and no_public_listener,
+        private_listener,
+        synapse_loopback_listener,
         owner_account,
+        firewall["serviceActive"] and firewall["privatePolicyActive"],
+        firewall["chatOnlyPolicyChainsReady"],
     )
     status = "unhealthy" if not all(critical) else ("degraded" if disk_percent >= 85.0 else "healthy")
-    return {"status": status, "checkedAt": utc_timestamp(), "checks": checks}
+    return {
+        "status": status,
+        "checkedAt": utc_timestamp(),
+        "checks": checks,
+        "installation": install_state,
+    }
 
 
 class InstallerContext:
@@ -774,7 +903,14 @@ class InstallerContext:
 
     def probe_packages(self) -> bool:
         commands = ("curl", "iptables", "nginx", "openssl", "pg_isready", "psql", "python3")
-        return all(shutil.which(command) for command in commands) and (INSTALL_ROOT / "installer/model.py").exists()
+        expected_marker = f"installerVersion={INSTALLER_VERSION}"
+        marker_matches = MANAGED_MARKER.exists() and MANAGED_MARKER.read_text(encoding="utf-8").strip() == expected_marker
+        return (
+            all(shutil.which(command) for command in commands)
+            and (INSTALL_ROOT / "installer/model.py").exists()
+            and marker_matches
+            and installed_bundle_matches_source()
+        )
 
     def apply_postgres(self) -> None:
         with StageLog(Stage.POSTGRES) as log:
@@ -826,7 +962,12 @@ class InstallerContext:
             )
 
     def probe_postgres(self) -> bool:
-        return postgres_ready()
+        try:
+            drop_in = postgres_cluster_config_directory() / "conf.d/90-zerovpn-private-chat.conf"
+            expected = source_path("postgres/90-zerovpn-private-chat.conf.template").read_text(encoding="utf-8")
+            return postgres_ready() and drop_in.read_text(encoding="utf-8") == expected
+        except (InstallerError, OSError):
+            return False
 
     def apply_synapse(self) -> None:
         with StageLog(Stage.SYNAPSE) as log:
@@ -900,11 +1041,34 @@ class InstallerContext:
             signing_key.chmod(0o600)
 
     def probe_synapse(self) -> bool:
-        return (
-            synapse_ready()
-            and (SYNAPSE_DATA / "signing.key").exists()
-            and stat.S_IMODE((SYNAPSE_DATA / "signing.key").stat().st_mode) == 0o600
-        )
+        try:
+            if not NODE_ID_FILE.exists() or not SERVER_NAME_FILE.exists():
+                return False
+            _, server_name = ensure_node_identity()
+            expected_homeserver = source_path("synapse/homeserver.yaml.template").read_text(encoding="utf-8")
+            expected_homeserver = expected_homeserver.replace("__SERVER_NAME__", server_name).replace(
+                "__WIREGUARD_ADDRESS__",
+                self.address,
+            )
+            expected_log = source_path("synapse/log.config").read_text(encoding="utf-8")
+            expected_unit = source_path("synapse/zerovpn-private-chat-synapse.service.template").read_text(
+                encoding="utf-8"
+            )
+            expected_renderer = source_path("synapse/render-runtime-config.py").read_text(encoding="utf-8")
+            signing_key = SYNAPSE_DATA / "signing.key"
+            return (
+                synapse_ready()
+                and signing_key.exists()
+                and stat.S_IMODE(signing_key.stat().st_mode) == 0o600
+                and (SYNAPSE_ETC / "homeserver.yaml.template").read_text(encoding="utf-8") == expected_homeserver
+                and (SYNAPSE_ETC / "log.config").read_text(encoding="utf-8") == expected_log
+                and SYNAPSE_UNIT_PATH.read_text(encoding="utf-8") == expected_unit
+                and (INSTALL_ROOT / "synapse/render-runtime-config.py").read_text(encoding="utf-8")
+                == expected_renderer
+                and component_versions().get("synapse") == "1.156.0"
+            )
+        except (InstallerError, OSError):
+            return False
 
     def apply_tls(self) -> None:
         with StageLog(Stage.TLS) as log:
@@ -978,6 +1142,16 @@ class InstallerContext:
                 )
             key.chmod(0o600)
             certificate.chmod(0o644)
+            established_pins: set[str] = set()
+            if OWNER_CREDENTIALS_FILE.exists():
+                established_pins.add(str(owner_account_credentials().get("tlsSpkiSha256", "")))
+            if MANIFEST_FILE.exists():
+                established_pins.add(str(read_json(MANIFEST_FILE).get("tlsSpkiSha256", "")))
+            established_pins.discard("")
+            if len(established_pins) > 1 or (established_pins and tls_spki_pin() not in established_pins):
+                raise InstallerError(
+                    "The TLS private key no longer matches the established node fingerprint; explicit recovery is required."
+                )
             nginx = source_path("synapse/nginx-private-chat.conf.template").read_text(encoding="utf-8")
             nginx = nginx.replace("__SERVER_NAME__", server_name).replace("__WIREGUARD_ADDRESS__", self.address)
             write_atomic(NGINX_SITE_AVAILABLE, nginx, 0o644)
@@ -986,9 +1160,6 @@ class InstallerContext:
                     raise InstallerError("The ZeroVPN nginx site name is already owned by another file.")
             else:
                 NGINX_SITE_ENABLED.symlink_to(NGINX_SITE_AVAILABLE)
-            default_site = Path("/etc/nginx/sites-enabled/default")
-            if default_site.is_symlink() and default_site.resolve() == Path("/etc/nginx/sites-available/default"):
-                default_site.unlink()
             run_command("validate nginx configuration", ["nginx", "-t"], log=log)
             run_command("enable nginx", ["systemctl", "enable", "nginx.service"], log=log)
             run_command("restart nginx", ["systemctl", "restart", "nginx.service"], log=log)
@@ -999,7 +1170,31 @@ class InstallerContext:
             )
 
     def probe_tls(self) -> bool:
-        return tls_ready(self.address)
+        try:
+            if not NODE_ID_FILE.exists() or not SERVER_NAME_FILE.exists():
+                return False
+            _, server_name = ensure_node_identity()
+            expected_nginx = source_path("synapse/nginx-private-chat.conf.template").read_text(encoding="utf-8")
+            expected_nginx = expected_nginx.replace("__SERVER_NAME__", server_name).replace(
+                "__WIREGUARD_ADDRESS__",
+                self.address,
+            )
+            if NGINX_SITE_AVAILABLE.read_text(encoding="utf-8") != expected_nginx:
+                return False
+            if not NGINX_SITE_ENABLED.is_symlink() or NGINX_SITE_ENABLED.resolve() != NGINX_SITE_AVAILABLE.resolve():
+                return False
+            current_pin = tls_spki_pin()
+            established_pins: set[str] = set()
+            if OWNER_CREDENTIALS_FILE.exists():
+                established_pins.add(str(owner_account_credentials().get("tlsSpkiSha256", "")))
+            if MANIFEST_FILE.exists():
+                established_pins.add(str(read_json(MANIFEST_FILE).get("tlsSpkiSha256", "")))
+            established_pins.discard("")
+            return tls_ready(self.address) and len(established_pins) <= 1 and (
+                not established_pins or current_pin in established_pins
+            )
+        except (InstallerError, OSError):
+            return False
 
     def apply_firewall(self) -> None:
         with StageLog(Stage.FIREWALL) as log:
@@ -1017,34 +1212,26 @@ class InstallerContext:
             run_command("restart private-chat firewall", ["systemctl", "restart", FIREWALL_SERVICE], log=log)
 
     def probe_firewall(self) -> bool:
-        jump = run_command(
-            "probe private-chat firewall jump",
-            ["iptables", "-w", "-C", "INPUT", "-j", "ZEROVPN_PRIVATE_CHAT_INPUT"],
-            check=False,
-            timeout=30,
-        ).returncode == 0
-        allow = run_command(
-            "probe private-chat TLS firewall rule",
-            [
-                "iptables",
-                "-w",
-                "-C",
-                "ZEROVPN_PRIVATE_CHAT_INPUT",
-                "-i",
-                self.interface,
-                "-d",
-                self.address,
-                "-p",
-                "tcp",
-                "--dport",
-                "443",
-                "-j",
-                "ACCEPT",
-            ],
-            check=False,
-            timeout=30,
-        ).returncode == 0
-        return jump and allow and systemd_active(FIREWALL_SERVICE)
+        health = firewall_health(self.interface, self.address)
+        try:
+            expected_apply = render_firewall_script(self.interface, self.address)
+            expected_remove = render_firewall_remove_script()
+            expected_unit = source_path("firewall/zerovpn-private-chat-firewall.service.template").read_text(
+                encoding="utf-8"
+            )
+            files_match = (
+                (INSTALL_ROOT / "firewall/apply.sh").read_text(encoding="utf-8") == expected_apply
+                and (INSTALL_ROOT / "firewall/remove.sh").read_text(encoding="utf-8") == expected_remove
+                and FIREWALL_UNIT_PATH.read_text(encoding="utf-8") == expected_unit
+            )
+        except OSError:
+            files_match = False
+        return (
+            files_match
+            and health["serviceActive"]
+            and health["privatePolicyActive"]
+            and health["chatOnlyPolicyChainsReady"]
+        )
 
     def apply_owner_account(self) -> None:
         with StageLog(Stage.OWNER_ACCOUNT) as log:
@@ -1054,6 +1241,12 @@ class InstallerContext:
                 credentials = owner_account_credentials()
                 if credentials.get("userId") != expected_user_id:
                     raise InstallerError("The stored owner account does not match the stable server name.")
+                if credentials.get("matrixPrivateUrl") != f"https://{self.address}":
+                    raise InstallerError("The stored owner account uses a different private Matrix URL.")
+                if credentials.get("tlsSpkiSha256") != tls_spki_pin():
+                    raise InstallerError(
+                        "The stored owner account fingerprint no longer matches TLS; explicit recovery is required."
+                    )
             elif owner_exists(server_name):
                 raise InstallerError("The owner account exists but its root-only credential file is missing.")
             else:
@@ -1078,7 +1271,12 @@ class InstallerContext:
         try:
             _, server_name = ensure_node_identity()
             credentials = owner_account_credentials()
-            return credentials.get("userId") == f"@owner:{server_name}" and owner_exists(server_name)
+            return (
+                credentials.get("userId") == f"@owner:{server_name}"
+                and credentials.get("matrixPrivateUrl") == f"https://{self.address}"
+                and credentials.get("tlsSpkiSha256") == tls_spki_pin()
+                and owner_exists(server_name)
+            )
         except InstallerError:
             return False
 
@@ -1205,6 +1403,7 @@ class InstallerContext:
             "installedAt": existing_installed_at or utc_timestamp(),
             "updatedAt": utc_timestamp(),
             "health": health,
+            "installation": installation_summary(self.ledger.data),
             "ownerMatrixUserId": f"@owner:{server_name}",
             "network": {
                 "wireguardInterface": self.interface,
@@ -1286,6 +1485,17 @@ def install(interface: str, address: str) -> int:
             flush=True,
         )
         return 1
+    # COMPLETE is marked in the ledger only after its apply/probe returns. Update
+    # only the non-secret stage snapshot so diagnostics see every stage complete
+    # without repeating network/service health probes after a successful run.
+    manifest = read_json(MANIFEST_FILE)
+    final_installation = installation_summary(ledger.data)
+    manifest["installation"] = final_installation
+    if isinstance(manifest.get("health"), dict):
+        manifest["health"]["installation"] = final_installation
+    manifest["updatedAt"] = utc_timestamp()
+    validate_node_manifest(manifest)
+    write_json(MANIFEST_FILE, manifest, 0o600)
     print(
         "ZEROVPN_PRIVATE_CHAT_COMPLETE "
         + json.dumps(
@@ -1308,6 +1518,7 @@ def health_command(as_json: bool) -> int:
     if MANIFEST_FILE.exists():
         manifest = read_json(MANIFEST_FILE)
         manifest["health"] = health
+        manifest["installation"] = installation_summary(ledger.data)
         manifest["updatedAt"] = utc_timestamp()
         validate_node_manifest(manifest)
         write_json(MANIFEST_FILE, manifest, 0o600)

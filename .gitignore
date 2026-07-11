@@ -19,6 +19,8 @@ node_modules/
 # Python test/runtime caches
 __pycache__/
 *.pyc
+.pytest_cache/
+.venv*/
 
 # IDE
 .idea/
@@ -76,3 +78,5 @@ g2/
 android/hs_err_pid*.log
 crash*.log
 hs_err_pid*.log
+
+.kotlin/

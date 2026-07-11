@@ -12,15 +12,22 @@ StageDefinition = installer_model.StageDefinition
 StageFailure = installer_model.StageFailure
 StageLedger = installer_model.StageLedger
 StageRunner = installer_model.StageRunner
+installation_summary = installer_model.installation_summary
+sanitize_error = installer_model.sanitize_error
 
 
 class StageStateTests(unittest.TestCase):
     def test_probe_satisfied_stage_is_recorded_without_apply(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             applied: list[str] = []
-            events: list[tuple[str, str]] = []
+            events: list[tuple[str, str, int | None]] = []
             ledger = StageLedger(Path(directory) / "state.json", now=lambda: "2026-07-10T00:00:00Z")
-            runner = StageRunner(ledger, lambda stage, status, _: events.append((stage.value, status)))
+            clock = iter((10.0, 10.125))
+            runner = StageRunner(
+                ledger,
+                lambda stage, status, _, duration: events.append((stage.value, status, duration)),
+                monotonic=lambda: next(clock),
+            )
 
             runner.run(
                 [
@@ -37,7 +44,13 @@ class StageStateTests(unittest.TestCase):
             record = ledger.data["stages"][Stage.PACKAGES.value]
             self.assertTrue(record["probeSatisfied"])
             self.assertEqual(0, record["attempts"])
-            self.assertEqual([(Stage.PACKAGES.value, "success")], events)
+            self.assertEqual(
+                [
+                    (Stage.PACKAGES.value, "running", None),
+                    (Stage.PACKAGES.value, "success", 125),
+                ],
+                events,
+            )
 
     def test_failed_stage_retries_without_replaying_satisfied_stage(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -80,6 +93,36 @@ class StageStateTests(unittest.TestCase):
             self.assertNotIn("abc.def.ghi", serialized)
             self.assertNotIn("index-pass", serialized)
             self.assertIn("[REDACTED]", serialized)
+
+    def test_redaction_handles_json_authorization_and_private_key_blocks(self) -> None:
+        diagnostic = sanitize_error(
+            '{"password":"json-secret","authorization":"Signature abc.def"} '
+            "-----BEGIN PRIVATE KEY----- private-material -----END PRIVATE KEY-----"
+        )
+        self.assertNotIn("json-secret", diagnostic)
+        self.assertNotIn("abc.def", diagnostic)
+        self.assertNotIn("private-material", diagnostic)
+        self.assertIn("[REDACTED]", diagnostic)
+
+    def test_installation_summary_lists_pending_failed_complete_and_self_test(self) -> None:
+        summary = installation_summary(
+            {
+                "currentStage": Stage.ENCRYPTION_SELF_TEST.value,
+                "stages": {
+                    Stage.PACKAGES.value: {"status": "complete", "attempts": 1},
+                    Stage.ENCRYPTION_SELF_TEST.value: {
+                        "status": "failed",
+                        "attempts": 2,
+                        "lastError": "token=do-not-keep",
+                    },
+                },
+            }
+        )
+        self.assertEqual("complete", summary["stages"][Stage.PACKAGES.value]["status"])
+        self.assertEqual("pending", summary["stages"][Stage.POSTGRES.value]["status"])
+        self.assertEqual("failed", summary["stages"][Stage.ENCRYPTION_SELF_TEST.value]["status"])
+        self.assertEqual("fail", summary["lastSelfTest"]["status"])
+        self.assertNotIn("do-not-keep", str(summary))
 
 
 if __name__ == "__main__":

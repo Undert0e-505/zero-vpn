@@ -8,6 +8,8 @@ from installer_test_imports import installer_model
 PreflightError = installer_model.PreflightError
 PreflightSnapshot = installer_model.PreflightSnapshot
 evaluate_preflight = installer_model.evaluate_preflight
+listening_hosts = installer_model.listening_hosts
+listeners_are_loopback_only = installer_model.listeners_are_loopback_only
 
 
 def supported_snapshot(**changes: object) -> PreflightSnapshot:
@@ -105,6 +107,15 @@ class PreflightTests(unittest.TestCase):
         )
         self.assertTrue(report.facts["partialInstallDetected"])
         self.assertIn("resumed", " ".join(report.warnings))
+
+    def test_listener_scope_parser_rejects_specific_non_loopback_bindings(self) -> None:
+        local = "LISTEN 0 244 127.0.0.1:5432 0.0.0.0:*\nLISTEN 0 244 [::1]:5432 [::]:*"
+        exposed = "LISTEN 0 244 10.0.0.12:5432 0.0.0.0:*"
+        wildcard = "LISTEN 0 244 *:5432 *:*"
+        self.assertEqual(frozenset({"127.0.0.1", "::1"}), listening_hosts(local, 5432))
+        self.assertTrue(listeners_are_loopback_only(local, 5432))
+        self.assertFalse(listeners_are_loopback_only(exposed, 5432))
+        self.assertFalse(listeners_are_loopback_only(wildcard, 5432))
 
 
 if __name__ == "__main__":

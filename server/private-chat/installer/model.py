@@ -14,6 +14,7 @@ import json
 import os
 import re
 import tempfile
+import time
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
@@ -22,7 +23,7 @@ from typing import Any, Callable, Iterable, Mapping, MutableMapping, Sequence
 from urllib.parse import urlparse
 
 
-INSTALLER_VERSION = "0.1.0"
+INSTALLER_VERSION = "0.1.1"
 STATE_SCHEMA_VERSION = 1
 MANIFEST_SCHEMA_VERSION = 1
 SUPPORTED_UBUNTU_VERSIONS = frozenset({"22.04", "24.04"})
@@ -69,20 +70,25 @@ class StageFailure(InstallerError):
 
 
 _SENSITIVE_ASSIGNMENT = re.compile(
-    r"(?i)\b(password|passwd|secret|token|authorization|private[_ -]?key)\b"
-    r"(\s*[:=]\s*)([^\s,;]+)"
+    r"(?i)([\"']?(?:password|passwd|credential|secret|token|authorization|private[_ -]?key)[\"']?"
+    r"\s*[:=]\s*)(?:\"[^\"]*\"|'[^']*'|[^\s,;]+)"
 )
 _BEARER = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+")
-_URL_USERINFO = re.compile(r"(?i)(https?://)([^/@\s:]+):([^/@\s]+)@")
+_URL_USERINFO = re.compile(r"(?i)(https?://)([^/@\s]+)@")
+_PRIVATE_KEY_BLOCK = re.compile(
+    r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?-----END [A-Z0-9 ]*PRIVATE KEY-----",
+    re.IGNORECASE | re.DOTALL,
+)
 
 
 def sanitize_error(value: object, limit: int = 600) -> str:
     """Return one bounded, single-line, secret-redacted diagnostic string."""
 
-    text = " ".join(str(value).replace("\x00", " ").split())
+    text = _PRIVATE_KEY_BLOCK.sub("[REDACTED PRIVATE KEY]", str(value).replace("\x00", " "))
+    text = " ".join(text.split())
     text = _BEARER.sub("Bearer [REDACTED]", text)
     text = _URL_USERINFO.sub(r"\1[REDACTED]@", text)
-    text = _SENSITIVE_ASSIGNMENT.sub(lambda match: f"{match.group(1)}{match.group(2)}[REDACTED]", text)
+    text = _SENSITIVE_ASSIGNMENT.sub(lambda match: f"{match.group(1)}[REDACTED]", text)
     return (text or "The stage failed without a diagnostic.")[:limit]
 
 
@@ -207,34 +213,96 @@ class StageRunner:
     def __init__(
         self,
         ledger: StageLedger,
-        emit: Callable[[Stage, str, str], None],
+        emit: Callable[[Stage, str, str, int | None], None],
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self.ledger = ledger
         self.emit = emit
+        self.monotonic = monotonic
 
     def run(self, definitions: Iterable[StageDefinition]) -> None:
         for definition in definitions:
             stage = definition.stage
+            started = self.monotonic()
+            self.emit(stage, "running", "Stage started.", None)
             try:
                 already_satisfied = False if definition.always_run else bool(definition.probe())
                 if already_satisfied:
-                    self.emit(stage, "success", "Existing state passed the stage probe; no change was needed.")
                     self.ledger.complete(stage, probe_satisfied=True)
+                    duration_ms = max(0, round((self.monotonic() - started) * 1000))
+                    self.emit(
+                        stage,
+                        "success",
+                        "Stage completed from existing state; no change was needed.",
+                        duration_ms,
+                    )
                     continue
                 self.ledger.begin(stage)
-                self.emit(stage, "running", "Stage started.")
                 definition.apply()
                 if not bool(definition.probe()):
                     raise InstallerError("The post-apply stage probe did not pass.")
                 self.ledger.complete(stage)
-                self.emit(stage, "success", "Stage completed.")
+                duration_ms = max(0, round((self.monotonic() - started) * 1000))
+                self.emit(stage, "success", "Stage completed.", duration_ms)
             except StageFailure:
                 raise
             except Exception as error:  # noqa: BLE001 - converted to a safe stage failure
                 reason = sanitize_error(error)
                 self.ledger.fail(stage, reason)
-                self.emit(stage, "error", reason)
+                duration_ms = max(0, round((self.monotonic() - started) * 1000))
+                self.emit(stage, "error", reason, duration_ms)
                 raise StageFailure(stage, reason) from error
+
+
+def installation_summary(ledger_data: Mapping[str, Any]) -> dict[str, Any]:
+    """Return a complete, non-secret stage summary for manifests and diagnostics."""
+
+    raw_stages = ledger_data.get("stages")
+    stage_records = raw_stages if isinstance(raw_stages, Mapping) else {}
+    stages: dict[str, Any] = {}
+    allowed_statuses = {"pending", "running", "complete", "failed"}
+    for stage in STAGE_ORDER:
+        raw_record = stage_records.get(stage.value)
+        record = raw_record if isinstance(raw_record, Mapping) else {}
+        status = str(record.get("status", "pending"))
+        if status not in allowed_statuses:
+            status = "pending"
+        try:
+            attempts = max(0, int(record.get("attempts", 0)))
+        except (TypeError, ValueError):
+            attempts = 0
+        last_error = record.get("lastError")
+        stages[stage.value] = {
+            "status": status,
+            "attempts": attempts,
+            "startedAt": str(record["startedAt"])[:64] if record.get("startedAt") else None,
+            "completedAt": str(record["completedAt"])[:64] if record.get("completedAt") else None,
+            "lastError": sanitize_error(last_error) if last_error else None,
+            "probeSatisfied": bool(record.get("probeSatisfied", False)),
+        }
+
+    current_stage = ledger_data.get("currentStage")
+    known_stage_names = {stage.value for stage in STAGE_ORDER}
+    if current_stage not in known_stage_names:
+        current_stage = None
+    self_test = ledger_data.get("selfTest")
+    self_test_record = self_test if isinstance(self_test, Mapping) else {}
+    self_test_stage = stages[Stage.ENCRYPTION_SELF_TEST.value]
+    if self_test_record.get("status") == "success":
+        self_test_status = "pass"
+    elif self_test_stage["status"] == "failed":
+        self_test_status = "fail"
+    else:
+        self_test_status = "not-run"
+    checked_at = self_test_record.get("checkedAt")
+    return {
+        "currentStage": current_stage,
+        "stages": stages,
+        "lastSelfTest": {
+            "status": self_test_status,
+            "checkedAt": str(checked_at)[:64] if checked_at else None,
+        },
+    }
 
 
 @dataclass(frozen=True)
@@ -344,6 +412,39 @@ def evaluate_preflight(snapshot: PreflightSnapshot, required_wireguard_address: 
     )
 
 
+def listening_hosts(output: str, port: int) -> frozenset[str]:
+    """Extract local listener hosts from ``ss -H -ltn[p]`` output."""
+
+    suffix = f":{port}"
+    hosts: set[str] = set()
+    for line in output.splitlines():
+        for field in line.split():
+            if not field.endswith(suffix):
+                continue
+            host = field[: -len(suffix)]
+            if host.startswith("[") and host.endswith("]"):
+                host = host[1:-1]
+            if host:
+                hosts.add(host)
+            break
+    return frozenset(hosts)
+
+
+def listeners_are_loopback_only(output: str, port: int) -> bool:
+    hosts = listening_hosts(output, port)
+    if not hosts:
+        return False
+    for host in hosts:
+        if host == "*":
+            return False
+        try:
+            if not ipaddress.ip_address(host).is_loopback:
+                return False
+        except ValueError:
+            return False
+    return True
+
+
 _INTERFACE_NAME = re.compile(r"^[A-Za-z0-9_.-]{1,15}$")
 
 
@@ -409,7 +510,7 @@ done
 _SERVER_NAME = re.compile(r"^node-[0-9a-f]{12}\.zerovpn$")
 _TLS_PIN = re.compile(r"^sha256/[A-Za-z0-9+/]{43}=$")
 _PROHIBITED_MANIFEST_KEYS = re.compile(
-    r"(?i)(password|credential|private.?key|registration.?secret|access.?token|refresh.?token)"
+    r"(?i)(password|passwd|credential|secret|private.?key|access.?token|refresh.?token|authorization|bearer)"
 )
 
 
@@ -438,6 +539,8 @@ def validate_node_manifest(manifest: Mapping[str, Any]) -> None:
         "installedAt",
         "health",
         "ownerMatrixUserId",
+        "network",
+        "installation",
     }
     missing = sorted(required.difference(manifest.keys()))
     if missing:
@@ -480,6 +583,49 @@ def validate_node_manifest(manifest: Mapping[str, Any]) -> None:
     health = manifest.get("health")
     if not isinstance(health, Mapping) or health.get("status") not in {"healthy", "degraded", "unhealthy"}:
         errors.append("health.status is invalid")
+    network = manifest.get("network")
+    if not isinstance(network, Mapping):
+        errors.append("network must be an object")
+    else:
+        network_address = str(network.get("wireguardAddress", ""))
+        if parsed_url.hostname and network_address != parsed_url.hostname:
+            errors.append("matrixPrivateUrl does not match network.wireguardAddress")
+        if not _INTERFACE_NAME.fullmatch(str(network.get("wireguardInterface", ""))):
+            errors.append("network.wireguardInterface is invalid")
+        if network.get("matrixPort") != 443 or network.get("synapseLoopbackPort") != 8008:
+            errors.append("network Matrix listener ports are invalid")
+        if network.get("federationEnabled") is not False:
+            errors.append("network.federationEnabled must be false")
+    installation = manifest.get("installation")
+    if not isinstance(installation, Mapping) or not isinstance(installation.get("stages"), Mapping):
+        errors.append("installation stage state is missing")
+    else:
+        reported_stages = installation["stages"]
+        reported_stage_names = {str(name) for name in reported_stages}
+        unknown_stages = sorted(reported_stage_names.difference(stage.value for stage in STAGE_ORDER))
+        if unknown_stages:
+            errors.append("installation contains unknown stages: " + ", ".join(unknown_stages))
+        for stage in STAGE_ORDER:
+            stage_record = reported_stages.get(stage.value)
+            if not isinstance(stage_record, Mapping) or stage_record.get("status") not in {
+                "pending",
+                "running",
+                "complete",
+                "failed",
+            }:
+                errors.append(f"installation status is invalid for {stage.value}")
+        last_self_test = installation.get("lastSelfTest")
+        if not isinstance(last_self_test, Mapping) or last_self_test.get("status") not in {
+            "pass",
+            "fail",
+            "not-run",
+        }:
+            errors.append("installation.lastSelfTest.status is invalid")
+        current_stage = installation.get("currentStage")
+        if current_stage is not None and current_stage not in {stage.value for stage in STAGE_ORDER}:
+            errors.append("installation.currentStage is invalid")
+    if isinstance(health, Mapping) and not isinstance(health.get("checks"), Mapping):
+        errors.append("health.checks must be an object")
     prohibited = sorted(key for key in _walk_keys(manifest) if _PROHIBITED_MANIFEST_KEYS.search(key))
     if prohibited:
         errors.append("manifest contains prohibited secret-shaped fields: " + ", ".join(prohibited))

@@ -25,6 +25,60 @@ class AndroidSecretContractTests(unittest.TestCase):
         self.assertIn("secretStore.putSecret(credentialSecretKey", view_model)
         self.assertNotIn('.put("password"', view_model)
 
+    def test_private_chat_diagnostics_show_required_non_secret_fields(self) -> None:
+        diagnostics = (
+            REPO_ROOT
+            / "android/app/src/main/java/com/zerovpn/app/ui/screens/DiagnosticsScreen.kt"
+        ).read_text(encoding="utf-8")
+        for required in (
+            "Private Chat installed",
+            "PostgreSQL",
+            "Synapse",
+            "TLS endpoint",
+            "Matrix /versions",
+            "Owner account",
+            "Installation stages",
+            "Chat-only peer rules active",
+            "Last self-test",
+            "server_name",
+            "Private Matrix URL",
+            "TLS fingerprint",
+            "Installed versions",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, diagnostics)
+        for forbidden in ("ownerCredentialsSecretKey", 'getString("password")', "accessToken"):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, diagnostics)
+
+    def test_existing_provisioning_log_carries_chat_duration_status_and_retry_guidance(self) -> None:
+        view_model = (
+            REPO_ROOT
+            / "android/app/src/main/java/com/zerovpn/app/ui/provisioning/ProvisioningViewModel.kt"
+        ).read_text(encoding="utf-8")
+        screen = (
+            REPO_ROOT
+            / "android/app/src/main/java/com/zerovpn/app/ui/screens/ProvisioningScreen.kt"
+        ).read_text(encoding="utf-8")
+        for required in (
+            "duration=",
+            "Retry Private Chat to resume from the saved VM stage",
+            "Private Chat health checks:",
+            "server_name=",
+            "tls_fingerprint=",
+        ):
+            self.assertIn(required, view_model)
+        self.assertIn("PRIVATE CHAT PROVISIONING LOG", screen)
+        self.assertIn("event.technicalDetail", screen)
+
+    def test_apk_assets_stage_only_runtime_files_and_real_self_test(self) -> None:
+        build = (REPO_ROOT / "android/app/build.gradle.kts").read_text(encoding="utf-8")
+        self.assertIn('tasks.register<Sync>("generatePrivateChatAssets")', build)
+        self.assertIn('"tests/**"', build)
+        self.assertIn('tests/encrypted_self_test.py', build)
+        self.assertIn('srcDir(generatedPrivateChatAssets)', build)
+        self.assertNotIn('srcDir(rootProject.file("../server"))', build)
+
 
 if __name__ == "__main__":
     unittest.main()

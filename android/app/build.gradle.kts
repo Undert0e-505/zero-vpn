@@ -1,4 +1,5 @@
 import java.util.Properties
+import org.gradle.api.tasks.Sync
 
 plugins {
     alias(libs.plugins.android.application)
@@ -32,6 +33,23 @@ val enableHevNative = providers.gradleProperty("enableHevNative")
 val enableVolunteerDebug = providers.gradleProperty("enableVolunteerDebug")
     .map { it.equals("true", ignoreCase = true) }
     .getOrElse(false)
+val privateChatSource = rootProject.file("../server/private-chat")
+val generatedPrivateChatAssets = layout.buildDirectory.dir("generated/private-chat-assets")
+val generatePrivateChatAssets = tasks.register<Sync>("generatePrivateChatAssets") {
+    from(privateChatSource) {
+        exclude(
+            "tests/**",
+            "**/__pycache__/**",
+            "**/*.pyc",
+            "**/.pytest_cache/**",
+            "**/.runtime/**",
+        )
+    }
+    from(privateChatSource.resolve("tests/encrypted_self_test.py")) {
+        into("tests")
+    }
+    into(generatedPrivateChatAssets.map { it.dir("private-chat") })
+}
 
 android {
     namespace = "com.zerovpn.app"
@@ -114,14 +132,7 @@ android {
     // The Ubuntu installer is authored and tested under server/private-chat and
     // packaged as an APK asset. There is no runtime or build dependency on zero-chat.
     sourceSets.getByName("main").assets.apply {
-        srcDir(rootProject.file("../server"))
-        exclude(
-            "**/__pycache__/**",
-            "**/*.pyc",
-            "private-chat/tests/installer_test_imports.py",
-            "private-chat/tests/run-tests.ps1",
-            "private-chat/tests/test_*.py",
-        )
+        srcDir(generatedPrivateChatAssets)
     }
 
     packaging {
@@ -142,6 +153,10 @@ android {
             }
         }
     }
+}
+
+tasks.named("preBuild").configure {
+    dependsOn(generatePrivateChatAssets)
 }
 
 dependencies {
@@ -169,5 +184,7 @@ dependencies {
     implementation(libs.wireguard.tunnel)
     implementation(libs.tor.android)
     implementation(libs.zxing.core)
+    testImplementation("junit:junit:4.13.2")
+    testImplementation("org.json:json:20240303")
     debugImplementation(libs.androidx.compose.ui.tooling)
 }

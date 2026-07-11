@@ -16,19 +16,41 @@ No Zero Chat checkout is needed to build, test, or run this implementation.
 
 ## Host-side installer tests
 
-From the repository root:
+All Python dependencies must stay in repository-local virtual environments. Do
+not install pytest, matrix-nio, python-olm, or Synapse into the global
+`D:\Python310` interpreter.
+
+Create the ordinary unit-test environment once from the repository root:
 
 ```powershell
-& 'D:\Python310\python.exe' -B -m unittest discover -s server/private-chat/tests -p 'test_*.py' -v
+Set-Location D:\dev\zero-vpn
+& 'D:\Python310\python.exe' -m venv .venv-test
+& .\.venv-test\Scripts\python.exe -m pip install --disable-pip-version-check --requirement requirements-test.txt
 ```
 
-or:
+The exact normal test command is:
+
+```powershell
+& .\.venv-test\Scripts\python.exe -m pytest -v
+```
+
+Equivalently, after activating `.venv-test`, run exactly:
+
+```powershell
+python -m pytest -v
+```
+
+`pytest.ini` limits ordinary collection to `test_*.py` under
+`server/private-chat/tests`. The ad-hoc OCI harness and the real
+`encrypted_self_test.py` client are not ordinary unit tests and are therefore
+not imported during normal collection. The PowerShell helper uses the same
+isolated command:
 
 ```powershell
 & .\server\private-chat\tests\run-tests.ps1
 ```
 
-The suite covers:
+The ordinary suite covers:
 
 - probe-satisfied, failed, and resumed stage transitions;
 - atomic state and error redaction;
@@ -38,18 +60,66 @@ The suite covers:
 - future chat-only metadata/lateral/Internet denial structure;
 - node manifest schema, private URL, TLS pin, stable owner ID, and secret-field rejection;
 - the real encrypted self-test procedure contract, including both directions, raw ciphertext, plaintext absence, account deactivation, and room purge.
+- PostgreSQL/Synapse/nginx closed-service policy, exact listener scope parsing,
+  TLS identity requirements, Android manifest parsing/redaction, Diagnostics
+  field coverage, and VPN-preserving removal boundaries.
 
-The contract test is not a substitute for the real Synapse run. It ensures the shipped real-client script cannot be silently replaced by a mock procedure.
+The contract test is not a substitute for the real Synapse run. It ensures the
+shipped real-client script cannot be silently replaced by a mock procedure.
 
-## Android compile and APK asset check
+Run the applicable Python static syntax check with the ordinary environment:
+
+```powershell
+& .\.venv-test\Scripts\python.exe -m compileall -q server/private-chat
+```
+
+## Opt-in encrypted Matrix interoperability test
+
+Create a completely separate environment:
+
+```powershell
+Set-Location D:\dev\zero-vpn
+& 'D:\Python310\python.exe' -m venv .venv-interop
+& .\.venv-interop\Scripts\python.exe -m pip install --disable-pip-version-check --requirement requirements-interop.txt
+```
+
+The exact explicit integration command is:
+
+```powershell
+& .\.venv-interop\Scripts\python.exe -m pytest -v -rs server/private-chat/tests/interop_encrypted_matrix.py
+```
+
+On Windows this reports a clear skip: the real exchange is restricted to the
+disposable Ubuntu/Synapse node, and `requirements-interop.txt` intentionally
+does not attempt the unsupported Windows python-olm source build. On a prepared
+Ubuntu node the same requirements file installs `matrix-nio[e2e]` in
+`.venv-interop`; run the explicit file with root-readable disposable inputs:
+
+```bash
+python3 -m venv .venv-interop
+.venv-interop/bin/python -m pip install --disable-pip-version-check --requirement requirements-interop.txt
+export ZEROVPN_MATRIX_LOCAL_URL='http://127.0.0.1:8008'
+export ZEROVPN_MATRIX_OWNER_CREDENTIALS='/etc/zerovpn/private-chat/secrets/owner-matrix.json'
+export ZEROVPN_MATRIX_REGISTRATION_SECRET='/etc/zerovpn/private-chat/secrets/registration_shared_secret'
+sudo --preserve-env=ZEROVPN_MATRIX_LOCAL_URL,ZEROVPN_MATRIX_OWNER_CREDENTIALS,ZEROVPN_MATRIX_REGISTRATION_SECRET \
+  .venv-interop/bin/python -m pytest -v -rs server/private-chat/tests/interop_encrypted_matrix.py
+```
+
+Do not enable shell tracing, echo those variables, or use a non-disposable
+homeserver. Missing optional modules, a non-Linux host, non-root access, or
+missing input paths produces an explicit skip before `matrix-nio` is imported.
+
+## Android validation and APK asset check
 
 ```powershell
 Set-Location D:\dev\zero-vpn\android
 $env:JAVA_HOME = 'C:\Program Files\Java\jdk-21'
 $env:ANDROID_HOME = 'D:\dev\android-sdk'
 $env:ANDROID_SDK_ROOT = 'D:\dev\android-sdk'
-.\gradlew.bat :app:compileDebugKotlin
-.\gradlew.bat :app:assembleDebug
+.\gradlew.bat clean
+.\gradlew.bat test
+.\gradlew.bat lint
+.\gradlew.bat assembleDebug
 ```
 
 `android/app/build.gradle.kts` packages this repository's `server/private-chat` tree as APK assets. Verify the essential files after asset merge:
@@ -60,6 +130,34 @@ Get-ChildItem -Recurse app\build\intermediates\assets\debug\mergeDebugAssets\pri
 ```
 
 At minimum, the merged assets must contain `installer/install.py`, `installer/model.py`, Synapse templates/requirements, firewall unit template, and `tests/encrypted_self_test.py`.
+
+The source debug APK is:
+
+```text
+D:\dev\zero-vpn\android\app\build\outputs\apk\debug\app-debug.apk
+```
+
+The review/test copy and checksum are:
+
+```text
+D:\dev\zero-vpn\artifacts\zerovpn-private-chat-phase1-debug.apk
+D:\dev\zero-vpn\artifacts\zerovpn-private-chat-phase1-debug.apk.sha256
+```
+
+The checksum file contains lowercase SHA-256 hex followed by the APK filename.
+
+Code/build validation recorded on 2026-07-11:
+
+- normal pytest: 37 passed (plus 55 unittest subtests), no collection errors;
+- explicit Windows interop command: 1 accurately reported Ubuntu-only skip;
+- Python compileall, generated firewall shell syntax, tracked health shell syntax, and PowerShell parser checks: passed;
+- Gradle `clean`, `test`, `lint`, and `assembleDebug`: passed with JDK 21 and the SDK paths above;
+- merged APK asset tree: 16 runtime files, including the encrypted self-test and excluding host-only pytest/PowerShell runners;
+- APK size: 107,847,791 bytes;
+- APK SHA-256: `846e76df8600514055408305b71d97daca9c422b1303587d3d30f696a6371564`.
+
+These are host-side code/build results. The APK was not installed or exercised
+on Android, and no Oracle or Ubuntu VM runtime was used in this lane.
 
 ## Manual Ubuntu installer run
 

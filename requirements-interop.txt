@@ -1,0 +1,6 @@
+# Opt-in encrypted Matrix interoperability test. Install only inside .venv-interop.
+-r requirements-test.txt
+# python-olm is built with Unix make tooling and the real test runs only on the
+# disposable Ubuntu/Synapse node. Windows keeps the pytest runner and reports a
+# clear platform/dependency skip instead of attempting an unsupported build.
+matrix-nio[e2e]==0.25.2; sys_platform != "win32"

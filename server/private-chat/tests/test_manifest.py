@@ -8,6 +8,7 @@ from installer_test_imports import installer_model
 
 
 validate_node_manifest = installer_model.validate_node_manifest
+Stage = installer_model.Stage
 
 
 def valid_manifest() -> dict[str, object]:
@@ -25,6 +26,21 @@ def valid_manifest() -> dict[str, object]:
         "installedAt": "2026-07-10T00:00:00Z",
         "health": {"status": "healthy", "checks": {}},
         "ownerMatrixUserId": f"@owner:{server_name}",
+        "network": {
+            "wireguardInterface": "wg0",
+            "wireguardAddress": "10.66.66.1",
+            "matrixPort": 443,
+            "synapseLoopbackPort": 8008,
+            "federationEnabled": False,
+        },
+        "installation": {
+            "currentStage": Stage.COMPLETE.value,
+            "stages": {
+                stage.value: {"status": "complete"}
+                for stage in Stage
+            },
+            "lastSelfTest": {"status": "pass", "checkedAt": "2026-07-10T00:00:00Z"},
+        },
     }
 
 
@@ -47,14 +63,29 @@ class ManifestValidationTests(unittest.TestCase):
 
     def test_secret_shaped_fields_are_rejected_at_any_depth(self) -> None:
         manifest = valid_manifest()
-        manifest["owner"] = {"password": "must-never-be-in-node-json"}
-        with self.assertRaises(ValueError) as failure:
-            validate_node_manifest(manifest)
-        self.assertIn("prohibited", str(failure.exception))
+        for secret_key in ("password", "clientSecret", "accessToken", "private_key"):
+            candidate = valid_manifest()
+            candidate["owner"] = {secret_key: "must-never-be-in-node-json"}
+            with self.subTest(secret_key=secret_key), self.assertRaises(ValueError) as failure:
+                validate_node_manifest(candidate)
+            self.assertIn("prohibited", str(failure.exception))
 
     def test_owner_and_stable_server_name_must_match(self) -> None:
         manifest = valid_manifest()
         manifest["ownerMatrixUserId"] = "@owner:other.example"
+        with self.assertRaises(ValueError):
+            validate_node_manifest(manifest)
+
+    def test_private_url_must_match_declared_wireguard_network(self) -> None:
+        manifest = valid_manifest()
+        manifest["network"]["wireguardAddress"] = "10.77.0.1"  # type: ignore[index]
+        with self.assertRaises(ValueError) as failure:
+            validate_node_manifest(manifest)
+        self.assertIn("wireguardAddress", str(failure.exception))
+
+    def test_every_stage_and_self_test_status_must_be_valid(self) -> None:
+        manifest = valid_manifest()
+        manifest["installation"]["stages"][Stage.TLS.value]["status"] = "mystery"  # type: ignore[index]
         with self.assertRaises(ValueError):
             validate_node_manifest(manifest)
 

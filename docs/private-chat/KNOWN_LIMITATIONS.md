@@ -52,6 +52,7 @@ The owner-facing Android integration is operational status only. It stores the o
 
 - Phase 1 has only the existing owner/full-VPN peers. Future chat-only policy chains are generated but intentionally unattached until Phase 3 creates restricted `/32` peers.
 - Consequently, metadata/lateral/Internet-denial behavior for invitees is unit-tested at rule-generation level but not yet proven with a real invited peer.
+- Diagnostics therefore reports **Chat-only peer rules active: No** in Phase 1 while separately reporting whether both deny-policy chains are ready. This is expected, not evidence of a live restricted peer.
 - Existing owner/friend WireGuard peers keep their current full-exit permissions; Phase 1 does not silently reclassify them.
 - Host firewall policy uses iptables because that is ZeroVPN's current authoritative provisioning system. A deliberate nftables migration is outside this phase.
 
@@ -64,5 +65,31 @@ The owner-facing Android integration is operational status only. It stores the o
 
 ## Validation status
 
-Host-side state/preflight/firewall/manifest/self-test-contract tests and Android compilation run on Windows. A real Oracle account/VM was not available in this development environment, so fresh A1 installation, real package download, public-port scan, app owner-login verification on-device, reboot, interruption, and VPN-survival evidence still require the documented Ubuntu/Android test run before merge or release.
+The ordinary Python suite is isolated from optional integration dependencies
+and runs on Windows. The explicit encrypted Matrix integration entry point
+skips on Windows because the real matrix-nio/libolm exchange is restricted to
+the disposable Ubuntu/Synapse test node. This Windows skip is not passing E2EE
+runtime evidence.
+
+Host-side state/preflight/listener/firewall/manifest/service-policy,
+self-test-contract, Android parser/redaction, provisioning-log, diagnostics,
+and VPN-survival contract tests run on Windows. Android JVM tests, Gradle test,
+lint, and debug assembly are build-time evidence only.
+
+No Oracle login, Oracle VM creation/change, SSH connection to a real VM, or
+interactive Android run was performed in this code-preparation lane. The test
+APK has not been installed or exercised on a device here. In particular, the
+following remain untested until Aaron follows the operator packet:
+
+- fresh A1 provisioning and actual Free Tier/capacity behavior;
+- Ubuntu package installation and Synapse/PostgreSQL startup on aarch64;
+- real encrypted Matrix exchange against the installed Synapse;
+- public-port scan and WireGuard-only Matrix reachability;
+- Dev Mode stage log layout, scrolling, durations, and error guidance on-device;
+- Diagnostics refresh, copy-safe summary, and rendered health/stage/firewall fields on-device;
+- TLS-pinned owner login/logout through the active Android WireGuard route;
+- interruption/retry, reboot recovery, chat removal, and demonstrated WireGuard survival on the VM.
+
+Those runtime results must not be inferred from a successful build, unit test,
+lint result, APK checksum, or Windows integration skip.
 

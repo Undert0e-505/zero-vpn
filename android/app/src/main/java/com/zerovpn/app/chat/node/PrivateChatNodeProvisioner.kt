@@ -33,8 +33,11 @@ class PrivateChatNodeProvisioner(
             )
             if (execution.exitCode != 0) {
                 throw PrivateChatProvisioningException(
-                    failedStage = execution.failedStage ?: "PRIVATE_CHAT_UNKNOWN",
-                    message = execution.failureReason ?: "The Private Chat installer failed. Retry resumes from the saved stage.",
+                    failedStage = execution.failedStage.safePrivateChatStage(),
+                    message = redactPrivateChatDiagnostic(
+                        execution.failureReason
+                            ?: "The Private Chat installer failed. Retry resumes from the saved stage.",
+                    ),
                 )
             }
             val manifestCommand = runCommand(
@@ -87,6 +90,7 @@ class PrivateChatNodeProvisioner(
             "sudo python3 /opt/zerovpn/private-chat/installer/install.py health --json",
         )
         val healthPayloadIsValid = runCatching {
+            require(healthResult.stdout.length <= 256_000)
             val json = JSONObject(healthResult.stdout.trim())
             json.getString("status") in setOf("healthy", "degraded", "unhealthy")
         }.getOrDefault(false)
@@ -279,11 +283,20 @@ class PrivateChatNodeProvisioner(
             line.startsWith(eventPrefix) -> {
                 runCatching {
                     val json = JSONObject(line.removePrefix(eventPrefix))
+                    val stage = json.getString("stage")
+                    require(stage in PRIVATE_CHAT_STAGE_ORDER)
+                    val status = json.getString("status").lowercase()
+                    require(status in setOf("running", "success", "warning", "error"))
                     onEvent(
                         PrivateChatRemoteEvent(
-                            stage = json.getString("stage"),
-                            status = json.getString("status"),
-                            message = json.getString("message"),
+                            stage = stage,
+                            status = status,
+                            message = redactPrivateChatDiagnostic(json.getString("message")),
+                            durationMillis = if (json.has("durationMs") && !json.isNull("durationMs")) {
+                                json.optLong("durationMs").coerceAtLeast(0L)
+                            } else {
+                                null
+                            },
                         )
                     )
                 }
@@ -292,7 +305,8 @@ class PrivateChatNodeProvisioner(
 
             line.startsWith(failurePrefix) -> runCatching {
                 val json = JSONObject(line.removePrefix(failurePrefix))
-                json.getString("stage") to json.getString("reason")
+                json.getString("stage").safePrivateChatStage() to
+                    redactPrivateChatDiagnostic(json.getString("reason"))
             }.getOrNull()
 
             else -> null
@@ -339,4 +353,7 @@ class PrivateChatNodeProvisioner(
         val exitCode: Int,
         val stdout: String,
     )
+
+    private fun String?.safePrivateChatStage(): String =
+        this?.takeIf { it in PRIVATE_CHAT_STAGE_ORDER } ?: "PRIVATE_CHAT_UNKNOWN"
 }

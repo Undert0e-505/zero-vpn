@@ -44,6 +44,12 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import com.zerovpn.app.ui.provisioning.ProvisioningViewModel
 import com.zerovpn.app.ui.provisioning.OracleOperationDiagnostics
 import com.zerovpn.app.BuildConfig
+import com.zerovpn.app.chat.node.PRIVATE_CHAT_STAGE_ORDER
+import com.zerovpn.app.chat.node.PrivateChatInstallStatus
+import com.zerovpn.app.chat.node.PrivateChatNodeState
+import com.zerovpn.app.chat.node.PrivateChatSelfTestStatus
+import com.zerovpn.app.chat.node.PrivateChatStageStatus
+import com.zerovpn.app.chat.node.redactPrivateChatDiagnostic
 import com.zerovpn.app.friends.InviteSlot
 import com.zerovpn.app.friends.SharedExitProfile
 import com.zerovpn.app.ui.theme.Accent
@@ -55,6 +61,7 @@ import com.zerovpn.app.ui.theme.Surface
 import com.zerovpn.app.ui.theme.TextDim
 import com.zerovpn.app.ui.theme.TextPrimary
 import com.zerovpn.app.vpn.DnsLeakStatus
+import com.zerovpn.app.vpn.ConfiguredExit
 import com.zerovpn.app.vpn.ExitIpStatus
 import com.zerovpn.app.vpn.LastHandshakeStatus
 import com.zerovpn.app.vpn.ProviderSwitchDiagnostics
@@ -164,6 +171,23 @@ fun DiagnosticsScreen(
             onRefresh = { vpnViewModel.refreshUserDiagnostics(force = true) },
         )
 
+        Spacer(modifier = Modifier.height(12.dp))
+        PrivateChatDiagnosticsCard(
+            exit = diagnosticsExit,
+            onRefresh = {
+                diagnosticsExit?.privateChat?.let {
+                    provisioningViewModel.refreshPrivateChatHealth(context, diagnosticsExit.id)
+                }
+            },
+            onCopy = {
+                copyToClipboard(
+                    context,
+                    "ZeroVPN Private Chat diagnostics",
+                    privateChatDiagnosticsText(diagnosticsExit),
+                )
+            },
+        )
+
         if (isDevMode) {
             Spacer(modifier = Modifier.height(12.dp))
             WireGuardDebugCard(vpnDiagnostics)
@@ -226,6 +250,216 @@ fun DiagnosticsScreen(
             )
         }
     }
+}
+
+@Composable
+private fun PrivateChatDiagnosticsCard(
+    exit: ConfiguredExit?,
+    onRefresh: () -> Unit,
+    onCopy: () -> Unit,
+) {
+    val chat = exit?.privateChat
+    val installed = chat?.nodeId != null &&
+        !chat.serverName.isNullOrBlank() &&
+        !chat.matrixPrivateUrl.isNullOrBlank() &&
+        !chat.tlsSpkiSha256.isNullOrBlank()
+    val refreshEnabled = exit?.provider == com.zerovpn.app.vpn.ExitProvider.OCI && chat != null
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(Surface, RoundedCornerShape(8.dp))
+            .border(1.dp, Border, RoundedCornerShape(8.dp))
+            .padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        Text(
+            text = "PRIVATE CHAT NODE",
+            style = SectionTitleStyle,
+        )
+        Text(
+            text = "Non-secret node, health, firewall, and installation state. Passwords, tokens, keys, and Matrix credentials are never displayed or copied.",
+            fontSize = 13.sp,
+            color = TextDim,
+            lineHeight = 18.sp,
+        )
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            Button(
+                onClick = onRefresh,
+                enabled = refreshEnabled,
+                modifier = Modifier.weight(1f),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = Accent,
+                    contentColor = Bg,
+                    disabledContainerColor = Border,
+                    disabledContentColor = TextDim,
+                ),
+            ) {
+                Text("Refresh node", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+            }
+            OutlinedButton(
+                onClick = onCopy,
+                modifier = Modifier.weight(1f),
+                colors = ButtonDefaults.outlinedButtonColors(contentColor = TextPrimary),
+            ) {
+                Text("Copy summary", fontSize = 12.sp, fontWeight = FontWeight.Medium)
+            }
+        }
+
+        DebugValue("Selected exit", exit?.name ?: "N/A")
+        DebugValue(
+            "Private Chat installed",
+            when {
+                installed -> "Yes"
+                chat?.status == PrivateChatInstallStatus.INSTALLING -> "No - installation in progress"
+                chat != null -> "No - incomplete or failed"
+                else -> "No"
+            },
+        )
+        DebugValue("Installation status", chat?.status?.name?.lowercase() ?: "not installed")
+        DebugValue("Node health", chat?.healthStatus ?: "not checked")
+        DebugValue("PostgreSQL", postgresHealthText(chat))
+        DebugValue("Synapse", synapseHealthText(chat))
+        DebugValue("TLS endpoint", healthCheckText(chat?.healthChecks?.tlsEndpointOk))
+        DebugValue("Matrix /versions", healthCheckText(chat?.healthChecks?.matrixVersionsOk))
+        DebugValue("Owner account", ownerAccountText(chat))
+        DebugValue("Private firewall", privateFirewallText(chat))
+        DebugValue("Chat-only peer rules active", chatOnlyRulesText(chat))
+        DebugValue("Last self-test", selfTestText(chat))
+        DebugValue("Last health check", chat?.healthCheckedAt ?: "not checked")
+
+        DebugBlock("server_name", chat?.serverName ?: "N/A")
+        DebugBlock("Private Matrix URL", chat?.matrixPrivateUrl ?: "N/A")
+        DebugBlock("TLS fingerprint (SPKI SHA-256)", chat?.tlsSpkiSha256 ?: "N/A")
+        DebugBlock(
+            "Installed versions",
+            chat?.componentVersions
+                ?.toSortedMap()
+                ?.entries
+                ?.joinToString("\n") { (name, version) -> "$name=$version" }
+                ?.ifBlank { "N/A" }
+                ?: "N/A",
+        )
+        DebugBlock("Installation stages", privateChatStagesText(chat))
+        chat?.lastError?.takeIf { it.isNotBlank() }?.let { error ->
+            Text(
+                text = "Private Chat warning: ${redactPrivateChatDiagnostic(error)}",
+                fontSize = 12.sp,
+                color = DiagnosticsWarning,
+                lineHeight = 17.sp,
+            )
+        }
+        chat?.lastUpdatedAt?.let {
+            DebugValue("App state updated", DateFormat.getDateTimeInstance().format(Date(it)))
+        }
+    }
+}
+
+private fun postgresHealthText(chat: PrivateChatNodeState?): String = when {
+    chat == null -> "Not installed"
+    chat.healthChecks.postgresqlProcessOk == false || chat.healthChecks.postgresqlConnectionOk == false -> "Fail"
+    chat.healthChecks.postgresqlProcessOk == true && chat.healthChecks.postgresqlConnectionOk == true -> "Pass"
+    else -> "Not checked"
+}
+
+private fun healthCheckText(value: Boolean?): String = when (value) {
+    true -> "Pass"
+    false -> "Fail"
+    null -> "Not checked"
+}
+
+private fun synapseHealthText(chat: PrivateChatNodeState?): String = when {
+    chat == null -> "Not installed"
+    chat.healthChecks.synapseProcessOk == false || chat.healthChecks.synapseLoopbackListenerOk == false -> "Fail"
+    chat.healthChecks.synapseProcessOk == true && chat.healthChecks.synapseLoopbackListenerOk == true -> "Pass - loopback only"
+    chat.healthChecks.synapseProcessOk == true -> "Pass - listener not checked"
+    else -> "Not checked"
+}
+
+private fun ownerAccountText(chat: PrivateChatNodeState?): String = when (chat?.healthChecks?.ownerAccountExists) {
+    true -> "Exists"
+    false -> "Missing"
+    null -> if (chat == null) "Not installed" else "Not checked"
+}
+
+private fun privateFirewallText(chat: PrivateChatNodeState?): String = when {
+    chat == null -> "Not installed"
+    chat.healthChecks.firewallServiceActive == false || chat.healthChecks.privateFirewallPolicyActive == false -> "Fail"
+    chat.healthChecks.firewallServiceActive == true && chat.healthChecks.privateFirewallPolicyActive == true -> "Active"
+    else -> "Not checked"
+}
+
+private fun chatOnlyRulesText(chat: PrivateChatNodeState?): String = when {
+    chat == null -> "Not installed"
+    chat.healthChecks.chatOnlyPeerRulesActive == true -> "Yes"
+    chat.healthChecks.chatOnlyPolicyChainsReady == true -> "No - policy ready; Phase 1 has no chat-only peers"
+    chat.healthChecks.chatOnlyPolicyChainsReady == false -> "No - policy check failed"
+    else -> "Not checked"
+}
+
+private fun selfTestText(chat: PrivateChatNodeState?): String = when (chat?.lastSelfTestStatus) {
+    PrivateChatSelfTestStatus.PASS -> "Pass${chat.lastSelfTestCheckedAt?.let { " - $it" }.orEmpty()}"
+    PrivateChatSelfTestStatus.FAIL -> "Fail${chat.lastSelfTestCheckedAt?.let { " - $it" }.orEmpty()}"
+    PrivateChatSelfTestStatus.NOT_RUN -> "Not run"
+    null -> "Not installed"
+}
+
+private fun privateChatStagesText(chat: PrivateChatNodeState?): String {
+    if (chat == null) return "No Private Chat installation state."
+    return PRIVATE_CHAT_STAGE_ORDER.joinToString("\n") { stageName ->
+        val recorded = chat.stageStates[stageName]
+        val status = recorded?.status ?: when {
+            chat.currentStage == stageName && chat.status == PrivateChatInstallStatus.FAILED -> PrivateChatStageStatus.FAILED
+            chat.currentStage == stageName && chat.status == PrivateChatInstallStatus.INSTALLING -> PrivateChatStageStatus.RUNNING
+            else -> PrivateChatStageStatus.PENDING
+        }
+        buildString {
+            append(stageName.removePrefix("PRIVATE_CHAT_").lowercase().replace('_', ' '))
+            append(": ").append(status.name.lowercase())
+            recorded?.let { stage ->
+                append(" (attempts=").append(stage.attempts)
+                if (stage.probeSatisfied) append(", resumed/probe")
+                append(")")
+                stage.lastError?.takeIf { it.isNotBlank() }?.let { error ->
+                    append(" - ").append(redactPrivateChatDiagnostic(error, 180))
+                }
+            }
+        }
+    }
+}
+
+private fun privateChatDiagnosticsText(exit: ConfiguredExit?): String {
+    val chat = exit?.privateChat
+    val installed = chat?.nodeId != null && !chat.serverName.isNullOrBlank()
+    return buildString {
+        appendLine("ZeroVPN Private Chat diagnostics")
+        appendLine("selectedExit=${exit?.name ?: "N/A"}")
+        appendLine("installed=${if (installed) "yes" else "no"}")
+        appendLine("installStatus=${chat?.status?.name?.lowercase() ?: "not-installed"}")
+        appendLine("health=${chat?.healthStatus ?: "not-checked"}")
+        appendLine("postgresql=${postgresHealthText(chat)}")
+        appendLine("synapse=${synapseHealthText(chat)}")
+        appendLine("tlsEndpoint=${healthCheckText(chat?.healthChecks?.tlsEndpointOk)}")
+        appendLine("matrixVersions=${healthCheckText(chat?.healthChecks?.matrixVersionsOk)}")
+        appendLine("ownerAccount=${ownerAccountText(chat)}")
+        appendLine("privateFirewall=${privateFirewallText(chat)}")
+        appendLine("chatOnlyPeerRulesActive=${chat?.healthChecks?.chatOnlyPeerRulesActive ?: false}")
+        appendLine("lastSelfTest=${selfTestText(chat)}")
+        appendLine("server_name=${chat?.serverName ?: "N/A"}")
+        appendLine("privateUrl=${chat?.matrixPrivateUrl ?: "N/A"}")
+        appendLine("tlsFingerprint=${chat?.tlsSpkiSha256 ?: "N/A"}")
+        appendLine("versions=")
+        chat?.componentVersions?.toSortedMap()?.forEach { (name, version) ->
+            appendLine("  $name=$version")
+        }
+        appendLine("stages=")
+        privateChatStagesText(chat).lineSequence().forEach { appendLine("  $it") }
+        chat?.lastError?.takeIf { it.isNotBlank() }?.let {
+            appendLine("lastError=${redactPrivateChatDiagnostic(it)}")
+        }
+    }.trimEnd()
 }
 
 @Composable
