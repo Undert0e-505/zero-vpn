@@ -36,6 +36,7 @@ import com.zerovpn.app.friends.SharedExitProfile
 import com.zerovpn.app.friends.SharedExitSource
 import com.zerovpn.app.friends.sha256
 import com.zerovpn.app.oci.OciProvisioner
+import com.zerovpn.app.oci.VmLaunchFailure
 import com.zerovpn.app.oci.OciRegion
 import com.zerovpn.app.oci.OciRegions
 import com.zerovpn.app.storage.SecureSecretStore
@@ -80,7 +81,33 @@ data class OracleOperationDiagnostics(
     val targetDisplayName: String? = null,
     val authState: String = "missing",
     val lastError: String? = null,
+    // Capacity-fallback fields (private-chat provisioning only)
+    val chatRequestedShape: String = "NOT TESTD",
+    val chatPreferredConfig: String = "NOT TESTED",
+    val chatCompactFallback: String = "NOT TESTED",
+    val chatLastAttemptedConfig: String = "NOT TESTED",
+    val chatLastLaunchResult: String = "NOT TESTED",
+    val chatInstanceCreated: String = "NOT TESTED",
+    val chatCleanupRequired: String = "NOT TESTED",
 )
+
+internal fun classifyProvisioningFailure(
+    error: Throwable,
+    events: List<ProvisioningEvent> = emptyList(),
+    currentPhase: Phase? = null,
+): Pair<Phase, String> {
+    when (val launchFailure = OciProvisioner.classifyLaunchFailure(error)) {
+        is VmLaunchFailure.OutOfHostCapacity -> return Phase.VM_LAUNCH to launchFailure.message
+        is VmLaunchFailure.Other -> return Phase.VM_LAUNCH to launchFailure.message
+        null -> Unit
+    }
+
+    val failedPhase = events.lastOrNull { it.status == Status.ERROR && it.phase != Phase.DONE }?.phase
+        ?: currentPhase
+        ?: Phase.AUTH
+    val displayMessage = error.message ?: error.javaClass.simpleName
+    return failedPhase to displayMessage
+}
 
 class ProvisioningViewModel : ViewModel() {
 
@@ -158,6 +185,11 @@ class ProvisioningViewModel : ViewModel() {
     private var homeRegion: String? = null
     private var apiKeyUserOcid: String? = null
     private var apiKeyTenancyOcid: String? = null
+    // Capacity-fallback tracking for Diagnostics
+    internal var chatLastAttemptedConfig: String = "NOT TESTED"
+    internal var chatLastLaunchResult: String = "NOT TESTED"
+    internal var chatInstanceCreated: String = "NOT TESTED"
+    internal var chatCleanupRequired: String = "NOT TESTED"
     private var apiKeyFingerprint: String? = null
     private var pendingProvisionExitId: String? = null
     private var provisioningJob: Job? = null
@@ -481,6 +513,7 @@ class ProvisioningViewModel : ViewModel() {
             failedOracleOperation.type != OracleOperationType.NONE -> failedOracleOperation
             else -> PendingOracleOperation.None
         }
+        val chatRequested = _privateChatRequested.value
         _oracleOperationDiagnostics.value = OracleOperationDiagnostics(
             pendingOperation = pendingOracleOperation.type,
             failedOperation = failedOracleOperation.type,
@@ -490,6 +523,13 @@ class ProvisioningViewModel : ViewModel() {
             targetDisplayName = operation.displayName,
             authState = if (authResult == null) "missing" else "present",
             lastError = lastOracleOperationError,
+            chatRequestedShape = if (chatRequested) "VM.Standard.A1.Flex" else "NOT TESTED",
+            chatPreferredConfig = if (chatRequested) "1 OCPU / 6 GB" else "NOT TESTED",
+            chatCompactFallback = if (chatRequested) "1 OCPU / 4 GB" else "NOT TESTED",
+            chatLastAttemptedConfig = chatLastAttemptedConfig,
+            chatLastLaunchResult = chatLastLaunchResult,
+            chatInstanceCreated = chatInstanceCreated,
+            chatCleanupRequired = chatCleanupRequired,
         )
     }
 
@@ -1616,6 +1656,14 @@ class ProvisioningViewModel : ViewModel() {
                 persistState()
                 return
             }
+            // Reset capacity-fallback diagnostics for a fresh provisioning run
+            if (_privateChatRequested.value) {
+                chatLastAttemptedConfig = "1 OCPU / 6 GB"
+                chatLastLaunchResult = "NOT TESTED"
+                chatInstanceCreated = "NOT TESTED"
+                chatCleanupRequired = "NOT TESTED"
+                refreshOracleOperationDiagnostics()
+            }
             val uiSelectedRegion = _selectedOracleRegion.value
             val persistedRegion = homeRegion
             val authBootstrapRegion = uiSelectedRegion ?: persistedRegion ?: AUTH_BOOTSTRAP_REGION
@@ -1687,22 +1735,42 @@ class ProvisioningViewModel : ViewModel() {
             doProvision(context, prov)
 
         } catch (e: Exception) {
-            setFailedOracleOperation(PendingOracleOperation.Provision, e.message)
-            val lastSuccess = when (_currentPhase.value) {
+            val (failedPhase, errorMessage) = classifyProvisioningFailure(
+                error = e,
+                events = _events.value,
+                currentPhase = _currentPhase.value,
+            )
+            // Update capacity-fallback diagnostics tracking
+            val launchFailure = OciProvisioner.classifyLaunchFailure(e)
+            if (launchFailure != null) {
+                chatLastLaunchResult = when (launchFailure) {
+                    is VmLaunchFailure.OutOfHostCapacity -> "FAIL"
+                    is VmLaunchFailure.Other -> "FAIL"
+                }
+                chatInstanceCreated = "No"
+                chatCleanupRequired = if (resourceIds?.instanceId != null) "WARNING" else "No"
+            } else if (failedPhase == Phase.AUTH || failedPhase == Phase.API_KEY) {
+                chatLastLaunchResult = "NOT TESTED"
+                chatInstanceCreated = "No"
+                chatCleanupRequired = "No"
+            }
+            refreshOracleOperationDiagnostics()
+            setFailedOracleOperation(PendingOracleOperation.Provision, errorMessage)
+            val lastSuccess = when (failedPhase) {
                 Phase.AUTH -> null
                 Phase.API_KEY -> Phase.AUTH
                 Phase.NETWORK -> Phase.API_KEY
                 Phase.VM_LAUNCH -> Phase.NETWORK
                 Phase.WAIT_SSH -> Phase.VM_LAUNCH
                 Phase.WIREGUARD -> Phase.WAIT_SSH
-                else -> if (_currentPhase.value?.isPrivateChat == true) Phase.WIREGUARD else null
+                else -> if (failedPhase.isPrivateChat) Phase.WIREGUARD else null
             }
             _state.value = ProvisioningState.Failure(
-                failedPhase = _currentPhase.value ?: Phase.AUTH,
+                failedPhase = failedPhase,
                 lastSuccessPhase = lastSuccess,
-                errorMessage = e.message,
+                errorMessage = errorMessage,
             )
-            if (_currentPhase.value == Phase.AUTH) {
+            if (failedPhase == Phase.AUTH) {
                 _oracleOnboardingState.value = OracleOnboardingState.AuthFailed
             }
             persistState()
@@ -1728,11 +1796,23 @@ class ProvisioningViewModel : ViewModel() {
 
             doProvision(context, prov)
         } catch (e: Exception) {
-            setFailedOracleOperation(PendingOracleOperation.Provision, e.message)
+            val (failedPhase, errorMessage) = classifyProvisioningFailure(
+                error = e,
+                events = _events.value,
+                currentPhase = _currentPhase.value,
+            )
+            val launchFailure = OciProvisioner.classifyLaunchFailure(e)
+            if (launchFailure != null) {
+                chatLastLaunchResult = "FAIL"
+                chatInstanceCreated = "No"
+                chatCleanupRequired = if (resourceIds?.instanceId != null) "WARNING" else "No"
+            }
+            refreshOracleOperationDiagnostics()
+            setFailedOracleOperation(PendingOracleOperation.Provision, errorMessage)
             _state.value = ProvisioningState.Failure(
-                failedPhase = _currentPhase.value ?: Phase.AUTH,
+                failedPhase = failedPhase,
                 lastSuccessPhase = null,
-                errorMessage = e.message,
+                errorMessage = errorMessage,
             )
             persistState()
         } finally {
@@ -1817,13 +1897,29 @@ class ProvisioningViewModel : ViewModel() {
             )
             persistState()
         } catch (e: Exception) {
-            setFailedOracleOperation(PendingOracleOperation.Provision, e.message)
-            _state.value = ProvisioningState.Failure(
-                failedPhase = _currentPhase.value ?: Phase.AUTH,
-                lastSuccessPhase = null,
-                errorMessage = e.message,
+            val (failedPhase, errorMessage) = classifyProvisioningFailure(
+                error = e,
+                events = _events.value,
+                currentPhase = _currentPhase.value,
             )
-            if (_currentPhase.value == Phase.AUTH) {
+            val launchFailure = OciProvisioner.classifyLaunchFailure(e)
+            if (launchFailure != null) {
+                chatLastLaunchResult = "FAIL"
+                chatInstanceCreated = "No"
+                chatCleanupRequired = if (resourceIds?.instanceId != null) "WARNING" else "No"
+            } else if (failedPhase == Phase.AUTH || failedPhase == Phase.API_KEY) {
+                chatLastLaunchResult = "NOT TESTED"
+                chatInstanceCreated = "No"
+                chatCleanupRequired = "No"
+            }
+            refreshOracleOperationDiagnostics()
+            setFailedOracleOperation(PendingOracleOperation.Provision, errorMessage)
+            _state.value = ProvisioningState.Failure(
+                failedPhase = failedPhase,
+                lastSuccessPhase = null,
+                errorMessage = errorMessage,
+            )
+            if (failedPhase == Phase.AUTH) {
                 _oracleOnboardingState.value = OracleOnboardingState.AuthFailed
             }
             persistState()

@@ -8,6 +8,35 @@ Private Chat is an optional workload installed after ZeroVPN has created, verifi
 
 If Private Chat is not selected, ZeroVPN keeps the existing `VM.Standard.E2.1.Micro` provisioning path and does not upload or run the chat installer. If it is selected, ZeroVPN requests `VM.Standard.A1.Flex` with 1 OCPU, 6 GB RAM, and a 50 GB boot volume.
 
+### A1 capacity fallback
+
+Oracle Free Tier A1 host capacity is not guaranteed. When the preferred 6 GB
+launch attempt receives an HTTP 500 response with `code: InternalError` and
+`message` containing `Out of host capacity`, ZeroVPN automatically retries the
+instance launch with a compact 4 GB configuration. The fallback is precise:
+
+- **Preferred:** `VM.Standard.A1.Flex` — 1 OCPU / 6 GB
+- **Compact fallback:** `VM.Standard.A1.Flex` — 1 OCPU / 4 GB
+- **Trigger:** HTTP 500 + response body containing both `InternalError` and
+  `Out of host capacity` (case-insensitive)
+- **No fallback for:** 401, 403, 429, 400, network timeouts, IOException,
+  generic 500 without the capacity message, or any other non-capacity failure
+- **No further fallback:** E2.1.Micro, paid shapes, increased OCPU, or any
+  non-Free-Tier-eligible shape is never attempted
+- **Final failure:** If the 4 GB attempt also returns out-of-host-capacity, the
+  UI displays a clear capacity error attributed to **VM launch**, not **API key
+  setup**
+- **Retry:** A user-initiated retry starts fresh with the preferred 6 GB
+  configuration. Authentication and API-key state from the previous run are
+  preserved when the retry begins from the saved Oracle session
+- **Cleanup:** If both attempts fail, no instance OCID is created, so no
+  instance termination is requested. Network resources (VCN, subnet, security
+  list, internet gateway) that were already created are cleaned up normally
+
+The stage attribution fix ensures that capacity failures are always reported
+as **Failed at: VM launch**, not as **Failed at: API key setup**, which was the
+original bug observed during the first owner test.
+
 The product wording is deliberately limited:
 
 > Requested resources appear Free Tier eligible. Oracle, not ZeroVPN, determines actual billing. Review the Oracle cost estimate before creating the VM.

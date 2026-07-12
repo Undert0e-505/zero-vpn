@@ -156,6 +156,18 @@ Code/build validation recorded on 2026-07-11:
 - APK size: 107,847,791 bytes;
 - APK SHA-256: `846e76df8600514055408305b71d97daca9c422b1303587d3d30f696a6371564`.
 
+Capacity-fallback validation recorded on 2026-07-12:
+
+- Android unit tests: 22 total (3 existing PrivateChatNodeTest + 15 VmLaunchCapacityFallbackTest + 4 ProvisioningFailureClassificationTest), all pass;
+- Gradle `test`, `lint`, and `assembleDebug`: passed after capacity-fallback changes;
+- The capacity classifier tests cover: real OCI response, case variation,
+  trailing period, generic InternalError without capacity message,
+  QuotaExceeded without InternalError, 200/401/403/429/400/500 classification,
+  and final failure classification;
+- The failure classification tests cover: capacity error → VM_LAUNCH phase,
+  generic error → event-based phase detection, clean capacity message display,
+  and auth error → AUTH phase.
+
 These are host-side code/build results. The APK was not installed or exercised
 on Android, and no Oracle or Ubuntu VM runtime was used in this lane.
 

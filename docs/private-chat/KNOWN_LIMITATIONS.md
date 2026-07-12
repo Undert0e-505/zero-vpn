@@ -21,6 +21,7 @@ The owner-facing Android integration is operational status only. It stores the o
 - Private Chat must be selected while creating a new Oracle exit. There is no general **Enable on existing VM** UI yet, although the VM installer itself is idempotent.
 - Supported targets are Ubuntu 22.04/24.04 on aarch64 or x86_64.
 - The requested A1 shape is 1 OCPU/6 GB/50 GB. Capacity and Free Tier eligibility are not guaranteed, and Oracle determines billing.
+- When A1 host capacity is exhausted, ZeroVPN automatically retries with a compact 4 GB configuration. If both 6 GB and 4 GB attempts fail with `Out of host capacity`, provisioning stops with a clear capacity error. No micro or paid-shape fallback is attempted. The capacity fallback triggers only on a precise HTTP 500 `InternalError` / `Out of host capacity` response — ambiguous transport failures, authentication errors, quota failures, or generic 500s do not trigger the fallback.
 - No VM resize/recreate occurs after a resource warning.
 - The existing OCI provisioning operation still has the Phase 0 limitations around incremental cloud-resource persistence before WireGuard succeeds. Chat begins only after a durable working exit exists, so those limitations do not expand into the chat workload.
 - SSH uses the existing ZeroVPN JSch bootstrap behavior with strict host-key checking disabled. The private TLS pin is established through that channel; stronger SSH host authentication remains required.

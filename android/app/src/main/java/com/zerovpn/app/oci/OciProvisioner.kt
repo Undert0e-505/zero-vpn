@@ -22,10 +22,44 @@ import org.json.JSONObject
 import com.zerovpn.app.ui.provisioning.Phase
 import com.zerovpn.app.ui.provisioning.ProvisioningEvent
 import com.zerovpn.app.ui.provisioning.Status
+import java.io.IOException
 import java.net.URLEncoder
 import java.security.interfaces.RSAPublicKey
 import java.util.concurrent.TimeUnit
 
+sealed class VmLaunchFailure {
+    data class OutOfHostCapacity(val message: String) : VmLaunchFailure()
+    data class Other(val message: String) : VmLaunchFailure()
+}
+
+class VmLaunchFailureException(val failure: VmLaunchFailure) : Exception(
+    when (failure) {
+        is VmLaunchFailure.OutOfHostCapacity -> failure.message
+        is VmLaunchFailure.Other -> failure.message
+    },
+)
+
+internal enum class LaunchAttemptResult { SUCCESS, RETRY_4GB, FAIL_CAPACITY, FAIL_OTHER }
+
+internal fun isOutOfHostCapacity(responseBody: String): Boolean =
+    responseBody.contains("InternalError", ignoreCase = true) &&
+        responseBody.contains("Out of host capacity", ignoreCase = true)
+
+internal fun classifyLaunchResponse(code: Int, body: String): LaunchAttemptResult {
+    return when {
+        code in 200..299 -> LaunchAttemptResult.SUCCESS
+        code == 500 && isOutOfHostCapacity(body) -> LaunchAttemptResult.RETRY_4GB
+        else -> LaunchAttemptResult.FAIL_OTHER
+    }
+}
+
+internal fun classifyFinalFailure(code: Int, body: String): LaunchAttemptResult {
+    return when {
+        code in 200..299 -> LaunchAttemptResult.SUCCESS
+        code == 500 && isOutOfHostCapacity(body) -> LaunchAttemptResult.FAIL_CAPACITY
+        else -> LaunchAttemptResult.FAIL_OTHER
+    }
+}
 /**
  * Real OCI provisioner — ports the Python state_machine.py to Kotlin.
  *
@@ -161,6 +195,12 @@ class OciProvisioner(
         val keys: WireGuardClientKeys,
     )
 
+    private data class OciPostResponse(
+        val code: Int,
+        val body: String,
+        val isSuccessful: Boolean,
+    )
+
     data class ResourceIds(
         var vcnId: String? = null,
         var slId: String? = null,
@@ -177,6 +217,16 @@ class OciProvisioner(
             phase = phase,
             status = status,
             message = message,
+        ))
+    }
+
+    private suspend fun emitDeveloperOnly(phase: Phase, status: Status, message: String) {
+        _events.emit(ProvisioningEvent(
+            timestamp = System.currentTimeMillis(),
+            phase = phase,
+            status = status,
+            message = message,
+            developerOnly = true,
         ))
     }
 
@@ -893,40 +943,130 @@ class OciProvisioner(
         }
 
         // Launch instance
-        if (privateChatRequested) {
+        val launchPath = "/20160918/instances"
+        val launchResp = if (privateChatRequested) {
             emit(
                 Phase.VM_LAUNCH,
                 Status.RUNNING,
                 "Private Chat requested: using VM.Standard.A1.Flex with 1 OCPU and 6 GB RAM. " +
                     "Requested resources appear Free Tier eligible. Oracle, not ZeroVPN, determines actual billing.",
             )
-        }
-        emit(Phase.VM_LAUNCH, Status.RUNNING, "Launching instance ($shape)...")
-        val launchBody = JSONObject()
-            .put("availabilityDomain", adName)
-            .put("compartmentId", cid)
-            .put("displayName", "zerovpn-exit-01")
-            .put("shape", shape)
-            .put("subnetId", rids.subnetId)
-            .put("sourceDetails", JSONObject()
-                .put("imageId", imageId)
-                .put("bootVolumeSizeInGBs", 50)
-                .put("sourceType", "image"))
-            .put("createVnicDetails", JSONObject()
-                .put("subnetId", rids.subnetId)
-                .put("assignPublicIp", true))
-            .put("metadata", JSONObject().put("ssh_authorized_keys", sshPublicKey))
-        if (privateChatRequested) {
-            launchBody.put(
-                "shapeConfig",
-                JSONObject()
-                    .put("ocpus", 1)
-                    .put("memoryInGBs", 6),
-            )
-        }
-        val launchBodyJson = launchBody.toString()
 
-        val launchResp = ociPost(auth, iaasHost, "/20160918/instances", launchBodyJson)
+            fun buildLaunchBody(memoryInGBs: Int): String = JSONObject()
+                .put("availabilityDomain", adName)
+                .put("compartmentId", cid)
+                .put("displayName", "zerovpn-exit-01")
+                .put("shape", shape)
+                .put("subnetId", rids.subnetId)
+                .put("sourceDetails", JSONObject()
+                    .put("imageId", imageId)
+                    .put("bootVolumeSizeInGBs", 50)
+                    .put("sourceType", "image"))
+                .put("createVnicDetails", JSONObject()
+                    .put("subnetId", rids.subnetId)
+                    .put("assignPublicIp", true))
+                .put("metadata", JSONObject().put("ssh_authorized_keys", sshPublicKey))
+                .put(
+                    "shapeConfig",
+                    JSONObject()
+                        .put("ocpus", 1)
+                        .put("memoryInGBs", memoryInGBs),
+                )
+                .toString()
+
+            suspend fun postLaunch(memoryInGBs: Int, attempt: Int): OciPostResponse {
+                emit(
+                    Phase.VM_LAUNCH,
+                    Status.RUNNING,
+                    "Launching Private Chat Node VM Attempt $attempt: VM.Standard.A1.Flex — 1 OCPU / $memoryInGBs GB",
+                )
+                return ociPostWithResponse(auth, iaasHost, launchPath, buildLaunchBody(memoryInGBs))
+            }
+
+            val firstAttempt = try {
+                postLaunch(memoryInGBs = 6, attempt = 1)
+            } catch (e: IOException) {
+                throw e
+            }
+            when (classifyLaunchResponse(firstAttempt.code, firstAttempt.body)) {
+                LaunchAttemptResult.SUCCESS -> JSONObject(firstAttempt.body)
+                LaunchAttemptResult.RETRY_4GB -> {
+                    if (isDevMode) {
+                        emitDeveloperOnly(
+                            Phase.VM_LAUNCH,
+                            Status.RUNNING,
+                            "OCI launch error response (6 GB): HTTP ${firstAttempt.code} ${firstAttempt.body}",
+                        )
+                    }
+                    emit(Phase.VM_LAUNCH, Status.RUNNING, "Oracle reported no A1 host capacity")
+                    emit(Phase.VM_LAUNCH, Status.RUNNING, "Retrying compact configuration")
+                    val secondAttempt = try {
+                        postLaunch(memoryInGBs = 4, attempt = 2)
+                    } catch (e: IOException) {
+                        throw e
+                    }
+                    when (classifyFinalFailure(secondAttempt.code, secondAttempt.body)) {
+                        LaunchAttemptResult.SUCCESS -> JSONObject(secondAttempt.body)
+                        LaunchAttemptResult.FAIL_CAPACITY -> {
+                            if (isDevMode) {
+                                emitDeveloperOnly(
+                                    Phase.VM_LAUNCH,
+                                    Status.RUNNING,
+                                    "OCI launch error response (4 GB): HTTP ${secondAttempt.code} ${secondAttempt.body}",
+                                )
+                            }
+                            val capacityMessage = "Oracle has no A1 host capacity in your home region right now. Try again later, or try a different region."
+                            emit(Phase.VM_LAUNCH, Status.ERROR, capacityMessage)
+                            throw VmLaunchFailureException(VmLaunchFailure.OutOfHostCapacity(capacityMessage))
+                        }
+                        LaunchAttemptResult.FAIL_OTHER -> {
+                            if (isDevMode) {
+                                emitDeveloperOnly(
+                                    Phase.VM_LAUNCH,
+                                    Status.RUNNING,
+                                    "OCI launch error response (4 GB): HTTP ${secondAttempt.code} ${secondAttempt.body}",
+                                )
+                            }
+                            throw VmLaunchFailureException(
+                                VmLaunchFailure.Other("POST $launchPath failed: ${secondAttempt.code} ${secondAttempt.body}"),
+                            )
+                        }
+                        LaunchAttemptResult.RETRY_4GB -> error("Unexpected final launch retry classification")
+                    }
+                }
+                LaunchAttemptResult.FAIL_OTHER -> {
+                    if (isDevMode) {
+                        emitDeveloperOnly(
+                            Phase.VM_LAUNCH,
+                            Status.RUNNING,
+                            "OCI launch error response (6 GB): HTTP ${firstAttempt.code} ${firstAttempt.body}",
+                        )
+                    }
+                    throw VmLaunchFailureException(
+                        VmLaunchFailure.Other("POST $launchPath failed: ${firstAttempt.code} ${firstAttempt.body}"),
+                    )
+                }
+                LaunchAttemptResult.FAIL_CAPACITY -> error("Unexpected initial launch capacity classification")
+            }
+        } else {
+            emit(Phase.VM_LAUNCH, Status.RUNNING, "Launching instance ($shape)...")
+            val launchBodyJson = JSONObject()
+                .put("availabilityDomain", adName)
+                .put("compartmentId", cid)
+                .put("displayName", "zerovpn-exit-01")
+                .put("shape", shape)
+                .put("subnetId", rids.subnetId)
+                .put("sourceDetails", JSONObject()
+                    .put("imageId", imageId)
+                    .put("bootVolumeSizeInGBs", 50)
+                    .put("sourceType", "image"))
+                .put("createVnicDetails", JSONObject()
+                    .put("subnetId", rids.subnetId)
+                    .put("assignPublicIp", true))
+                .put("metadata", JSONObject().put("ssh_authorized_keys", sshPublicKey))
+                .toString()
+            ociPost(auth, iaasHost, launchPath, launchBodyJson)
+        }
         val instanceId = launchResp.getString("id")
         rids.instanceId = instanceId
 
@@ -969,6 +1109,7 @@ class OciProvisioner(
         emit(Phase.VM_LAUNCH, Status.SUCCESS, "Instance running, public IP: $publicIp")
         return publicIp
     }
+
 
     // --- Phase 6: SSH + WireGuard ---
 
@@ -1617,30 +1758,48 @@ class OciProvisioner(
 
     // --- OCI HTTP helpers ---
 
-    private suspend fun ociPost(auth: AuthResult, host: String, path: String, body: String): JSONObject {
-        return kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-            val bodyBytes = body.toByteArray(Charsets.UTF_8)
-            val contentSha256 = java.util.Base64.getEncoder().encodeToString(
-                java.security.MessageDigest.getInstance("SHA-256").digest(bodyBytes)
-            )
-            val (authHeader, dateStr, _) = OciRequestSigner.buildAuthHeader(
-                tenancyOcid = auth.tenancyOcid,
-                userOcid = auth.userOcid,
-                fingerprint = auth.fingerprint,
-                privateKey = auth.privateKey,
-                method = "POST",
-                path = path,
-                host = host,
-                useSecurityToken = true, securityToken = auth.securityToken,
-                body = body, )
-            val req = Request.Builder()
+    private fun buildSignedPostRequest(auth: AuthResult, host: String, path: String, body: String): Request {
+        val bodyBytes = body.toByteArray(Charsets.UTF_8)
+        val contentSha256 = java.util.Base64.getEncoder().encodeToString(
+            java.security.MessageDigest.getInstance("SHA-256").digest(bodyBytes)
+        )
+        val (authHeader, dateStr, _) = OciRequestSigner.buildAuthHeader(
+            tenancyOcid = auth.tenancyOcid,
+            userOcid = auth.userOcid,
+            fingerprint = auth.fingerprint,
+            privateKey = auth.privateKey,
+            method = "POST",
+            path = path,
+            host = host,
+            useSecurityToken = true,
+            securityToken = auth.securityToken,
+            body = body,
+        )
+        return Request.Builder()
             .url("https://$host$path")
             .header("date", dateStr)
             .header("Content-Type", "application/json")
             .header("x-content-sha256", contentSha256)
             .header("Authorization", authHeader)
-            .post(body.toByteArray(Charsets.UTF_8).toRequestBody(jsonMedia))
+            .post(bodyBytes.toRequestBody(jsonMedia))
             .build()
+    }
+
+    private suspend fun ociPostWithResponse(auth: AuthResult, host: String, path: String, body: String): OciPostResponse {
+        return kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            val req = buildSignedPostRequest(auth, host, path, body)
+            val resp = httpClient.newCall(req).execute()
+            OciPostResponse(
+                code = resp.code,
+                body = resp.body?.string() ?: "",
+                isSuccessful = resp.isSuccessful,
+            )
+        }
+    }
+
+    private suspend fun ociPost(auth: AuthResult, host: String, path: String, body: String): JSONObject {
+        return kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            val req = buildSignedPostRequest(auth, host, path, body)
             val resp = httpClient.newCall(req).execute()
             val respBody = resp.body?.string() ?: ""
             if (!resp.isSuccessful) {
@@ -1854,6 +2013,14 @@ class OciProvisioner(
     }
 
     companion object {
+        fun classifyLaunchFailure(error: Throwable): VmLaunchFailure? {
+            var current: Throwable? = error
+            while (current != null) {
+                if (current is VmLaunchFailureException) return current.failure
+                current = current.cause
+            }
+            return null
+        }
         /**
          * The setup-wg.sh script content (embedded as a string constant).
          * Same as D:/dev/zero-vpn/harness/setup-wg.sh

@@ -79,6 +79,38 @@ This is a debug APK for a controlled test, not a release build.
 8. Return to ZeroVPN after Oracle redirects back. If the app asks for a manual continue, follow the visible normal-flow prompt.
 9. Allow the app to create the disposable VM and working WireGuard exit. Do not use Oracle Console or external credentials to modify the VM while the test is running.
 
+### A1 capacity fallback
+
+If Oracle returns `Out of host capacity` for the 6 GB launch, ZeroVPN
+automatically retries with a compact 4 GB configuration. The Dev Mode log
+should show:
+
+```text
+Launching Private Chat Node VM Attempt 1: VM.Standard.A1.Flex — 1 OCPU / 6 GB
+Oracle reported no A1 host capacity
+Retrying compact configuration
+Launching Private Chat Node VM Attempt 2: VM.Standard.A1.Flex — 1 OCPU / 4 GB
+```
+
+If both attempts fail, the UI should display:
+
+```text
+Failed at: VM launch
+Oracle has no A1 host capacity in your home region right now. Try again later, or try a different region.
+```
+
+The first owner test on 2026-07-12 received three consecutive 6 GB capacity
+failures (before the fallback was implemented). The stage was incorrectly
+attributed to **API key setup**. The fallback and stage attribution fix
+address both issues. The next operator test should verify:
+
+1. The 6 GB → 4 GB fallback triggers automatically on capacity failure.
+2. The failure stage is attributed to **VM launch**, not **API key setup**.
+3. If both attempts fail, no instance is created and no instance cleanup is requested.
+4. A user-initiated retry starts fresh with 6 GB.
+5. Ordinary VPN-only provisioning still uses `VM.Standard.E2.1.Micro` unchanged.
+6. The Diagnostics screen shows the capacity-fallback fields under **ORACLE OPERATION STATE**.
+
 ## 4. Watch and capture Private Chat provisioning
 
 1. Keep the provisioning screen open. The working WireGuard exit should be saved before the optional chat workload starts.

@@ -585,6 +585,13 @@ private fun OracleOperationDebugCard(
         DebugValue("Target region", diagnostics.targetRegion ?: "N/A")
         DebugValue("Target instance prefix", diagnostics.targetInstanceIdPrefix ?: "N/A")
         DebugValue("Auth state", diagnostics.authState)
+        DebugValue("Requested chat shape", diagnostics.chatRequestedShape)
+        DebugValue("Preferred configuration", diagnostics.chatPreferredConfig)
+        DebugValue("Compact fallback", diagnostics.chatCompactFallback)
+        DebugValue("Last attempted configuration", diagnostics.chatLastAttemptedConfig)
+        DebugValue("Last launch result", diagnostics.chatLastLaunchResult)
+        DebugValue("Instance created", diagnostics.chatInstanceCreated)
+        DebugValue("Cleanup required", diagnostics.chatCleanupRequired)
         DebugBlock("Last Oracle operation error", diagnostics.lastError ?: "N/A")
     }
 }
