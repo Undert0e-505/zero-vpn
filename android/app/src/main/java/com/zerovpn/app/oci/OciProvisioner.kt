@@ -854,13 +854,104 @@ class OciProvisioner(
             emit(Phase.API_KEY, Status.WARNING, "Uploaded API key fingerprint differs from local fingerprint; using OCI response")
         }
 
-        // Switch from security-token auth to durable API-key auth.
-        // All subsequent OCI calls (network, VM, destroy) will use API-key signing.
+        // --- Key identity verification (pre-upload already done above) ---
         val publicKeySha256 = runCatching {
             OciCredentialIdentity.sha256Digest(
                 OciCredentialIdentity.publicKeyFrom(auth.privateKey)
             )
         }.getOrNull()
+
+        // Verify credential identity: the stored fingerprint must match the signing key.
+        OciCredentialIdentity.verify(auth.privateKey, uploadedFingerprint, publicKeySha256)
+
+        onUploaded?.invoke(uploadedFingerprint)
+
+        // --- Stage 1: Verify Oracle registered the key (using browser security-token auth) ---
+        // After uploading the public key, use the still-valid browser security token to call
+        // ListApiKeys and confirm the fingerprint appears in Oracle's response.
+        val registrationProbePath = "/20160918/users/${auth.userOcid}/apiKeys"
+        val registrationBackoffMs = longArrayOf(1000, 2000, 4000, 8000, 15000)
+        var keyRegistered = false
+        var registrationAttempts = 0
+        var registrationRequestId: String? = null
+        for ((index, delayMs) in registrationBackoffMs.withIndex()) {
+            registrationAttempts++
+            emit(Phase.API_KEY, Status.RUNNING, "Verifying key registration (attempt ${index + 1}/${registrationBackoffMs.size})...")
+            kotlinx.coroutines.delay(delayMs)
+            try {
+                val keysResponse = securityTokenGetArray(auth, idHost, registrationProbePath)
+                registrationRequestId = keysResponse.requestId
+                val fingerprints = mutableListOf<String>()
+                for (i in 0 until keysResponse.array.length()) {
+                    val fp = keysResponse.array.getJSONObject(i).optString("fingerprint", "")
+                    if (fp.isNotBlank()) fingerprints.add(fp)
+                }
+                if (uploadedFingerprint in fingerprints) {
+                    keyRegistered = true
+                    emit(Phase.API_KEY, Status.RUNNING, "Key registration confirmed: fingerprint present in ListApiKeys response.")
+                    break
+                } else {
+                    emit(Phase.API_KEY, Status.RUNNING, "Fingerprint not yet visible in ListApiKeys, retrying...")
+                }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                emit(Phase.API_KEY, Status.WARNING, "Registration lookup error: ${e.javaClass.simpleName}: ${e.message}")
+                break
+            }
+        }
+        if (!keyRegistered) {
+            val keyId = "${auth.tenancyOcid}/${auth.userOcid}/$uploadedFingerprint"
+            emit(Phase.API_KEY, Status.ERROR, "Key registration pending: fingerprint not found after $registrationAttempts attempt(s). keyId=$keyId")
+            throw ApiKeyVerificationException(
+                stage = "KEY_REGISTRATION_PENDING",
+                fingerprint = uploadedFingerprint,
+                keyId = keyId,
+                endpoint = "https://$idHost$registrationProbePath",
+                attemptCount = registrationAttempts,
+                requestId = registrationRequestId,
+            )
+        }
+
+        // --- Stage 2: Verify API-key signing ---
+        // Only after Stage 1 confirms the key is registered, perform a read-only GET
+        // using API-key authentication (useSecurityToken = false).
+        // If this returns 401 while Stage 1 confirmed the key exists, the signing
+        // implementation is broken — it is NOT activation delay.
+        emit(Phase.API_KEY, Status.RUNNING, "Verifying API-key signing...")
+        val signingProbePath = "/20160918/users/${auth.userOcid}/apiKeys"
+        val signingProbeResult = probeApiKeySigning(auth, idHost, signingProbePath)
+        when (signingProbeResult) {
+            is SigningProbeResult.Success -> {
+                emit(Phase.API_KEY, Status.RUNNING, "API-key signing verified: Oracle accepted the signed request.")
+            }
+            is SigningProbeResult.AuthenticationRejected -> {
+                val keyId = "${auth.tenancyOcid}/${auth.userOcid}/$uploadedFingerprint"
+                emit(Phase.API_KEY, Status.ERROR, "API-key signature validation failed. Oracle registered the key but rejected the signed request. keyId=$keyId")
+                throw ApiKeyVerificationException(
+                    stage = "API_KEY_SIGNATURE_VALIDATION_FAILED",
+                    fingerprint = uploadedFingerprint,
+                    keyId = keyId,
+                    endpoint = "https://$idHost$signingProbePath",
+                    attemptCount = 1,
+                    requestId = signingProbeResult.requestId,
+                )
+            }
+            is SigningProbeResult.Error -> {
+                val keyId = "${auth.tenancyOcid}/${auth.userOcid}/$uploadedFingerprint"
+                emit(Phase.API_KEY, Status.ERROR, "API-key signing probe error: ${signingProbeResult.exceptionClass}: ${signingProbeResult.message}")
+                throw ApiKeyVerificationException(
+                    stage = "API_KEY_SIGNATURE_VALIDATION_FAILED",
+                    fingerprint = uploadedFingerprint,
+                    keyId = keyId,
+                    endpoint = "https://$idHost$signingProbePath",
+                    attemptCount = 1,
+                    requestId = null,
+                )
+            }
+        }
+
+        // --- Both stages passed: switch to API-key auth ---
         auth.authContext = OciAuthContext.ApiKey(
             tenancyOcid = auth.tenancyOcid,
             userOcid = auth.userOcid,
@@ -869,60 +960,16 @@ class OciProvisioner(
             region = homeRegion,
             publicKeySha256 = publicKeySha256,
         )
-        // Verify credential identity: the stored fingerprint must match the signing key.
-        OciCredentialIdentity.verify(auth.privateKey, uploadedFingerprint, publicKeySha256)
 
-        onUploaded?.invoke(uploadedFingerprint)
-
-        // --- API-key activation gate ---
-        // OCI IAM propagation can take a few seconds after upload. Before sending any
-        // mutation requests (VCN, instance, network), probe with a read-only GET using
-        // the new API-key auth context. Retry with backoff on 401 NotAuthenticated only.
-        val activationProbePath = "/20160918/users/${auth.userOcid}/apiKeys"
-        val backoffMs = longArrayOf(2000, 4000, 8000, 16000, 30000)
-        var activationSuccess = false
-        var attemptCount = 0
-        for ((index, delayMs) in backoffMs.withIndex()) {
-            attemptCount++
-            emit(Phase.API_KEY, Status.RUNNING, "Verifying API-key activation (attempt ${index + 1}/${backoffMs.size})...")
-            kotlinx.coroutines.delay(delayMs)
-            try {
-                val probeResult = probeApiKeyActivation(auth, idHost, activationProbePath)
-                if (probeResult) {
-                    activationSuccess = true
-                    emit(Phase.API_KEY, Status.RUNNING, "API-key activation confirmed after ${index + 1} probe attempt(s).")
-                    break
-                } else {
-                    emit(Phase.API_KEY, Status.RUNNING, "API-key not yet active (HTTP 401), retrying...")
-                }
-            } catch (e: kotlinx.coroutines.CancellationException) {
-                throw e
-            } catch (e: Exception) {
-                // Non-401 errors are not propagation delays — stop probing.
-                emit(Phase.API_KEY, Status.WARNING, "API-key activation probe error: ${e.javaClass.simpleName}: ${e.message}")
-                break
-            }
-        }
-        if (!activationSuccess) {
-            val keyId = "${auth.tenancyOcid}/${auth.userOcid}/$uploadedFingerprint"
-            emit(Phase.API_KEY, Status.ERROR, "API-key activation failed after $attemptCount probe attempt(s). keyId=$keyId")
-            throw ApiKeyActivationFailedException(
-                fingerprint = uploadedFingerprint,
-                keyId = keyId,
-                endpoint = "https://$idHost$activationProbePath",
-                attemptCount = attemptCount,
-            )
-        }
-
-        emit(Phase.API_KEY, Status.SUCCESS, "API key uploaded and activated: $uploadedFingerprint")
+        emit(Phase.API_KEY, Status.SUCCESS, "API key uploaded, registered, and signing verified: $uploadedFingerprint")
         return uploadedFingerprint
     }
 
     /**
-     * Send a read-only GET using API-key auth to verify the newly uploaded key is active.
-     * Returns true on HTTP 200, false on HTTP 401, throws on other errors.
+     * Security-token-authenticated GET that returns the full response (status, body, requestId).
+     * Used for Stage 1 registration checks.
      */
-    private suspend fun probeApiKeyActivation(auth: AuthResult, host: String, path: String): Boolean {
+    private suspend fun securityTokenGetArray(auth: AuthResult, host: String, path: String): SecurityTokenGetResult {
         return kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
             val (authHeader, dateStr, _) = OciRequestSigner.buildAuthHeader(
                 tenancyOcid = auth.tenancyOcid,
@@ -932,8 +979,8 @@ class OciProvisioner(
                 method = "GET",
                 path = path,
                 host = host,
-                useSecurityToken = false,
-                securityToken = null,
+                useSecurityToken = true,
+                securityToken = auth.securityToken,
             )
             val req = Request.Builder()
                 .url("https://$host$path")
@@ -943,28 +990,97 @@ class OciProvisioner(
                 .build()
             val resp = httpClient.newCall(req).execute()
             resp.use { response ->
-                when (response.code) {
-                    in 200..299 -> true
-                    401 -> false
-                    else -> throw Exception("API-key activation probe received HTTP ${response.code}")
+                val body = response.body?.string() ?: "[]"
+                val requestId = response.header("opc-request-id")?.takeLast(12)
+                if (!response.isSuccessful) {
+                    throw Exception("Security-token GET failed: HTTP ${response.code}")
                 }
+                SecurityTokenGetResult(
+                    array = JSONArray(body.ifBlank { "[]" }),
+                    requestId = requestId,
+                )
             }
         }
     }
 
     /**
-     * Thrown when the newly uploaded API key cannot be authenticated within the bounded activation window.
+     * API-key-authenticated GET probe for Stage 2 signing verification.
+     * Returns Success, AuthenticationRejected (401), or Error.
+     */
+    private suspend fun probeApiKeySigning(auth: AuthResult, host: String, path: String): SigningProbeResult {
+        return kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            try {
+                val (authHeader, dateStr, _) = OciRequestSigner.buildAuthHeader(
+                    tenancyOcid = auth.tenancyOcid,
+                    userOcid = auth.userOcid,
+                    fingerprint = auth.fingerprint,
+                    privateKey = auth.privateKey,
+                    method = "GET",
+                    path = path,
+                    host = host,
+                    useSecurityToken = false,
+                    securityToken = null,
+                )
+                val req = Request.Builder()
+                    .url("https://$host$path")
+                    .header("date", dateStr)
+                    .header("Authorization", authHeader)
+                    .get()
+                    .build()
+                val resp = httpClient.newCall(req).execute()
+                resp.use { response ->
+                    val requestId = response.header("opc-request-id")?.takeLast(12)
+                    when (response.code) {
+                        in 200..299 -> SigningProbeResult.Success
+                        401 -> SigningProbeResult.AuthenticationRejected(requestId = requestId)
+                        else -> SigningProbeResult.Error(
+                            exceptionClass = "HttpResponseException",
+                            message = "API-key signing probe received HTTP ${response.code}",
+                        )
+                    }
+                }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                SigningProbeResult.Error(
+                    exceptionClass = e.javaClass.simpleName,
+                    message = e.message ?: "Unknown error",
+                )
+            }
+        }
+    }
+
+    private data class SecurityTokenGetResult(val array: JSONArray, val requestId: String?)
+
+    private sealed class SigningProbeResult {
+        data object Success : SigningProbeResult()
+        data class AuthenticationRejected(val requestId: String?) : SigningProbeResult()
+        data class Error(val exceptionClass: String, val message: String) : SigningProbeResult()
+    }
+
+    /**
+     * Thrown when API-key verification fails at either stage.
      * Contains only signer-safe diagnostic fields — no private key material or authorization signatures.
      */
-    class ApiKeyActivationFailedException(
+    class ApiKeyVerificationException(
+        val stage: String,
         val fingerprint: String,
         val keyId: String,
         val endpoint: String,
         val attemptCount: Int,
+        val requestId: String?,
     ) : Exception(
-        "API-key activation failed after $attemptCount probe attempt(s). " +
-            "The key was uploaded successfully but OCI IAM did not authenticate it within the bounded window. " +
-            "keyId=$keyId, endpoint=$endpoint"
+        when (stage) {
+            "KEY_REGISTRATION_PENDING" ->
+                "Key registration pending: fingerprint not found after $attemptCount attempt(s). " +
+                    "The key was uploaded but Oracle did not list it. keyId=$keyId, endpoint=$endpoint"
+            "API_KEY_SIGNATURE_VALIDATION_FAILED" ->
+                "Oracle registered the API key, but ZeroVPN could not authenticate with it. " +
+                    "No cloud resources were created. Do not create another key automatically. " +
+                    "keyId=$keyId, endpoint=$endpoint"
+            else ->
+                "API-key verification failed at stage $stage after $attemptCount attempt(s). keyId=$keyId, endpoint=$endpoint"
+        }
     )
 
     // --- Phase 4: Network Creation ---
@@ -1710,9 +1826,13 @@ class OciProvisioner(
         // Upload API key and verify activation
         try {
             uploadApiKey(auth, homeRegion, onApiKeyUploaded)
-        } catch (e: ApiKeyActivationFailedException) {
-            // Upload succeeded but IAM propagation failed — distinct from upload failure
-            emit(Phase.API_KEY, Status.ERROR, "API key uploaded but activation failed: ${e.message}")
+        } catch (e: ApiKeyVerificationException) {
+            // Verification failed — distinct from upload failure
+            when (e.stage) {
+                "KEY_REGISTRATION_PENDING" -> emit(Phase.API_KEY, Status.ERROR, "Key registration pending: ${e.message}")
+                "API_KEY_SIGNATURE_VALIDATION_FAILED" -> emit(Phase.API_KEY, Status.ERROR, "API-key signature validation failed: ${e.message}")
+                else -> emit(Phase.API_KEY, Status.ERROR, "API-key verification failed: ${e.message}")
+            }
             throw e
         } catch (e: Exception) {
             emit(Phase.API_KEY, Status.ERROR, "Upload failed: ${e.javaClass.simpleName}: ${e.message}")
