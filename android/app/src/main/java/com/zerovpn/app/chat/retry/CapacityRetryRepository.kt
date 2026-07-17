@@ -176,7 +176,8 @@ class CapacityRetryRepository(
             val finished = session.copy(
                 lastWorkerFinishedAtUtc = now.toString(),
             )
-            val counted = if (result is BackgroundLaunchResult.LocalPreparationFailure) {
+            val counted = if (result is BackgroundLaunchResult.LocalPreparationFailure ||
+                result is BackgroundLaunchResult.AuthenticationFailure) {
                 finished
             } else {
                 finished.copy(
@@ -259,6 +260,17 @@ class CapacityRetryRepository(
                     lastResult = "LOCAL_PREPARATION_FAILURE",
                     requiresUserAction = true,
                     terminalReason = "Background launch stopped before the instance request was sent (${result.category}). ${result.safeMessage}",
+                )
+                is BackgroundLaunchResult.AuthenticationFailure -> counted.copy(
+                    state = CapacityRetryState.PAUSED_AUTH_REQUIRED,
+                    pendingMemoryGb = attemptedMemoryGb,
+                    lastHttpStatus = result.httpStatus,
+                    lastOciErrorCode = null,
+                    lastSafeErrorCategory = result.category,
+                    lastRedactedRequestId = result.redactedRequestId,
+                    lastResult = "OCI_AUTHENTICATION_FAILED",
+                    requiresUserAction = true,
+                    terminalReason = "OCI rejected the background worker\u2019s signed request (HTTP ${result.httpStatus}). Open ZeroVPN to refresh Oracle credentials.",
                 )
                 is BackgroundLaunchResult.TransmissionFailure -> counted.copy(
                     state = CapacityRetryState.FAILED_AMBIGUOUS_RECONCILIATION_REQUIRED,

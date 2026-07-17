@@ -280,3 +280,51 @@ D:\dev\zero-vpnrtifacts\zerovpn-private-chat-background-retry-debug.apk.sha256
 ```
 
 Use the SHA-256 file generated with the build as the source of truth for the current artifact.
+
+
+## OCI shared-signer authentication fix (2026-07-17)
+
+### Root cause
+
+Foreground OCI requests used a browser security token with `keyId=""ST$<token>""` (session
+auth). After uploading a durable OCI API key, the code never switched to API-key auth
+(`keyId=""<tenancy>/<user>/<fingerprint>""`). The retry worker persisted and reused the
+short-lived browser token. Once expired, the worker's signed availability-domain GET
+received HTTP 401, incorrectly classified as `LOCAL_PREPARATION_FAILURE`.
+
+### Fix
+
+- **OciAuthContext** sealed interface: `SecurityTokenBootstrap` (browser login to API-key
+  upload) and `ApiKey` (all post-upload operations). The provisioner switches auth mode
+  after the upload succeeds.
+- **OciCredentialIdentity**: verifies the stored fingerprint and public-key SHA-256 digest
+  match the signing key. Detects key corruption before the worker attempts a signed request.
+- **DurableApiKeyCredentials** in `RetryCredentialVault`: the worker loads durable API-key
+  credentials (tenancy, user, fingerprint, private key PEM, region, public-key digest),
+  never the short-lived browser token.
+- **BackgroundLaunchCredentials** no longer carries `securityToken`; it uses API-key auth
+  exclusively (`useSecurityToken = false, securityToken = null`).
+- **AuthenticationFailure** result: HTTP 401 from OCI is classified as
+  `BackgroundLaunchResult.AuthenticationFailure`, NOT `LocalPreparationFailure`. The repo
+  sets state to `PAUSED_AUTH_REQUIRED`, cancels future work, and notifies the user. It does
+  NOT auto-generate a new API key or reset the retry deadline.
+- **Accurate counters**: `workerCyclesStarted`, `prerequisiteRequestsSent`,
+  `instanceLaunchRequests6Gb`, `instanceLaunchRequests4Gb`, `backgroundLaunchAttempts`.
+  Legacy counters are deprecated and set to 0 for new sessions.
+- **Switch overlay fix**: the Private Chat setup switch is hidden when a retry session is
+  active/paused/failed/timed-out. The retry card owns the actions.
+
+### New test files
+
+- `OciCredentialIdentityTest` - fingerprint + SHA-256 digest verification
+- `OciRequestSignerGoldenTest` - canonical signing string identical for both auth modes
+- `OciBackgroundLauncherTest` - updated for API-key auth, adds 401 to AuthenticationFailure test
+- `CapacityRetryRepositoryTest` - updated for AuthenticationFailure handling
+- `PrivateChatSetupControlsTest` - tests for `shouldHidePrivateChatSwitch`
+
+### Build artifact
+
+` `	ext`
+D:\dev\zero-vpn\artifacts\zerovpn-shared-oci-signer-fix-debug.apk
+D:\dev\zero-vpn\artifacts\zerovpn-shared-oci-signer-fix-debug.apk.sha256
+` ` `

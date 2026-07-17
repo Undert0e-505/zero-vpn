@@ -308,6 +308,11 @@ private fun CapacityRetryDiagnosticsCard(
         DebugValue("Background retry cycles attempted", session.retryCycleCount.toString())
         DebugValue("6 GB launch requests", session.launchRequestCount6Gb.toString())
         DebugValue("4 GB launch requests", session.launchRequestCount4Gb.toString())
+        DebugValue("Worker cycles started", session.workerCyclesStarted.toString())
+        DebugValue("Prerequisite requests sent", session.prerequisiteRequestsSent.toString())
+        DebugValue("Instance launch requests (6 GB)", session.instanceLaunchRequests6Gb.toString())
+        DebugValue("Instance launch requests (4 GB)", session.instanceLaunchRequests4Gb.toString())
+        DebugValue("Background launch attempts", session.backgroundLaunchAttempts.toString())
         DebugValue("Last attempted configuration", session.lastAttemptMemoryGb?.let { "1 OCPU / ${it} GB" } ?: "NOT TESTED")
         DebugValue("Last result", session.lastResult ?: "NOT TESTED")
         DebugValue(

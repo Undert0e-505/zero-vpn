@@ -95,5 +95,13 @@ class SecureSecretStore(context: Context) {
         fun privateChatOwnerCredentials(exitId: String): String = "oracle:$exitId:privateChatOwnerCredentials"
         fun inviteClientConfig(slotId: String): String = "invite:$slotId:clientConfig"
         fun sharedWireGuardConfig(sharedExitId: String): String = "shared:$sharedExitId:wireGuardConfig"
+
+        // --- Durable API-key credential storage (post-upload auth) ---
+        fun oracleApiKeyTenancy(sessionId: String): String = "oracleApiKey:$sessionId:tenancyOcid"
+        fun oracleApiKeyUser(sessionId: String): String = "oracleApiKey:$sessionId:userOcid"
+        fun oracleApiKeyFingerprint(sessionId: String): String = "oracleApiKey:$sessionId:fingerprint"
+        fun oracleApiKeyPrivateKey(sessionId: String): String = "oracleApiKey:$sessionId:privateKeyPkcs8"
+        fun oracleApiKeyRegion(sessionId: String): String = "oracleApiKey:$sessionId:region"
+        fun oracleApiKeyPublicKeyDigest(sessionId: String): String = "oracleApiKey:$sessionId:publicKeySha256"
     }
 }

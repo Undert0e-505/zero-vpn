@@ -385,6 +385,45 @@ class CapacityRetryRepositoryTest {
         assertEquals(session.deadlineUtc, failed.deadlineUtc)
     }
 
+    @Test fun authenticationFailurePausesAuthRequiredAndPreservesDeadlineAndCredentials() {
+        val prefs = FakeSharedPreferences()
+        val session = repositoryAt(start, prefs).createSession(
+            "candidate:auth-fail",
+            CapacityRetryMode.INITIAL_PRIVATE_CHAT,
+            null,
+            "tenancy",
+        )
+        val repo = repositoryAt(start.plusSeconds(15 * 60), prefs)
+        repo.beginWorkerCycle(session.sessionId)
+        val diagnostics = launchDiagnostics(
+            progress = LaunchProgress.RESPONSE_RECEIVED,
+            transmissionStarted = true,
+            responseHeadersReceived = true,
+        )
+
+        repo.finishLaunchAttempt(
+            session.sessionId,
+            BackgroundLaunchResult.AuthenticationFailure(
+                category = "oci-authentication-failed",
+                safeMessage = "OCI rejected the signed request with HTTP 401.",
+                httpStatus = 401,
+                redactedRequestId = "redacted-req-id",
+                diagnostics = diagnostics,
+            ),
+        )
+
+        val paused = repo.sessions().single()
+        assertEquals(CapacityRetryState.PAUSED_AUTH_REQUIRED, paused.state)
+        assertEquals("OCI_AUTHENTICATION_FAILED", paused.lastResult)
+        assertEquals("oci-authentication-failed", paused.lastSafeErrorCategory)
+        assertEquals(401, paused.lastHttpStatus)
+        assertTrue(paused.requiresUserAction)
+        assertEquals(session.deadlineUtc, paused.deadlineUtc)
+        // Should not count as a launch request
+        assertEquals(0, paused.launchRequestCount6Gb)
+        assertEquals(0, paused.launchRequestCount4Gb)
+    }
+
     @Test fun ambiguousReconciliationBlockerCannotBeCancelledOrReplaced() {
         val repo = repositoryAt(start)
         val session = repo.createSession(

@@ -81,6 +81,7 @@ class PrivateChatCapacityRetryWorker(
             record("Cooldown check: not eligible (retry deadline expired)")
             record("Session updated: new state " + current.state.name)
             vault.clearCredentials(sessionId)
+            vault.clearApiKeyCredentials(sessionId)
             workScheduler.cancel(current)
             notifier.notifyTimedOut(current)
             return Result.success()
@@ -114,6 +115,7 @@ class PrivateChatCapacityRetryWorker(
             if (started.state == CapacityRetryState.TIMED_OUT) {
                 record("Session updated: new state " + started.state.name)
                 vault.clearCredentials(sessionId)
+                vault.clearApiKeyCredentials(sessionId)
                 workScheduler.cancel(started)
                 notifier.notifyTimedOut(started)
                 return Result.success()
@@ -121,9 +123,9 @@ class PrivateChatCapacityRetryWorker(
             if (started.state != CapacityRetryState.ACQUIRING) return Result.success()
             record("Session updated: new state " + started.state.name)
 
-            val loaded = vault.loadCredentials(sessionId)
+            val loaded = vault.loadApiKeyCredentials(sessionId)
             if (loaded == null) {
-                record("Credential load: failure")
+                record("Credential load: failure (no durable API-key credentials)")
                 val paused = pauseAuthRequired(repository, sessionId)
                 if (paused?.state == CapacityRetryState.PAUSED_AUTH_REQUIRED) {
                     record("Session updated: new state " + paused.state.name)
@@ -133,7 +135,7 @@ class PrivateChatCapacityRetryWorker(
             }
 
             val privateKey = runCatching { vault.loadPrivateKey(loaded.privateKeyPem) }.getOrElse {
-                record("Credential load: failure")
+                record("Credential load: failure (private key parse error)")
                 val paused = pauseAuthRequired(repository, sessionId)
                 if (paused?.state == CapacityRetryState.PAUSED_AUTH_REQUIRED) {
                     record("Session updated: new state " + paused.state.name)
@@ -141,7 +143,24 @@ class PrivateChatCapacityRetryWorker(
                 }
                 return Result.success()
             }
-            record("Credential load: success")
+            // Verify credential identity: fingerprint must match the signing key.
+            val fingerprintMatches = runCatching {
+                com.zerovpn.app.oci.OciCredentialIdentity.verify(
+                    privateKey = privateKey,
+                    expectedFingerprint = loaded.fingerprint,
+                    expectedPublicKeySha256 = loaded.publicKeySha256,
+                )
+            }
+            if (fingerprintMatches.isFailure) {
+                record("Credential load: failure (fingerprint mismatch)")
+                val paused = pauseAuthRequired(repository, sessionId)
+                if (paused?.state == CapacityRetryState.PAUSED_AUTH_REQUIRED) {
+                    record("Session updated: new state " + paused.state.name)
+                    notifier.notifyAuthRequired(paused)
+                }
+                return Result.success()
+            }
+            record("Credential load: success (durable API-key auth)")
 
             val missingContext = listOfNotNull(
                 "userOcid".takeIf { started.userOcid.isNullOrBlank() },
@@ -169,6 +188,7 @@ class PrivateChatCapacityRetryWorker(
                     workScheduler.cancel(failed)
                     notifier.notifyTerminalFailure(failed)
                     vault.clearCredentials(sessionId)
+                    vault.clearApiKeyCredentials(sessionId)
                 }
                 return Result.success()
             }
@@ -182,11 +202,12 @@ class PrivateChatCapacityRetryWorker(
             val result = try {
                 launcher.launchA1Instance(
                     credentials = BackgroundLaunchCredentials(
-                        securityToken = loaded.securityToken,
+                        tenancyOcid = loaded.tenancyOcid,
+                        userOcid = loaded.userOcid,
+                        fingerprint = loaded.fingerprint,
                         privateKey = privateKey,
-                        tenancyOcid = started.tenancyOcid!!,
-                        userOcid = started.userOcid!!,
-                        fingerprint = started.fingerprint!!,
+                        region = loaded.region,
+                        publicKeySha256 = loaded.publicKeySha256,
                     ),
                     params = BackgroundLaunchParams(
                         compartmentOcid = started.compartmentOcid!!,
@@ -257,6 +278,7 @@ class PrivateChatCapacityRetryWorker(
                     is BackgroundLaunchResult.AmbiguousFailure -> "other (ambiguous)"
                     is BackgroundLaunchResult.LocalPreparationFailure -> "other (local preparation)"
                     is BackgroundLaunchResult.TransmissionFailure -> "other (transmission ambiguous)"
+                    is BackgroundLaunchResult.AuthenticationFailure -> "other (authentication failed)"
                 },
             )
             val updated = repository.finishLaunchAttempt(sessionId, result)
@@ -274,6 +296,12 @@ class PrivateChatCapacityRetryWorker(
                     workScheduler.cancel(updated)
                     notifier.notifyTerminalFailure(updated)
                     vault.clearCredentials(sessionId)
+                    vault.clearApiKeyCredentials(sessionId)
+                }
+                CapacityRetryState.PAUSED_AUTH_REQUIRED -> {
+                    // OCI auth failed (HTTP 401). Pause and notify user — do NOT auto-generate a new API key.
+                    workScheduler.cancel(updated)
+                    notifier.notifyAuthRequired(updated)
                 }
                 else -> Unit
             }

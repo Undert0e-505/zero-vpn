@@ -75,8 +75,21 @@ data class CapacityRetrySession(
     val lastWorkerStartedAtUtc: String? = null,
     val lastWorkerFinishedAtUtc: String? = null,
     val retryCycleCount: Int = 0,
+    @Deprecated("Inaccurate — replaced by instanceLaunchRequests6Gb/4Gb")
     val launchRequestCount6Gb: Int = 0,
+    @Deprecated("Inaccurate — replaced by instanceLaunchRequests6Gb/4Gb")
     val launchRequestCount4Gb: Int = 0,
+    // --- Accurate counters (replaces legacy fields) ---
+    /** Incremented when the worker starts orchestration. */
+    val workerCyclesStarted: Int = 0,
+    /** Incremented when a signed lookup/list GET is transmitted. */
+    val prerequisiteRequestsSent: Int = 0,
+    /** Incremented immediately before transmitting a 6 GB instance POST. */
+    val instanceLaunchRequests6Gb: Int = 0,
+    /** Incremented immediately before transmitting a 4 GB instance POST. */
+    val instanceLaunchRequests4Gb: Int = 0,
+    /** Incremented when an instance POST is transmitted. */
+    val backgroundLaunchAttempts: Int = 0,
     val lastAttemptMemoryGb: Int? = null,
     val lastHttpStatus: Int? = null,
     val lastOciErrorCode: String? = null,
@@ -127,6 +140,11 @@ data class CapacityRetrySession(
         .put("retryCycleCount", retryCycleCount)
         .put("launchRequestCount6Gb", launchRequestCount6Gb)
         .put("launchRequestCount4Gb", launchRequestCount4Gb)
+        .put("workerCyclesStarted", workerCyclesStarted)
+        .put("prerequisiteRequestsSent", prerequisiteRequestsSent)
+        .put("instanceLaunchRequests6Gb", instanceLaunchRequests6Gb)
+        .put("instanceLaunchRequests4Gb", instanceLaunchRequests4Gb)
+        .put("backgroundLaunchAttempts", backgroundLaunchAttempts)
         .put("lastAttemptMemoryGb", lastAttemptMemoryGb)
         .put("lastHttpStatus", lastHttpStatus)
         .put("lastOciErrorCode", lastOciErrorCode)
@@ -202,8 +220,13 @@ data class CapacityRetrySession(
                 lastLaunchAttemptFinishedAtUtc = initialLaunchAttemptFinishedAtUtc,
                 nextEligibleAttemptAtUtc = nextEligibleAt.toString(),
                 pendingMemoryGb = normalizedPendingMemoryGb,
-                launchRequestCount6Gb = if (normalizedAttemptMemoryGb == 6) 1 else 0,
-                launchRequestCount4Gb = if (normalizedAttemptMemoryGb == 4) 1 else 0,
+                launchRequestCount6Gb = 0, // Deprecated: inaccurate — use instanceLaunchRequests6Gb
+                launchRequestCount4Gb = 0, // Deprecated: inaccurate — use instanceLaunchRequests4Gb
+                workerCyclesStarted = 0,
+                prerequisiteRequestsSent = 0,
+                instanceLaunchRequests6Gb = if (normalizedAttemptMemoryGb == 6) 1 else 0,
+                instanceLaunchRequests4Gb = if (normalizedAttemptMemoryGb == 4) 1 else 0,
+                backgroundLaunchAttempts = if (normalizedAttemptMemoryGb != null) 1 else 0,
                 lastAttemptMemoryGb = normalizedAttemptMemoryGb,
                 lastHttpStatus = initialHttpStatus,
                 lastOciErrorCode = initialOciErrorCode,
@@ -248,6 +271,11 @@ data class CapacityRetrySession(
             retryCycleCount = json.optInt("retryCycleCount", 0),
             launchRequestCount6Gb = json.optInt("launchRequestCount6Gb", 0),
             launchRequestCount4Gb = json.optInt("launchRequestCount4Gb", 0),
+            workerCyclesStarted = json.optInt("workerCyclesStarted", 0),
+            prerequisiteRequestsSent = json.optInt("prerequisiteRequestsSent", 0),
+            instanceLaunchRequests6Gb = json.optInt("instanceLaunchRequests6Gb", 0),
+            instanceLaunchRequests4Gb = json.optInt("instanceLaunchRequests4Gb", 0),
+            backgroundLaunchAttempts = json.optInt("backgroundLaunchAttempts", 0),
             lastAttemptMemoryGb = json.optIntOrNull("lastAttemptMemoryGb"),
             lastHttpStatus = json.optIntOrNull("lastHttpStatus"),
             lastOciErrorCode = json.optNullableString("lastOciErrorCode"),

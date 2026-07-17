@@ -149,15 +149,24 @@ class PrivateChatCapacityRetryWorkerRecreationTest {
         )
         val secretStore = TrackingRetrySecretStore()
         val vault = RetryCredentialVault(secretStore)
-        val signingKey = OciRequestSigner.generateKeyPair().private
+        val signingKey = OciRequestSigner.generateKeyPair()
+        val realFingerprint = com.zerovpn.app.oci.OciCredentialIdentity.fingerprintOf(
+            com.zerovpn.app.oci.OciCredentialIdentity.publicKeyFrom(signingKey.private)
+        )
         assertTrue(
-            vault.storeCredentials(
+            vault.storeApiKeyCredentials(
                 session.sessionId,
-                "worker-security-token",
-                RetryCredentialVault.privateKeyToPkcs8Pem(signingKey),
+                DurableApiKeyCredentials(
+                    tenancyOcid = "ocid1.tenancy.oc1..tenancy",
+                    userOcid = "ocid1.user.oc1..user",
+                    fingerprint = realFingerprint,
+                    privateKeyPem = RetryCredentialVault.privateKeyToPkcs8Pem(signingKey.private),
+                    region = "uk-london-1",
+                    publicKeySha256 = null,
+                ),
             ),
         )
-        val credentialsBefore = vault.loadCredentials(session.sessionId)
+        val credentialsBefore = vault.loadApiKeyCredentials(session.sessionId)
         val diagnosticLog = CapacityRetryDiagnosticLog(prefs, Clock.fixed(now, ZoneOffset.UTC))
         val launcher = object : BackgroundLaunchExecutor {
             var receivedRetryToken: String? = null
@@ -206,7 +215,7 @@ class PrivateChatCapacityRetryWorkerRecreationTest {
         assertEquals(0, blocked.retryCycleCount)
         assertEquals(0, blocked.launchRequestCount6Gb)
         assertNull(blocked.nextEligibleAttemptAtUtc)
-        assertEquals(credentialsBefore, vault.loadCredentials(session.sessionId))
+        assertEquals(credentialsBefore, vault.loadApiKeyCredentials(session.sessionId))
         assertFalse(secretStore.removedKeys.any { it.contains(session.sessionId) })
 
         val detailed = diagnosticLog.entries(session.sessionId)

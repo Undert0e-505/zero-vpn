@@ -49,6 +49,7 @@ import com.zerovpn.app.chat.retry.PrivateChatCapabilityStatus
 import com.zerovpn.app.chat.retry.ProvisioningLeaseOperation
 import com.zerovpn.app.chat.retry.ProvisioningOperationLease
 import com.zerovpn.app.chat.retry.RetryCredentialVault
+import com.zerovpn.app.chat.retry.DurableApiKeyCredentials
 import com.zerovpn.app.chat.retry.candidatesFromJson
 import com.zerovpn.app.chat.retry.capacityRetrySchedulerStatus
 import com.zerovpn.app.chat.retry.decideCapacityRetryReconciliation
@@ -1095,6 +1096,7 @@ class ProvisioningViewModel : ViewModel() {
                 val timedOut = repository.markTimedOutIfNeeded(session.sessionId) ?: session
                 scheduler.cancel(timedOut)
                 vault.clearCredentials(session.sessionId)
+                vault.clearApiKeyCredentials(session.sessionId)
                 diagnosticLog.append(
                     session.sessionId,
                     "Scheduler reconciliation: retry deadline expired; background work cancelled",
@@ -1237,6 +1239,7 @@ class ProvisioningViewModel : ViewModel() {
         }
         val cancelled = repository.cancelSession(session.sessionId) ?: session
         RetryCredentialVault(secretStore).clearCredentials(session.sessionId)
+        RetryCredentialVault(secretStore).clearApiKeyCredentials(session.sessionId)
         CapacityRetryWorkScheduler(context.applicationContext).cancel(cancelled)
         _capacityRetrySessions.value = repository.sessions()
         clearPendingCapacityRetryMetadata()
@@ -2033,7 +2036,8 @@ class ProvisioningViewModel : ViewModel() {
         }
 
         val vault = RetryCredentialVault(secretStore)
-        val credentials = vault.loadCredentials(started.sessionId)
+        // Load durable API-key credentials (not the legacy security token)
+        val credentials = vault.loadApiKeyCredentials(started.sessionId)
         val privateKey = credentials?.let { runCatching { vault.loadPrivateKey(it.privateKeyPem) }.getOrNull() }
         if (credentials == null || privateKey == null) {
             repository.updateSession(started.sessionId) { session ->
@@ -2043,7 +2047,7 @@ class ProvisioningViewModel : ViewModel() {
                     lastResult = "PAUSED_AUTH_REQUIRED",
                     lastSafeErrorCategory = "auth-required",
                     requiresUserAction = true,
-                    terminalReason = "The saved Oracle signing credentials are missing or unreadable.",
+                    terminalReason = "The saved Oracle API-key credentials are missing or unreadable.",
                 )
             }
             _capacityRetrySessions.value = repository.sessions()
@@ -2073,6 +2077,7 @@ class ProvisioningViewModel : ViewModel() {
             }
             failed?.let { CapacityRetryWorkScheduler(context.applicationContext).cancel(it) }
             vault.clearCredentials(started.sessionId)
+            vault.clearApiKeyCredentials(started.sessionId)
             _capacityRetrySessions.value = repository.sessions()
             _state.value = ProvisioningState.Failure(Phase.VM_LAUNCH, Phase.NETWORK, "The saved VM launch context is incomplete.")
             persistState()
@@ -2088,11 +2093,12 @@ class ProvisioningViewModel : ViewModel() {
         val result = try {
             OciBackgroundLauncher().launchA1Instance(
                 credentials = BackgroundLaunchCredentials(
-                    securityToken = credentials.securityToken,
+                    tenancyOcid = credentials.tenancyOcid,
+                    userOcid = credentials.userOcid,
+                    fingerprint = credentials.fingerprint,
                     privateKey = privateKey,
-                    tenancyOcid = started.tenancyOcid!!,
-                    userOcid = started.userOcid!!,
-                    fingerprint = started.fingerprint!!,
+                    region = credentials.region,
+                    publicKeySha256 = credentials.publicKeySha256,
                 ),
                 params = BackgroundLaunchParams(
                     compartmentOcid = started.compartmentOcid!!,
@@ -2165,6 +2171,7 @@ class ProvisioningViewModel : ViewModel() {
             CapacityRetryState.FAILED_TERMINAL -> {
                 CapacityRetryWorkScheduler(context.applicationContext).cancel(updated)
                 vault.clearCredentials(updated.sessionId)
+                vault.clearApiKeyCredentials(updated.sessionId)
                 _state.value = ProvisioningState.Failure(
                     Phase.VM_LAUNCH,
                     Phase.NETWORK,
@@ -2262,12 +2269,14 @@ class ProvisioningViewModel : ViewModel() {
         } ?: session
         CapacityRetryWorkScheduler(context.applicationContext).cancel(succeeded)
         RetryCredentialVault(secretStore).clearCredentials(session.sessionId)
+        RetryCredentialVault(secretStore).clearApiKeyCredentials(session.sessionId)
         _capacityRetrySessions.value = repository.sessions()
     }
 
     private fun clearPendingRetryCredentials(provisioningId: String? = pendingProvisionExitId) {
         if (!provisioningId.isNullOrBlank() && ::secretStore.isInitialized) {
             RetryCredentialVault(secretStore).clearProvisioningCredentials(provisioningId)
+            RetryCredentialVault(secretStore).clearProvisioningApiKeyCredentials(provisioningId)
         }
         if (provisioningId == pendingProvisionExitId) {
             retryLaunchSubnetId = null
@@ -2913,13 +2922,22 @@ class ProvisioningViewModel : ViewModel() {
                 onApiKeyUploaded = { uploadedFingerprint ->
                     apiKeyFingerprint = uploadedFingerprint
                     if (privateChatRequested) {
-                        val stored = RetryCredentialVault(secretStore).storeProvisioningCredentials(
+                        val publicKeySha256 = com.zerovpn.app.oci.OciCredentialIdentity.sha256Digest(
+                            com.zerovpn.app.oci.OciCredentialIdentity.publicKeyFrom(auth.privateKey)
+                        )
+                        val stored = RetryCredentialVault(secretStore).storeProvisioningApiKeyCredentials(
                             provisioningId = provisioningId,
-                            securityToken = auth.securityToken,
-                            privateKey = auth.privateKey,
+                            creds = DurableApiKeyCredentials(
+                                tenancyOcid = auth.tenancyOcid,
+                                userOcid = auth.userOcid,
+                                fingerprint = uploadedFingerprint,
+                                privateKeyPem = RetryCredentialVault.privateKeyToPkcs8Pem(auth.privateKey),
+                                region = preflight.homeRegion,
+                                publicKeySha256 = publicKeySha256,
+                            ),
                         )
                         check(stored) {
-                            "ZeroVPN could not securely retain the original Oracle signing credentials. " +
+                            "ZeroVPN could not securely retain the durable API-key credentials. " +
                                 "Provisioning was stopped before VM launch."
                         }
                     }

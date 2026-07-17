@@ -75,7 +75,9 @@ class CapacityRetryModelTest {
         assertEquals("2026-07-15T11:55:00Z", session.lastLaunchAttemptFinishedAtUtc)
         assertEquals("2026-07-15T12:10:00Z", session.nextEligibleAttemptAtUtc)
         assertEquals(4, session.pendingMemoryGb)
-        assertEquals(1, session.launchRequestCount6Gb)
+        @Suppress("DEPRECATION")
+        assertEquals(0, session.launchRequestCount6Gb) // deprecated, always 0 for new sessions
+        assertEquals(1, session.instanceLaunchRequests6Gb) // accurate counter
     }
 
     @Test fun pendingMemoryAlternatesOnlyAfterCapacityMiss() {

@@ -187,7 +187,30 @@ class OciProvisioner(
         val selectedRegion: String,
         val tokenRegion: String? = null,
         val tokenRegionSource: String? = null,
-    )
+        /**
+         * Current auth context. Starts as [OciAuthContext.SecurityTokenBootstrap] during browser login,
+         * then switches to [OciAuthContext.ApiKey] after the API key upload succeeds.
+         * All post-upload OCI calls use API-key auth (useSecurityToken = false, securityToken = null).
+         */
+        var authContext: OciAuthContext = OciAuthContext.SecurityTokenBootstrap(
+            securityToken = securityToken,
+            privateKey = privateKey,
+            tenancyOcid = tenancyOcid,
+            userOcid = userOcid,
+            fingerprint = fingerprint,
+        ),
+    ) {
+        /**
+         * Whether the current auth context uses a security token (browser bootstrap).
+         * After API key upload, this becomes false and all subsequent calls use API-key auth.
+         */
+        val usesSecurityToken: Boolean get() = authContext is OciAuthContext.SecurityTokenBootstrap
+
+        /**
+         * The security token from the bootstrap phase, or null after switching to API-key auth.
+         */
+        val activeSecurityToken: String? get() = (authContext as? OciAuthContext.SecurityTokenBootstrap)?.securityToken
+    }
 
     data class PreflightResult(
         val success: Boolean,
@@ -828,13 +851,119 @@ class OciProvisioner(
         if (uploadedFingerprint != auth.fingerprint) {
             emit(Phase.API_KEY, Status.WARNING, "Uploaded API key fingerprint differs from local fingerprint; using OCI response")
         }
+
+        // Switch from security-token auth to durable API-key auth.
+        // All subsequent OCI calls (network, VM, destroy) will use API-key signing.
+        val publicKeySha256 = runCatching {
+            OciCredentialIdentity.sha256Digest(
+                OciCredentialIdentity.publicKeyFrom(auth.privateKey)
+            )
+        }.getOrNull()
+        auth.authContext = OciAuthContext.ApiKey(
+            tenancyOcid = auth.tenancyOcid,
+            userOcid = auth.userOcid,
+            fingerprint = uploadedFingerprint,
+            privateKey = auth.privateKey,
+            region = homeRegion,
+            publicKeySha256 = publicKeySha256,
+        )
+        // Verify credential identity: the stored fingerprint must match the signing key.
+        OciCredentialIdentity.verify(auth.privateKey, uploadedFingerprint, publicKeySha256)
+
         onUploaded?.invoke(uploadedFingerprint)
 
-        emit(Phase.API_KEY, Status.RUNNING, "Waiting for propagation...")
-        kotlinx.coroutines.delay(5000)
-        emit(Phase.API_KEY, Status.SUCCESS, "API key uploaded: $uploadedFingerprint")
+        // --- API-key activation gate ---
+        // OCI IAM propagation can take a few seconds after upload. Before sending any
+        // mutation requests (VCN, instance, network), probe with a read-only GET using
+        // the new API-key auth context. Retry with backoff on 401 NotAuthenticated only.
+        val activationProbePath = "/20160918/users/${auth.userOcid}/apiKeys"
+        val backoffMs = longArrayOf(1000, 2000, 4000, 8000, 15000)
+        var activationSuccess = false
+        var attemptCount = 0
+        for ((index, delayMs) in backoffMs.withIndex()) {
+            attemptCount++
+            emit(Phase.API_KEY, Status.RUNNING, "Verifying API-key activation (attempt ${index + 1}/${backoffMs.size})...")
+            kotlinx.coroutines.delay(delayMs)
+            try {
+                val probeResult = probeApiKeyActivation(auth, idHost, activationProbePath)
+                if (probeResult) {
+                    activationSuccess = true
+                    emit(Phase.API_KEY, Status.RUNNING, "API-key activation confirmed after ${index + 1} probe attempt(s).")
+                    break
+                } else {
+                    emit(Phase.API_KEY, Status.RUNNING, "API-key not yet active (HTTP 401), retrying...")
+                }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                // Non-401 errors are not propagation delays — stop probing.
+                emit(Phase.API_KEY, Status.WARNING, "API-key activation probe error: ${e.javaClass.simpleName}: ${e.message}")
+                break
+            }
+        }
+        if (!activationSuccess) {
+            val keyId = "${auth.tenancyOcid}/${auth.userOcid}/$uploadedFingerprint"
+            emit(Phase.API_KEY, Status.ERROR, "API-key activation failed after $attemptCount probe attempt(s). keyId=$keyId")
+            throw ApiKeyActivationFailedException(
+                fingerprint = uploadedFingerprint,
+                keyId = keyId,
+                endpoint = "https://$idHost$activationProbePath",
+                attemptCount = attemptCount,
+            )
+        }
+
+        emit(Phase.API_KEY, Status.SUCCESS, "API key uploaded and activated: $uploadedFingerprint")
         return uploadedFingerprint
     }
+
+    /**
+     * Send a read-only GET using API-key auth to verify the newly uploaded key is active.
+     * Returns true on HTTP 200, false on HTTP 401, throws on other errors.
+     */
+    private suspend fun probeApiKeyActivation(auth: AuthResult, host: String, path: String): Boolean {
+        return kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            val (authHeader, dateStr, _) = OciRequestSigner.buildAuthHeader(
+                tenancyOcid = auth.tenancyOcid,
+                userOcid = auth.userOcid,
+                fingerprint = auth.fingerprint,
+                privateKey = auth.privateKey,
+                method = "GET",
+                path = path,
+                host = host,
+                useSecurityToken = false,
+                securityToken = null,
+            )
+            val req = Request.Builder()
+                .url("https://$host$path")
+                .header("date", dateStr)
+                .header("Authorization", authHeader)
+                .get()
+                .build()
+            val resp = httpClient.newCall(req).execute()
+            resp.use { response ->
+                when (response.code) {
+                    in 200..299 -> true
+                    401 -> false
+                    else -> throw Exception("API-key activation probe received HTTP ${response.code}")
+                }
+            }
+        }
+    }
+
+    /**
+     * Thrown when the newly uploaded API key cannot be authenticated within the bounded activation window.
+     * Contains only signer-safe diagnostic fields — no private key material or authorization signatures.
+     */
+    class ApiKeyActivationFailedException(
+        val fingerprint: String,
+        val keyId: String,
+        val endpoint: String,
+        val attemptCount: Int,
+    ) : Exception(
+        "API-key activation failed after $attemptCount probe attempt(s). " +
+            "The key was uploaded successfully but OCI IAM did not authenticate it within the bounded window. " +
+            "keyId=$keyId, endpoint=$endpoint"
+    )
 
     // --- Phase 4: Network Creation ---
 
@@ -1574,9 +1703,13 @@ class OciProvisioner(
     ): Pair<ResourceIds, ProvisionResult> {
         val homeRegion = preflight.homeRegion
 
-        // Upload API key
+        // Upload API key and verify activation
         try {
             uploadApiKey(auth, homeRegion, onApiKeyUploaded)
+        } catch (e: ApiKeyActivationFailedException) {
+            // Upload succeeded but IAM propagation failed — distinct from upload failure
+            emit(Phase.API_KEY, Status.ERROR, "API key uploaded but activation failed: ${e.message}")
+            throw e
         } catch (e: Exception) {
             emit(Phase.API_KEY, Status.ERROR, "Upload failed: ${e.javaClass.simpleName}: ${e.message}")
             throw e
@@ -1778,8 +1911,8 @@ class OciProvisioner(
             method = "POST",
             path = path,
             host = host,
-            useSecurityToken = true,
-            securityToken = auth.securityToken,
+            useSecurityToken = auth.usesSecurityToken,
+            securityToken = auth.activeSecurityToken,
             body = body,
         )
         return Request.Builder()
@@ -1827,7 +1960,7 @@ class OciProvisioner(
                     method = "GET",
                     path = path,
                     host = host,
-                    useSecurityToken = true, securityToken = auth.securityToken, )
+                    useSecurityToken = auth.usesSecurityToken, securityToken = auth.activeSecurityToken, )
             val req = Request.Builder()
                 .url("https://$host$path")
                 .header("date", dateStr)
@@ -1853,7 +1986,7 @@ class OciProvisioner(
                     method = "GET",
                     path = path,
                     host = host,
-                    useSecurityToken = true, securityToken = auth.securityToken, )
+                    useSecurityToken = auth.usesSecurityToken, securityToken = auth.activeSecurityToken, )
             val req = Request.Builder()
                 .url("https://$host$path")
                 .header("date", dateStr)
@@ -1883,7 +2016,7 @@ class OciProvisioner(
                     method = "PUT",
                     path = path,
                     host = host,
-                    useSecurityToken = true, securityToken = auth.securityToken,
+                    useSecurityToken = auth.usesSecurityToken, securityToken = auth.activeSecurityToken,
                     body = body, )
             val req = Request.Builder()
                 .url("https://$host$path")
@@ -1911,7 +2044,7 @@ class OciProvisioner(
                     method = "DELETE",
                     path = path,
                     host = host,
-                    useSecurityToken = true, securityToken = auth.securityToken, )
+                    useSecurityToken = auth.usesSecurityToken, securityToken = auth.activeSecurityToken, )
             val req = Request.Builder()
                 .url("https://$host$path")
                 .header("date", dateStr)

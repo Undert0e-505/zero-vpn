@@ -18,12 +18,17 @@ import java.net.URLEncoder
 import java.security.MessageDigest
 import java.security.PrivateKey
 
+/**
+ * Durable API-key credentials for the background retry worker.
+ * The worker always uses API-key auth (never the short-lived browser security token).
+ */
 internal data class BackgroundLaunchCredentials(
-    val securityToken: String,
-    val privateKey: PrivateKey,
     val tenancyOcid: String,
     val userOcid: String,
     val fingerprint: String,
+    val privateKey: PrivateKey,
+    val region: String,
+    val publicKeySha256: String? = null,
 )
 
 internal data class BackgroundLaunchParams(
@@ -72,12 +77,25 @@ internal sealed class BackgroundLaunchResult {
         val redactedRequestId: String?,
         val diagnostics: LaunchFailureDiagnostics,
     ) : BackgroundLaunchResult()
+
+    /**
+     * OCI returned HTTP 401 — the signed request was transmitted but OCI rejected the authentication.
+     * This is NOT a local preparation failure; the request was sent and a response was received.
+     */
+    data class AuthenticationFailure(
+        val category: String,
+        val safeMessage: String,
+        val httpStatus: Int,
+        val redactedRequestId: String?,
+        val diagnostics: LaunchFailureDiagnostics,
+    ) : BackgroundLaunchResult()
 }
 
 internal fun BackgroundLaunchResult.failureDiagnosticsOrNull(): LaunchFailureDiagnostics? = when (this) {
     is BackgroundLaunchResult.LocalPreparationFailure -> diagnostics
     is BackgroundLaunchResult.TransmissionFailure -> diagnostics
     is BackgroundLaunchResult.AmbiguousFailure -> diagnostics
+    is BackgroundLaunchResult.AuthenticationFailure -> diagnostics
     else -> null
 }
 
@@ -161,6 +179,13 @@ private data class LaunchProgressTracker(
     )
 }
 
+/**
+ * Thrown when OCI returns HTTP 401 on a signed request.
+ * The background launcher catches this and returns [BackgroundLaunchResult.AuthenticationFailure].
+ */
+internal class OciAuthenticationException(val response: OciHttpResponse) :
+    Exception("OCI returned HTTP 401: authentication rejected.")
+
 internal class OciBackgroundLauncher(
     private val transport: OciHttpTransport = OkHttpOciTransport(),
     private val identityHostOverride: String? = null,
@@ -222,6 +247,16 @@ internal class OciBackgroundLauncher(
             }
         } catch (cancelled: CancellationException) {
             throw cancelled
+        } catch (authFailure: OciAuthenticationException) {
+            // HTTP 401 — a transmitted auth failure, NOT a local preparation failure.
+            val diagnostics = tracker.capture(authFailure, retryToken, sessionId)
+            return BackgroundLaunchResult.AuthenticationFailure(
+                category = "oci-authentication-failed",
+                safeMessage = "OCI rejected the signed request with HTTP 401.",
+                httpStatus = 401,
+                redactedRequestId = diagnostics.redactedRequestId,
+                diagnostics = diagnostics,
+            )
         } catch (error: Exception) {
             val diagnostics = tracker.capture(error, retryToken, sessionId)
             return when {
@@ -287,6 +322,10 @@ internal class OciBackgroundLauncher(
         val response = get(credentials, host, path, tracker, operation)
         tracker.progress = LaunchProgress.PREPARING_REQUEST
         tracker.failingOperation = "validate-$operation-response"
+        if (response.code == 401) {
+            // HTTP 401 is a transmitted auth failure, NOT a local preparation failure.
+            throw OciAuthenticationException(response)
+        }
         if (!response.isSuccessful) throw IllegalStateException("OCI GET failed: ${response.code}")
         return JSONArray(response.body.ifBlank { "[]" })
     }
@@ -308,8 +347,8 @@ internal class OciBackgroundLauncher(
             method = "GET",
             path = path,
             host = host,
-            useSecurityToken = true,
-            securityToken = credentials.securityToken,
+            useSecurityToken = false,
+            securityToken = null,
         )
         val request = Request.Builder()
             .url("$scheme://$host$path")
@@ -348,8 +387,8 @@ internal class OciBackgroundLauncher(
             method = "POST",
             path = path,
             host = host,
-            useSecurityToken = true,
-            securityToken = credentials.securityToken,
+            useSecurityToken = false,
+            securityToken = null,
             body = body,
         )
         tracker.requestSigningCompleted = true
@@ -404,7 +443,29 @@ internal class OciBackgroundLauncher(
         val requestId = response.redactedRequestId()
         return when (response.code) {
             429 -> BackgroundLaunchResult.RateLimited(parseRetryAfterSeconds(response.header("Retry-After")))
-            400, 401, 403, 404, 409 -> BackgroundLaunchResult.TerminalFailure(response.code, code, "terminal-oci", requestId)
+            401 -> {
+                // Should not reach here normally (OciAuthenticationException handles 401 in getArray/post),
+                // but handle defensively in case classifyOther is called directly.
+                BackgroundLaunchResult.AuthenticationFailure(
+                    category = "oci-authentication-failed",
+                    safeMessage = "OCI rejected the signed request with HTTP 401.",
+                    httpStatus = 401,
+                    redactedRequestId = requestId,
+                    diagnostics = LaunchFailureDiagnostics.capture(
+                        error = IllegalStateException("HTTP 401 from OCI"),
+                        progress = LaunchProgress.RESPONSE_RECEIVED,
+                        failingOperation = "classify-launch-response",
+                        requestConstructionCompleted = true,
+                        requestSigningCompleted = true,
+                        transmissionStarted = true,
+                        responseHeadersReceived = true,
+                        redactedRequestId = requestId,
+                        retryToken = "",
+                        sessionId = "",
+                    ),
+                )
+            }
+            400, 403, 404, 409 -> BackgroundLaunchResult.TerminalFailure(response.code, code, "terminal-oci", requestId)
             408, 500, 502, 503, 504 -> BackgroundLaunchResult.AmbiguousFailure(response.code, "ambiguous-oci", requestId)
             else -> BackgroundLaunchResult.TerminalFailure(response.code, code, "unexpected-oci", requestId)
         }

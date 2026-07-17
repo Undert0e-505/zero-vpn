@@ -148,6 +148,71 @@ class RetryCredentialVaultTest {
         assertTrue(store.bulkWrites.isEmpty())
     }
 
+    @Test fun durableApiKeyCredentialsRoundTrip() {
+        val store = FakeRetrySecretStore()
+        val vault = RetryCredentialVault(store)
+        val signingKey = OciRequestSigner.generateKeyPair().private
+        val pem = RetryCredentialVault.privateKeyToPkcs8Pem(signingKey)
+        val creds = DurableApiKeyCredentials(
+            tenancyOcid = "ocid1.tenancy.oc1..tenancy",
+            userOcid = "ocid1.user.oc1..user",
+            fingerprint = "aa:bb:cc",
+            privateKeyPem = pem,
+            region = "uk-london-1",
+            publicKeySha256 = "abc123",
+        )
+        assertTrue(vault.storeApiKeyCredentials("session-1", creds))
+        val loaded = vault.loadApiKeyCredentials("session-1")
+        assertEquals(creds, loaded)
+        vault.clearApiKeyCredentials("session-1")
+        assertNull(vault.loadApiKeyCredentials("session-1"))
+    }
+
+    @Test fun durableApiKeyCredentialsRejectIncompleteInput() {
+        val store = FakeRetrySecretStore()
+        val vault = RetryCredentialVault(store)
+        val goodPem = RetryCredentialVault.privateKeyToPkcs8Pem(OciRequestSigner.generateKeyPair().private)
+        val base = DurableApiKeyCredentials(
+            tenancyOcid = "t", userOcid = "u", fingerprint = "f",
+            privateKeyPem = goodPem, region = "r", publicKeySha256 = null,
+        )
+        assertFalse(vault.storeApiKeyCredentials("", base))
+        assertFalse(vault.storeApiKeyCredentials("s", base.copy(tenancyOcid = "")))
+        assertFalse(vault.storeApiKeyCredentials("s", base.copy(userOcid = "")))
+        assertFalse(vault.storeApiKeyCredentials("s", base.copy(fingerprint = "")))
+        assertFalse(vault.storeApiKeyCredentials("s", base.copy(privateKeyPem = "")))
+        assertFalse(vault.storeApiKeyCredentials("s", base.copy(region = "")))
+    }
+
+    @Test fun provisioningApiKeyCredentialsArePromotedToSession() {
+        val store = FakeRetrySecretStore()
+        val vault = RetryCredentialVault(store)
+        val provisioningId = "oci:pending-exit"
+        val signingKey = OciRequestSigner.generateKeyPair().private
+        val pem = RetryCredentialVault.privateKeyToPkcs8Pem(signingKey)
+        val creds = DurableApiKeyCredentials(
+            tenancyOcid = "ocid1.tenancy.oc1..tenancy",
+            userOcid = "ocid1.user.oc1..user",
+            fingerprint = "aa:bb:cc",
+            privateKeyPem = pem,
+            region = "uk-london-1",
+            publicKeySha256 = null,
+        )
+        assertTrue(vault.storeProvisioningApiKeyCredentials(provisioningId, creds))
+        val repository = CapacityRetryRepository(
+            FakeSharedPreferences(),
+            Clock.fixed(Instant.parse("2026-07-15T12:00:00Z"), ZoneOffset.UTC),
+        )
+        val result = CapacityRetrySessionStarter(repository, vault).start(startContext(provisioningId))
+        assertTrue(result is CapacityRetryStartResult.Started)
+        val session = (result as CapacityRetryStartResult.Started).session
+        // Durable API-key credentials should be promoted to the session scope
+        val promoted = vault.loadApiKeyCredentials(session.sessionId)
+        assertEquals(creds, promoted)
+        // Provisioning-scope credentials should be cleared
+        assertNull(vault.loadProvisioningApiKeyCredentials(provisioningId))
+    }
+
     private fun startContext(provisioningId: String) = CapacityRetryStartContext(
         provisioningId = provisioningId,
         candidateId = provisioningId,

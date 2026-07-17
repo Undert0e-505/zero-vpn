@@ -22,7 +22,7 @@ one OCI instance-launch request in each 15-minute eligibility window:
   `InternalError` and `message` equal to `Out of host capacity` (case-insensitive,
   with an optional trailing period)
 - **No capacity fallback for:** 400, 401, 403, 429, network timeouts,
-  `IOException`, a generic 500, or any other non-capacity failure
+  `IOException`, a generic 500, or any other non-capacity failure. HTTP 401 is classified as `AuthenticationFailure` (not `LocalPreparationFailure`) and pauses the session with `PAUSED_AUTH_REQUIRED`.
 - **HTTP 429:** keep the same pending memory target and the same fixed deadline,
   preserve the retry credential, and wait until the later of 15 minutes or an
   integer-seconds `Retry-After` value before another launch request
@@ -199,7 +199,7 @@ The corrected sequence is:
 1. Record the Private Chat and automatic-retry choices.
 2. Authenticate with Oracle once and generate one RSA signing keypair.
 3. Upload that API key once.
-4. Store the security token and PKCS8 private key in Android Keystore-backed storage under the pending provisioning ID.
+4. Store the durable API-key credentials (tenancy OCID, user OCID, fingerprint, PKCS8 private key, region, public-key SHA-256 digest) in Android Keystore-backed storage under the pending provisioning ID. The background retry worker loads these durable API-key credentials — never the short-lived browser security token.
 5. Send one foreground A1 Flex 1 OCPU / 6 GB launch request.
 6. On success, continue foreground provisioning and cancel any retry state.
 7. On the exact capacity response, persist 4 GB as the next target, enter `WAITING_FOR_RETRY`, and make no immediate fallback request. If the pre-auth policy was enabled, ZeroVPN schedules the first background slot no earlier than 15 minutes later. If it was disabled, the capacity screen retains **Keep trying for 24 hours** as a manual opt-in.

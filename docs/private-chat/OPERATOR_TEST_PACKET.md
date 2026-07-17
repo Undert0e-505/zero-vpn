@@ -273,3 +273,21 @@ Screenshots/logs to return exactly:
 - post-switch Home/Diagnostics evidence showing the candidate active and old exit retained.
 
 Copied logs to return: Dev Mode provisioning log and copied Diagnostics summary only after reviewing them for secrets. Redact Oracle account identifiers, full OCIDs, request IDs, public IPs if Aaron considers them sensitive, Matrix user credentials/tokens, SSH private keys, WireGuard private keys/configs, TLS private keys, auth headers, request signatures, and any full reusable request body.
+
+
+## OCI shared-signer authentication fix (2026-07-17)
+
+The OCI authentication fix changes how the background retry worker authenticates:
+
+- After API key upload, the provisioner switches from browser security-token auth to durable API-key auth
+- The retry worker loads durable API-key credentials (tenancy, user, fingerprint, private key, region, public-key digest) from encrypted storage
+- HTTP 401 from OCI on a signed request is classified as `AuthenticationFailure` and pauses the session with `PAUSED_AUTH_REQUIRED`
+- The worker does NOT auto-generate a new API key or reset the retry deadline on 401
+- The Private Chat setup switch is hidden while a retry session is active
+
+### Test APK for this lane
+
+` `	ext `
+D:\dev\zero-vpn\artifacts\zerovpn-shared-oci-signer-fix-debug.apk
+D:\dev\zero-vpn\artifacts\zerovpn-shared-oci-signer-fix-debug.apk.sha256
+` ` `

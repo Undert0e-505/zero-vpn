@@ -224,6 +224,7 @@ fun ProvisioningScreen(
                     capacityRetryPolicyEnabled = capacityRetryPolicyEnabled,
                     privateChatToggleEnabled = isPrivateChatRequestToggleEnabled(hasActiveCapacityRetry),
                     hasActiveCapacityRetry = hasActiveCapacityRetry,
+                    hidePrivateChatSwitch = shouldHidePrivateChatSwitch(visibleRetrySession),
                     onPrivateChatRequestedChange = viewModel::setPrivateChatRequested,
                     onCapacityRetryPolicyChange = viewModel::setCapacityRetryPolicyEnabled,
                     onSelectRegion = viewModel::selectOracleRegion,
@@ -246,6 +247,7 @@ fun ProvisioningScreen(
                     capacityRetryPolicyEnabled = capacityRetryPolicyEnabled,
                     privateChatToggleEnabled = isPrivateChatRequestToggleEnabled(hasActiveCapacityRetry),
                     hasActiveCapacityRetry = hasActiveCapacityRetry,
+                    hidePrivateChatSwitch = shouldHidePrivateChatSwitch(visibleRetrySession),
                     onPrivateChatRequestedChange = viewModel::setPrivateChatRequested,
                     onCapacityRetryPolicyChange = viewModel::setCapacityRetryPolicyEnabled,
                     onSelectRegion = viewModel::selectOracleRegion,
@@ -597,6 +599,21 @@ internal enum class PrivateChatSwitchRole {
 internal fun isPrivateChatRequestToggleEnabled(hasActiveCapacityRetry: Boolean): Boolean =
     !hasActiveCapacityRetry
 
+/**
+ * Whether the Private Chat setup switch should be hidden entirely because a retry card owns the actions.
+ */
+internal fun shouldHidePrivateChatSwitch(retrySession: CapacityRetrySession?): Boolean {
+    if (retrySession == null) return false
+    return retrySession.state in setOf(
+        CapacityRetryState.ACTIVE,
+        CapacityRetryState.WAITING_FOR_RETRY,
+        CapacityRetryState.PAUSED_AUTH_REQUIRED,
+        CapacityRetryState.FAILED_AMBIGUOUS_RECONCILIATION_REQUIRED,
+        CapacityRetryState.FAILED_TERMINAL,
+        CapacityRetryState.TIMED_OUT,
+    )
+}
+
 internal fun visiblePrivateChatSwitchRoles(
     privateChatRequested: Boolean,
     onboardingState: OracleOnboardingState,
@@ -623,6 +640,7 @@ private fun OracleOnboardingContent(
     capacityRetryPolicyEnabled: Boolean,
     privateChatToggleEnabled: Boolean,
     hasActiveCapacityRetry: Boolean,
+    hidePrivateChatSwitch: Boolean,
     onPrivateChatRequestedChange: (Boolean) -> Unit,
     onCapacityRetryPolicyChange: (Boolean) -> Unit,
     onSelectRegion: (String?) -> Unit,
@@ -678,29 +696,31 @@ private fun OracleOnboardingContent(
                 .padding(12.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Column(modifier = Modifier.weight(1f)) {
-                    Text(
-                        text = "Private Chat Node (Phase 1)",
-                        fontSize = 14.sp,
-                        fontWeight = FontWeight.SemiBold,
-                        color = TextPrimary,
-                    )
-                    Text(
-                        text = "Optional owner node, private to WireGuard. No invitations or public Matrix access yet.",
-                        fontSize = 12.sp,
-                        color = TextDim,
-                        lineHeight = 17.sp,
+            if (!hidePrivateChatSwitch) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "Private Chat Node (Phase 1)",
+                            fontSize = 14.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = TextPrimary,
+                        )
+                        Text(
+                            text = "Optional owner node, private to WireGuard. No invitations or public Matrix access yet.",
+                            fontSize = 12.sp,
+                            color = TextDim,
+                            lineHeight = 17.sp,
+                        )
+                    }
+                    Switch(
+                        checked = privateChatRequested,
+                        onCheckedChange = onPrivateChatRequestedChange,
+                        enabled = privateChatToggleEnabled,
                     )
                 }
-                Switch(
-                    checked = privateChatRequested,
-                    onCheckedChange = onPrivateChatRequestedChange,
-                    enabled = privateChatToggleEnabled,
-                )
             }
             if (hasActiveCapacityRetry) {
                 Text(

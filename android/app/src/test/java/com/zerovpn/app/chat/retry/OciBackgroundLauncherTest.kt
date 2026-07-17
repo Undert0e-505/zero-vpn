@@ -179,6 +179,29 @@ class OciBackgroundLauncherTest {
         assertEquals("efghijklmnop", failure.requestId)
     }
 
+    @Test fun availabilityDomainLookup401IsAuthenticationFailureNotLocalPreparation() = runBlocking {
+        val pair = OciRequestSigner.generateKeyPair()
+        val transport = FakeTransport(
+            OciHttpResponse(401, """{"code":"NotAuthenticated"}"""),
+        )
+
+        val result = launcher(transport).launchA1Instance(
+            credentials(pair.private),
+            params(),
+            pendingMemoryGb = 6,
+            retryToken = "auth-failure-token",
+            sessionId = "session:auth-failure",
+        )
+
+        val failure = result as BackgroundLaunchResult.AuthenticationFailure
+        assertEquals("oci-authentication-failed", failure.category)
+        assertEquals(401, failure.httpStatus)
+        // Auth failure should NOT be classified as local preparation failure
+        assertFalse(result is BackgroundLaunchResult.LocalPreparationFailure)
+        // No launch POST should have been sent
+        assertEquals(0, transport.requests.count { it.method == "POST" })
+    }
+
     private fun launcher(transport: OciHttpTransport) = OciBackgroundLauncher(
         transport,
         identityHostOverride = "identity.test",
@@ -186,11 +209,11 @@ class OciBackgroundLauncherTest {
     )
 
     private fun credentials(privateKey: java.security.PrivateKey) = BackgroundLaunchCredentials(
-        securityToken = "test-security-token",
-        privateKey = privateKey,
         tenancyOcid = "ocid1.tenancy.oc1..tenancy",
         userOcid = "ocid1.user.oc1..user",
         fingerprint = "aa:bb:cc",
+        privateKey = privateKey,
+        region = "uk-london-1",
     )
 
     private fun params() = BackgroundLaunchParams(

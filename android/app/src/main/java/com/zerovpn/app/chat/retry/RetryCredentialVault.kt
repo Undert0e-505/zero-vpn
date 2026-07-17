@@ -29,11 +29,29 @@ data class RetryCredentials(
     val privateKeyPem: String,
 )
 
+/**
+ * Durable API-key credentials persisted after the API key upload succeeds.
+ * The background retry worker loads these instead of the short-lived browser token.
+ */
+data class DurableApiKeyCredentials(
+    val tenancyOcid: String,
+    val userOcid: String,
+    val fingerprint: String,
+    val privateKeyPem: String,
+    val region: String,
+    val publicKeySha256: String?,
+)
+
 class RetryCredentialVault(
     private val secretStore: RetrySecretStore,
 ) {
     constructor(secureSecretStore: SecureSecretStore) : this(SecureRetrySecretStore(secureSecretStore))
 
+    /**
+     * @deprecated Use [storeApiKeyCredentials] for durable post-upload API-key auth.
+     * Kept for backward compatibility with existing provisioning flow.
+     */
+    @Deprecated("Use storeApiKeyCredentials for durable API-key auth", ReplaceWith("storeApiKeyCredentials"))
     fun storeCredentials(sessionId: String, securityToken: String, privateKeyPem: String): Boolean {
         if (sessionId.isBlank() || securityToken.isBlank() || privateKeyPem.isBlank()) return false
         val expected = RetryCredentials(securityToken, privateKeyPem)
@@ -61,11 +79,94 @@ class RetryCredentialVault(
         secretStore.removeSecret(SecureSecretStore.oracleApiSigningPrivateKey(sessionId))
     }
 
+    // --- Durable API-key credential storage ---
+
+    /**
+     * Persist durable API-key credentials for the background retry worker.
+     * All fields are stored atomically via [RetrySecretStore.putSecrets].
+     */
+    fun storeApiKeyCredentials(sessionId: String, creds: DurableApiKeyCredentials): Boolean {
+        if (sessionId.isBlank()) return false
+        if (creds.tenancyOcid.isBlank() || creds.userOcid.isBlank() ||
+            creds.fingerprint.isBlank() || creds.privateKeyPem.isBlank() ||
+            creds.region.isBlank()
+        ) return false
+        val secrets = buildMap {
+            put(SecureSecretStore.oracleApiKeyTenancy(sessionId), creds.tenancyOcid)
+            put(SecureSecretStore.oracleApiKeyUser(sessionId), creds.userOcid)
+            put(SecureSecretStore.oracleApiKeyFingerprint(sessionId), creds.fingerprint)
+            put(SecureSecretStore.oracleApiKeyPrivateKey(sessionId), creds.privateKeyPem)
+            put(SecureSecretStore.oracleApiKeyRegion(sessionId), creds.region)
+            creds.publicKeySha256?.let { put(SecureSecretStore.oracleApiKeyPublicKeyDigest(sessionId), it) }
+        }
+        val committed = secretStore.putSecrets(secrets)
+        if (!committed) return false
+        // Verify round-trip
+        val loaded = loadApiKeyCredentials(sessionId) ?: return false
+        return loaded.tenancyOcid == creds.tenancyOcid &&
+            loaded.userOcid == creds.userOcid &&
+            loaded.fingerprint == creds.fingerprint &&
+            loaded.privateKeyPem == creds.privateKeyPem &&
+            loaded.region == creds.region
+    }
+
+    /**
+     * Load durable API-key credentials for the background retry worker.
+     * Returns null if any required field is missing.
+     */
+    fun loadApiKeyCredentials(sessionId: String): DurableApiKeyCredentials? {
+        if (sessionId.isBlank()) return null
+        val tenancy = secretStore.getSecret(SecureSecretStore.oracleApiKeyTenancy(sessionId))?.takeIf { it.isNotBlank() }
+            ?: return null
+        val user = secretStore.getSecret(SecureSecretStore.oracleApiKeyUser(sessionId))?.takeIf { it.isNotBlank() }
+            ?: return null
+        val fingerprint = secretStore.getSecret(SecureSecretStore.oracleApiKeyFingerprint(sessionId))?.takeIf { it.isNotBlank() }
+            ?: return null
+        val privateKeyPem = secretStore.getSecret(SecureSecretStore.oracleApiKeyPrivateKey(sessionId))?.takeIf { it.isNotBlank() }
+            ?: return null
+        val region = secretStore.getSecret(SecureSecretStore.oracleApiKeyRegion(sessionId))?.takeIf { it.isNotBlank() }
+            ?: return null
+        val publicKeySha256 = secretStore.getSecret(SecureSecretStore.oracleApiKeyPublicKeyDigest(sessionId))?.takeIf { it.isNotBlank() }
+        return DurableApiKeyCredentials(
+            tenancyOcid = tenancy,
+            userOcid = user,
+            fingerprint = fingerprint,
+            privateKeyPem = privateKeyPem,
+            region = region,
+            publicKeySha256 = publicKeySha256,
+        )
+    }
+
+    /**
+     * Remove all durable API-key credentials for a session.
+     */
+    fun clearApiKeyCredentials(sessionId: String) {
+        if (sessionId.isBlank()) return
+        secretStore.removeSecret(SecureSecretStore.oracleApiKeyTenancy(sessionId))
+        secretStore.removeSecret(SecureSecretStore.oracleApiKeyUser(sessionId))
+        secretStore.removeSecret(SecureSecretStore.oracleApiKeyFingerprint(sessionId))
+        secretStore.removeSecret(SecureSecretStore.oracleApiKeyPrivateKey(sessionId))
+        secretStore.removeSecret(SecureSecretStore.oracleApiKeyRegion(sessionId))
+        secretStore.removeSecret(SecureSecretStore.oracleApiKeyPublicKeyDigest(sessionId))
+    }
+
     fun storeProvisioningCredentials(
         provisioningId: String,
         securityToken: String,
         privateKeyPem: String,
     ): Boolean = storeCredentials(provisioningScopeId(provisioningId), securityToken, privateKeyPem)
+
+    /**
+     * Store durable API-key credentials staged during provisioning.
+     * The worker promotes these to the session scope when the retry session starts.
+     */
+    fun storeProvisioningApiKeyCredentials(
+        provisioningId: String,
+        creds: DurableApiKeyCredentials,
+    ): Boolean = storeApiKeyCredentials(provisioningScopeId(provisioningId), creds)
+
+    fun loadProvisioningApiKeyCredentials(provisioningId: String): DurableApiKeyCredentials? =
+        loadApiKeyCredentials(provisioningScopeId(provisioningId))
 
     fun storeProvisioningCredentials(
         provisioningId: String,
@@ -82,6 +183,17 @@ class RetryCredentialVault(
         loadCredentials(provisioningScopeId(provisioningId))
 
     fun promoteProvisioningCredentials(provisioningId: String, sessionId: String): Boolean {
+        // Promote durable API-key credentials (new path)
+        val stagedApiKey = loadProvisioningApiKeyCredentials(provisioningId)
+        if (stagedApiKey != null) {
+            if (!storeApiKeyCredentials(sessionId, stagedApiKey)) return false
+            if (loadApiKeyCredentials(sessionId) == null) return false
+            clearProvisioningApiKeyCredentials(provisioningId)
+            // Also clear legacy credentials if present
+            clearProvisioningCredentials(provisioningId)
+            return true
+        }
+        // Fall back to legacy security-token credentials
         if (loadCredentials(sessionId) != null) {
             clearProvisioningCredentials(provisioningId)
             return true
@@ -95,6 +207,10 @@ class RetryCredentialVault(
 
     fun clearProvisioningCredentials(provisioningId: String) {
         clearCredentials(provisioningScopeId(provisioningId))
+    }
+
+    fun clearProvisioningApiKeyCredentials(provisioningId: String) {
+        clearApiKeyCredentials(provisioningScopeId(provisioningId))
     }
 
     fun loadPrivateKey(privateKeyPem: String): PrivateKey = privateKeyFromPkcs8Pem(privateKeyPem)
@@ -165,7 +281,8 @@ class CapacityRetrySessionStarter(
         }
         if (
             existing == null &&
-            vault.loadProvisioningCredentials(context.provisioningId) == null
+            vault.loadProvisioningCredentials(context.provisioningId) == null &&
+            vault.loadProvisioningApiKeyCredentials(context.provisioningId) == null
         ) {
             return CapacityRetryStartResult.MissingStoredCredentials
         }
