@@ -129,6 +129,10 @@ android {
         buildConfig = true
     }
 
+    testOptions {
+        unitTests.isIncludeAndroidResources = true
+    }
+
     // The Ubuntu installer is authored and tested under server/private-chat and
     // packaged as an APK asset. There is no runtime or build dependency on zero-chat.
     sourceSets.getByName("main").assets.apply {
@@ -173,6 +177,7 @@ dependencies {
     implementation(libs.androidx.compose.material3)
     implementation(libs.androidx.compose.material.icons.extended)
     implementation(libs.androidx.navigation.compose)
+    implementation(libs.androidx.work.runtime.ktx)
     implementation(libs.androidx.lifecycle.viewmodel.compose)
     implementation(libs.androidx.camera.camera2)
     implementation(libs.androidx.camera.lifecycle)
@@ -186,5 +191,6 @@ dependencies {
     implementation(libs.zxing.core)
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.json:json:20240303")
+    testImplementation("org.robolectric:robolectric:4.16.1")
     debugImplementation(libs.androidx.compose.ui.tooling)
 }

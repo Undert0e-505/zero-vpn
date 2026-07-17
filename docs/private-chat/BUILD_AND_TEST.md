@@ -258,3 +258,25 @@ On a disposable VM, exercise:
 - Synapse/PostgreSQL health failure with owner VPN survival.
 
 Never use production owner history or credentials for these tests.
+
+
+## Background retry validation recorded on 2026-07-15
+
+Android JVM tests now include the requested 57-test debug unit suite:
+
+- 16 capacity retry model tests;
+- 19 capacity retry repository/persistence tests with deterministic clocks and fake SharedPreferences;
+- 15 A1 capacity classifier/fallback tests;
+- 4 provisioning failure attribution tests;
+- 3 Private Chat node model tests.
+
+The retry repository tests cover durable reconstruction, exact 24-hour deadlines, 15-minute target cadence, duplicate-session prevention, cancellation, timeout, delayed worker deadline behavior, cycle-count semantics, capacity-miss rescheduling, retry-token persistence for ambiguous reuse, candidate duplicate prevention, and ready/switch candidate state persistence.
+
+The distinct debug APK for this lane is:
+
+```text
+D:\dev\zero-vpnrtifacts\zerovpn-private-chat-background-retry-debug.apk
+D:\dev\zero-vpnrtifacts\zerovpn-private-chat-background-retry-debug.apk.sha256
+```
+
+Use the SHA-256 file generated with the build as the source of truth for the current artifact.

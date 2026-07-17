@@ -229,3 +229,47 @@ Use this path if chat installation fails or the node health is unacceptable:
 Removal is intentionally chat-scoped. It must not edit `/etc/wireguard`, stop
 `wg-quick@wg0`, delete OCI resources, or remove the Android VPN profile. The
 runtime test above is required to demonstrate that behavior on Aaron's node.
+
+## Background retry and deferred-chat operator tests
+
+### Test 1 - Background capacity retry
+
+1. Install the debug APK.
+2. Enable Developer Mode.
+3. Request Private Chat and reach exact capacity failure for both 6 GB and 4 GB.
+4. Tap **Keep trying for 24 hours**.
+5. Capture the capacity retry status and Dev Mode log.
+6. Remove the app from recents, reopen it later, and return to OCI setup.
+7. Verify the UTC deadline did not reset and the background retry count did not include the original foreground attempt.
+8. Tap **Stop retrying** when the stop action is available and verify no further WorkManager work is scheduled.
+
+Redact Oracle account identifiers, full OCIDs, request IDs, WireGuard keys, Matrix credentials, and any private key material. The current build may pause with auth-required until durable OCI signing material is persisted for background use; report that state exactly if seen.
+
+### Test 2 - VPN-only bypass
+
+1. From the capacity failure screen, choose **Set up VPN only instead**.
+2. Confirm the normal VPN-only Oracle shape and cost warning are shown.
+3. Provision the standard VM, connect, and verify handshake plus regional exit IP.
+4. Confirm no Private Chat services are installed or reported healthy on that VM.
+5. Confirm **Add Private Chat** is available on the VPN-only exit.
+
+### Test 3 - Deferred parallel candidate
+
+1. From a working VPN-only OCI exit, tap **Add Private Chat**.
+2. Confirm the original VPN remains selected and usable.
+3. Capture the candidate status and any capacity retry status.
+4. When full candidate provisioning lands, acquire/provision the candidate, capture diagnostics, switch explicitly, verify VPN and Private Chat, and confirm the old VM remains available for rollback.
+
+Screenshots/logs to return exactly:
+
+- capacity failure screen showing **Keep trying for 24 hours** and **Set up VPN only instead**;
+- initial retry status card showing retry count, last result, next target attempt, remaining time, deadline, preferred, and fallback;
+- relaunch retry status card after app removal/reopen, with the same fixed deadline still visible;
+- Dev Mode log entries for session created, worker reconciliation or pause, cancellation/timeout if exercised, VPN-only bypass, candidate created, ready-to-switch, and switch result;
+- Diagnostics **CAPACITY RETRY** card;
+- Diagnostics **DEFERRED CHAT CANDIDATE** card;
+- VPN-only success card and Home card showing **Add Private Chat**;
+- explicit switch review screen before switching;
+- post-switch Home/Diagnostics evidence showing the candidate active and old exit retained.
+
+Copied logs to return: Dev Mode provisioning log and copied Diagnostics summary only after reviewing them for secrets. Redact Oracle account identifiers, full OCIDs, request IDs, public IPs if Aaron considers them sensitive, Matrix user credentials/tokens, SSH private keys, WireGuard private keys/configs, TLS private keys, auth headers, request signatures, and any full reusable request body.

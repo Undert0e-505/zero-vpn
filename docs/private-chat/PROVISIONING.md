@@ -8,34 +8,40 @@ Private Chat is an optional workload installed after ZeroVPN has created, verifi
 
 If Private Chat is not selected, ZeroVPN keeps the existing `VM.Standard.E2.1.Micro` provisioning path and does not upload or run the chat installer. If it is selected, ZeroVPN requests `VM.Standard.A1.Flex` with 1 OCPU, 6 GB RAM, and a 50 GB boot volume.
 
-### A1 capacity fallback
+### A1 capacity retry slots
 
-Oracle Free Tier A1 host capacity is not guaranteed. When the preferred 6 GB
-launch attempt receives an HTTP 500 response with `code: InternalError` and
-`message` containing `Out of host capacity`, ZeroVPN automatically retries the
-instance launch with a compact 4 GB configuration. The fallback is precise:
+Oracle Free Tier A1 host capacity is not guaranteed. ZeroVPN permits exactly
+one OCI instance-launch request in each 15-minute eligibility window:
 
-- **Preferred:** `VM.Standard.A1.Flex` — 1 OCPU / 6 GB
-- **Compact fallback:** `VM.Standard.A1.Flex` — 1 OCPU / 4 GB
-- **Trigger:** HTTP 500 + response body containing both `InternalError` and
-  `Out of host capacity` (case-insensitive)
-- **No fallback for:** 401, 403, 429, 400, network timeouts, IOException,
-  generic 500 without the capacity message, or any other non-capacity failure
-- **No further fallback:** E2.1.Micro, paid shapes, increased OCPU, or any
-  non-Free-Tier-eligible shape is never attempted
-- **Final failure:** If the 4 GB attempt also returns out-of-host-capacity, the
-  UI displays a clear capacity error attributed to **VM launch**, not **API key
-  setup**
-- **Retry:** A user-initiated retry starts fresh with the preferred 6 GB
-  configuration. Authentication and API-key state from the previous run are
-  preserved when the retry begins from the saved Oracle session
-- **Cleanup:** If both attempts fail, no instance OCID is created, so no
-  instance termination is requested. Network resources (VCN, subnet, security
-  list, internet gateway) that were already created are cleaned up normally
+- **Initial foreground request:** `VM.Standard.A1.Flex` - 1 OCPU / 6 GB
+- **First retry target:** `VM.Standard.A1.Flex` - 1 OCPU / 4 GB, no earlier
+  than 15 minutes after an exact 6 GB capacity miss
+- **Later retry targets:** alternate 6 GB and 4 GB after each exact capacity
+  miss; a slot never sends both configurations
+- **Capacity classification:** HTTP 500 with JSON `code` equal to
+  `InternalError` and `message` equal to `Out of host capacity` (case-insensitive,
+  with an optional trailing period)
+- **No capacity fallback for:** 400, 401, 403, 429, network timeouts,
+  `IOException`, a generic 500, or any other non-capacity failure
+- **HTTP 429:** keep the same pending memory target and the same fixed deadline,
+  preserve the retry credential, and wait until the later of 15 minutes or an
+  integer-seconds `Retry-After` value before another launch request
+- **No shape escalation:** E2.1.Micro, paid shapes, increased OCPU, and other
+  non-Free-Tier-eligible shapes are never automatic fallbacks
+- **Retry policy:** When Private Chat is selected, the owner chooses whether
+  automatic capacity retry is enabled before Oracle authentication starts.
+  Enabling the policy records the choice only; it does not enqueue WorkManager
+  or launch an OCI request.
+- **Credential once:** The foreground workflow uploads one API key. Background
+  and manual capacity retries reuse its securely stored signing credential;
+  **Retry** never reopens browser authentication or uploads another API key.
+- **Cleanup:** Capacity misses and rate limiting do not request instance cleanup
+  when no instance OCID exists. Existing user-initiated cleanup controls remain
+  available for partial network resources.
 
-The stage attribution fix ensures that capacity failures are always reported
-as **Failed at: VM launch**, not as **Failed at: API key setup**, which was the
-original bug observed during the first owner test.
+Capacity failures are attributed to **VM launch**, not **API key setup**. A
+rate-limited session is shown as waiting for its next eligible request rather
+than as a terminal provisioning error.
 
 The product wording is deliberately limited:
 
@@ -174,3 +180,100 @@ sudo python3 /opt/zerovpn/private-chat/installer/install.py remove --yes
 ```
 
 Never paste the contents of `/etc/zerovpn/private-chat/secrets` into diagnostics.
+
+## 24-hour A1 capacity retry and deferred Private Chat
+
+Status: implemented for durable app state, relaunch UI, diagnostics, candidate records, explicit switch state, session-scoped credential vaulting, and unattended background OCI A1 launch attempts.
+
+When Private Chat is enabled, the onboarding screen shows **Automatically retry if A1 capacity is unavailable** before either Oracle account action. The choice is synchronously persisted as `capacity_retry_policy_enabled` before browser authentication. Enabling it authorizes a later 24-hour retry window but does not create a retry session, enqueue WorkManager, or issue an OCI request.
+
+That policy switch is an initial, pre-authentication choice only. Once a
+capacity-retry session exists it is no longer rendered. The persisted retry
+session makes `privateChatRequested` authoritative `true` on reload, and the
+single Private Chat request switch is disabled while that session remains
+active. The owner ends or bypasses the session through **Stop retrying** or
+**VPN only**; toggling a second setup control cannot diverge the two states.
+
+The corrected sequence is:
+
+1. Record the Private Chat and automatic-retry choices.
+2. Authenticate with Oracle once and generate one RSA signing keypair.
+3. Upload that API key once.
+4. Store the security token and PKCS8 private key in Android Keystore-backed storage under the pending provisioning ID.
+5. Send one foreground A1 Flex 1 OCPU / 6 GB launch request.
+6. On success, continue foreground provisioning and cancel any retry state.
+7. On the exact capacity response, persist 4 GB as the next target, enter `WAITING_FOR_RETRY`, and make no immediate fallback request. If the pre-auth policy was enabled, ZeroVPN schedules the first background slot no earlier than 15 minutes later. If it was disabled, the capacity screen retains **Keep trying for 24 hours** as a manual opt-in.
+8. In later eligible slots, send exactly one request and alternate 6 GB and 4 GB only after exact capacity misses. HTTP 429 preserves the current target and delays that same target by at least another 15 minutes, or longer when `Retry-After` requires it.
+
+The capacity-specific screen also retains:
+
+- keep trying for 24 hours when automatic retry was not selected before authentication;
+- set up VPN only instead;
+- retry now;
+- cancel/cleanup using the existing failure controls.
+
+The retry session state is durable in the existing `zerovpn_provisioning` SharedPreferences file. It stores only non-secret scheduling, launch, and reconciliation metadata: session/candidate IDs, `lastLaunchAttemptFinishedAtUtc`, `nextEligibleAttemptAtUtc`, `pendingMemoryGb`, the absolute UTC deadline, worker timestamps, background cycle count, separate 6 GB and 4 GB launch request counts, last safe classification, retry-token identifiers, user OCID, tenancy/compartment OCID, API-key fingerprint, selected/token region diagnostics, subnet ID, VM SSH public key, acquired instance OCID if known, source exit ID for deferred candidates, and terminal/user-action state. New sessions begin in `WAITING_FOR_RETRY`; `ACTIVE` means a previous eligible slot ended without an instance, and `ACQUIRING` means a worker owns the launch lease. The production retry window is fixed at 24 hours from the first exact foreground capacity response. Manual Retry, HTTP 429, app relaunch, process death, device reboot, and WorkManager recreation never reconstruct or extend that deadline. WorkManager uses a 15-minute periodic request with network connectivity required, and the worker independently checks the persisted next-eligible timestamp before every possible launch. Android may delay or skip individual runs; it may not make a slot early.
+
+WorkManager uses unique periodic work named from the retry session ID with `ExistingPeriodicWorkPolicy.KEEP`, so app relaunch reconciliation does not replace an existing worker or restart its initial delay. Work input contains only the opaque retry session ID. No OCI private keys, WireGuard keys, Matrix secrets, request signatures, auth headers, or request bodies are placed in WorkManager `Data`, notifications, diagnostics, or Dev Mode text.
+
+WorkManager is initialized by its default AndroidX Startup provider. `ZeroVpnApp`
+does not supply a custom `Configuration` or `WorkerFactory`, and
+`PrivateChatCapacityRetryWorker` has only the standard application-context and
+`WorkerParameters` constructor. On process recreation the worker rebuilds
+`CapacityRetryRepository`, `RetryCredentialVault(SecureSecretStore(...))`, and
+`ProvisioningOperationLease` from `applicationContext`; it has no
+ViewModel/activity or foreground-singleton dependency.
+
+App-start reconciliation queries
+`getWorkInfosForUniqueWork(session.uniqueWorkName)` before deciding whether to
+enqueue. `ENQUEUED` and `RUNNING` work is retained. Missing, cancelled, failed,
+or unexpectedly succeeded work is re-enqueued only while the persisted session
+is inside its deadline, has readable scoped credentials, and no provisioning
+lease is active. Replacement work derives its initial delay from
+`nextEligibleAttemptAtUtc`; an overdue session therefore receives zero
+additional initial delay rather than another fixed 15-minute wait. Android
+still controls the actual execution time. Expired work is cancelled and its
+session credential is cleared.
+
+Immediately after the foreground API-key upload succeeds, ZeroVPN stores the minimum signing material in `SecureSecretStore`: the OCI browser security token and the same generated RSA API-signing private key serialized as PKCS8 PEM. Both values are encrypted with the existing Android Keystore-backed AES/GCM key alias `zerovpn.local.secretstore.v1` in the `zerovpn_secure_secrets` preference file. The initial scope is the pending provisioning ID. After exact foreground capacity failure, retry startup promotes those already-stored values to the retry session ID; it has no `AuthResult` dependency and accepts no newly generated key. The session copy is cleared on cancellation, timeout, or terminal failure. It remains available after background instance acquisition until foreground continuation completes, avoiding a second authentication solely to continue the same workflow. This is not a general Oracle credential cache.
+
+The token and PKCS8 key are encrypted first and synchronously committed in one secure-preference update before network creation or the foreground launch request proceeds. If that durable write cannot be verified, provisioning fails closed before VM launch. Promotion to the retry-session scope is likewise verified before WorkManager can be enqueued.
+
+During the authorized retry window, the device can reconstruct the RSA private key and sign OCI requests without another browser login. The worker loads credentials only from the vault, signs with `useSecurityToken=true`, reads `pendingMemoryGb`, and sends exactly one A1 Flex launch request for that slot. An exact capacity miss alternates the next target (6 GB to 4 GB or 4 GB to 6 GB). HTTP 429 records `RATE_LIMITED`, preserves the pending target and retry count, and sets the next eligible time to the later of 15 minutes or the integer-seconds `Retry-After` value. Success records `INSTANCE_ACQUIRED` with the instance OCID. If the scoped credentials are missing or unreadable, the worker fails closed with `PAUSED_AUTH_REQUIRED`; it never opens authentication or uploads another key.
+
+The status card exposes the same guarded path for **Retry**. While cooldown is active it shows **Next attempt in Xm Ys** and makes no OCI request. Once eligible, **Retry now** makes one launch request with the stored credential and current pending memory target. It does not run the authentication, API-key generation, or API-key upload flow again. The card also observes `getWorkInfosForUniqueWorkLiveData` and shows the durable scheduler state (`Enqueued`, `Running`, `Cancelled`, `Failed`, `Succeeded`, or `Not found`). If eligibility is already in the past while work remains enqueued, it explicitly says that ZeroVPN is waiting for Android's scheduler rather than implying another OCI request has run. A missing overdue work record is re-enqueued and reported as such.
+
+Each worker cycle appends a bounded, non-secret durable trace to
+`zerovpn_provisioning`: worker start, cooldown decision, lease decision,
+credential-load outcome, launch start, safe launch classification, and final
+session state. The latest entries survive process death and are rendered in
+the retry card. The trace never includes tokens, private keys, signatures,
+request bodies, or full Oracle responses.
+
+The launch path records explicit preparation, signing, request-ready,
+transmission-started, and response-received boundaries. A failure before the
+instance POST is transmitted is a terminal local failure with a specific safe
+category. A failure after transmission starts but before response headers are
+received is ambiguous because Oracle may have created the instance. Generic
+launch HTTP 5xx responses are also treated as ambiguous rather than as
+capacity misses.
+
+Ambiguous launch failures enter
+`FAILED_AMBIGUOUS_RECONCILIATION_REQUIRED`. ZeroVPN cancels the unique periodic
+work, retains the current retry token, pending memory target, encrypted signing
+credential, and original fixed deadline, and sends no later launch request.
+VPN-only bypass and replacement retry sessions remain blocked until
+reconciliation proves that Oracle did not create an A1 instance. The status
+notification links to Diagnostics; Dev Mode shows the redacted exception,
+root cause, failing operation/component, progress flags, abbreviated IDs, and
+redacted stack trace stored in the existing capacity-retry diagnostic log.
+
+Foreground and background OCI operations share one persisted provisioning lease. Foreground provisioning, manual retry, post-authentication continuation, cleanup, candidate reconciliation, and candidate switching exclude the background worker. Each acquisition has its own random token, so completion or cancellation of an older coroutine cannot release a newer operation's lease in the same process. Work reconciliation also refuses to enqueue while `ProvisioningState.Running`, while `provisioningJob` is active, or while the lease is held. The worker repeats the complete persisted-session and lease checks even if WorkManager already enqueued it; when blocked it returns success so the next periodic interval can try again. A process-instance owner makes an interrupted foreground lease stale after process death, so a killed process does not block retry forever. Unique periodic work remains a second same-session duplicate guard.
+
+Android backup is disabled for the app (`android:allowBackup="false"`), so the encrypted secure preferences are not exported through Android backup/device-transfer transports.
+
+VPN-only bypass records Private Chat as deferred and starts the existing standard `VM.Standard.E2.1.Micro` VPN-only path. It does not install PostgreSQL, Synapse, private TLS, or Matrix owner material on that VM. Eligible VPN-only OCI exits expose **Add Private Chat**, which creates one linked candidate record and enqueues the same capacity retry workflow while keeping the source VPN active. When a user returns to OCI setup, the provisioning screen renders a retry status card before normal controls. The card displays background retry cycles attempted, last attempt/result, next target attempt, remaining time from the persisted UTC deadline, deadline, and the preferred/fallback A1 configurations. It also exposes **Stop retrying**, **Set up VPN only instead**, and **View Dev Mode log**. On the immediate capacity-failure screen, a pre-enabled policy displays that active status instead of asking the owner to opt in again. Relaunch reconciliation marks expired sessions timed out and safely re-enqueues unique WorkManager work for still-waiting/active sessions only when no foreground lease is active; the countdown is never reconstructed from WorkManager timing.
+
+Deferred-chat candidates are linked to their source exit and repeated **Add Private Chat** actions route to the existing candidate. The candidate may be marked ready only when the app has a persisted candidate exit with WireGuard config, a public endpoint, healthy Private Chat status, passing PostgreSQL/Synapse/TLS/Matrix/owner/firewall checks, a passing encrypted self-test, and a TLS SPKI pin. The explicit switch operation updates the selected active exit only after the candidate exit is already persisted, records the old exit as rollback-capable, retains both VMs, and restores the previous selected exit if app-state activation fails. Runtime VPN reconnect, handshake, and exit-IP proof still require Aaron's device/operator run.
+
+Diagnostics now includes **CAPACITY RETRY** and **DEFERRED CHAT CANDIDATE** cards with PASS/FAIL/WARNING/NOT TESTED/NOT INSTALLED labels. Dev Mode events are emitted for session creation, worker reconciliation, cancellation, VPN-only bypass, candidate creation, ready-to-switch, and switch started/succeeded/failed. These records intentionally include only IDs, counts, timestamps, status labels, and abbreviated/non-secret metadata.

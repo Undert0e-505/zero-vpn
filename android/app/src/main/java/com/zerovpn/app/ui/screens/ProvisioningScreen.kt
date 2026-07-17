@@ -52,12 +52,21 @@ import com.zerovpn.app.ui.provisioning.ProvisioningViewModel
 import com.zerovpn.app.ui.provisioning.Status
 import com.zerovpn.app.ui.theme.*
 import com.zerovpn.app.chat.node.PrivateChatInstallStatus
+import com.zerovpn.app.chat.retry.CapacityRetryDiagnosticEntry
+import com.zerovpn.app.chat.retry.CapacityRetrySchedulerState
+import com.zerovpn.app.chat.retry.CapacityRetrySchedulerStatus
+import com.zerovpn.app.chat.retry.CapacityRetrySession
+import com.zerovpn.app.chat.retry.CapacityRetryState
+import com.zerovpn.app.chat.retry.hasAuthoritativePrivateChatRetry
 import com.zerovpn.app.oci.OciRegion
 import com.zerovpn.app.oci.OciRegions
 import com.zerovpn.app.vpn.VpnConnectionState
 import com.zerovpn.app.vpn.VpnViewModel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.text.SimpleDateFormat
+import java.time.Duration
+import java.time.Instant
 import java.util.Date
 import java.util.Locale
 
@@ -73,6 +82,7 @@ fun ProvisioningScreen(
     viewModel: ProvisioningViewModel = viewModel(),
     vpnViewModel: VpnViewModel = viewModel(),
     onConnectedHome: () -> Unit = {},
+    onViewDiagnostics: () -> Unit = {},
     onDestroy: (() -> Unit)? = null,
 ) {
     val state by viewModel.state.collectAsState()
@@ -82,10 +92,14 @@ fun ProvisioningScreen(
     val wireGuardPort by viewModel.wireGuardPort.collectAsState()
     val isDevMode by viewModel.isDevMode.collectAsState()
     val privateChatRequested by viewModel.privateChatRequested.collectAsState()
+    val capacityRetryPolicyEnabled by viewModel.capacityRetryPolicyEnabled.collectAsState()
     val onboardingState by viewModel.oracleOnboardingState.collectAsState()
     val selectedOracleRegion by viewModel.selectedOracleRegion.collectAsState()
     val exits by viewModel.configuredExits.collectAsState()
     val selectedExitId by viewModel.selectedExitId.collectAsState()
+    val capacityRetrySessions by viewModel.capacityRetrySessions.collectAsState()
+    val capacityRetrySchedulerStatuses by viewModel.capacityRetrySchedulerStatuses.collectAsState()
+    val capacityRetryDiagnostics by viewModel.capacityRetryDiagnostics.collectAsState()
     val vpnState by vpnViewModel.state.collectAsState()
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -95,6 +109,7 @@ fun ProvisioningScreen(
     var showDestroyDialog by remember { mutableStateOf(false) }
     var pendingPermissionExitId by remember { mutableStateOf<String?>(null) }
     var successConnectTargetId by remember { mutableStateOf<String?>(null) }
+    val hasActiveCapacityRetry = capacityRetrySessions.hasAuthoritativePrivateChatRetry()
 
     val permissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.StartActivityForResult(),
@@ -180,6 +195,25 @@ fun ProvisioningScreen(
             Spacer(modifier = Modifier.weight(1f))
         }
 
+        val visibleRetrySession = capacityRetrySessions.lastOrNull {
+            it.state != CapacityRetryState.NONE && it.state != CapacityRetryState.SUCCEEDED
+        }
+        if ((state is ProvisioningState.Idle || state is ProvisioningState.PreStart) && visibleRetrySession != null) {
+            CapacityRetryStatusCard(
+                session = visibleRetrySession,
+                schedulerStatus = capacityRetrySchedulerStatuses[visibleRetrySession.sessionId],
+                diagnosticEntries = capacityRetryDiagnostics.filter {
+                    it.sessionId == visibleRetrySession.sessionId
+                },
+                onRetry = { viewModel.retry(context) },
+                onStop = { viewModel.stopActiveCapacityRetry(context) },
+                onVpnOnlyInstead = { viewModel.setupVpnOnlyInstead(context) },
+                onViewDiagnostics = onViewDiagnostics,
+                onViewDevLog = { viewModel.setDevMode(true) },
+            )
+            Spacer(modifier = Modifier.height(12.dp))
+        }
+
         when (val s = state) {
             is ProvisioningState.Idle -> {
                 OracleOnboardingContent(
@@ -187,7 +221,11 @@ fun ProvisioningScreen(
                     selectedRegion = selectedOracleRegion,
                     regions = viewModel.oracleRegions,
                     privateChatRequested = privateChatRequested,
+                    capacityRetryPolicyEnabled = capacityRetryPolicyEnabled,
+                    privateChatToggleEnabled = isPrivateChatRequestToggleEnabled(hasActiveCapacityRetry),
+                    hasActiveCapacityRetry = hasActiveCapacityRetry,
                     onPrivateChatRequestedChange = viewModel::setPrivateChatRequested,
+                    onCapacityRetryPolicyChange = viewModel::setCapacityRetryPolicyEnabled,
                     onSelectRegion = viewModel::selectOracleRegion,
                     onExistingAccount = { viewModel.startProvisioning(context) },
                     onCreateAccount = { viewModel.launchOracleSignup(context) },
@@ -205,7 +243,11 @@ fun ProvisioningScreen(
                     selectedRegion = selectedOracleRegion,
                     regions = viewModel.oracleRegions,
                     privateChatRequested = privateChatRequested,
+                    capacityRetryPolicyEnabled = capacityRetryPolicyEnabled,
+                    privateChatToggleEnabled = isPrivateChatRequestToggleEnabled(hasActiveCapacityRetry),
+                    hasActiveCapacityRetry = hasActiveCapacityRetry,
                     onPrivateChatRequestedChange = viewModel::setPrivateChatRequested,
+                    onCapacityRetryPolicyChange = viewModel::setCapacityRetryPolicyEnabled,
                     onSelectRegion = viewModel::selectOracleRegion,
                     onExistingAccount = { viewModel.startProvisioning(context) },
                     onCreateAccount = { viewModel.launchOracleSignup(context) },
@@ -294,8 +336,26 @@ fun ProvisioningScreen(
                     selectedRegion = selectedOracleRegion,
                     regions = viewModel.oracleRegions,
                     onSelectRegion = viewModel::selectOracleRegion,
+                    capacityRetryPolicyEnabled = capacityRetryPolicyEnabled,
+                    capacityRetrySchedulerStatuses = capacityRetrySchedulerStatuses,
+                    capacityRetryDiagnostics = capacityRetryDiagnostics,
+                    capacityRetrySession = capacityRetrySessions.lastOrNull {
+                        it.state in setOf(
+                            CapacityRetryState.WAITING_FOR_RETRY,
+                            CapacityRetryState.ACTIVE,
+                            CapacityRetryState.ACQUIRING,
+                            CapacityRetryState.PAUSED_AUTH_REQUIRED,
+                            CapacityRetryState.FAILED_TERMINAL,
+                            CapacityRetryState.FAILED_AMBIGUOUS_RECONCILIATION_REQUIRED,
+                        )
+                    },
                     onRetry = { viewModel.retry(context) },
                     onCleanup = { viewModel.cleanup(context) },
+                    onKeepTrying24h = { viewModel.startCapacityRetry(context) },
+                    onStopRetry = { viewModel.stopActiveCapacityRetry(context) },
+                    onVpnOnlyInstead = { viewModel.setupVpnOnlyInstead(context) },
+                    onViewDiagnostics = onViewDiagnostics,
+                    onViewDevLog = { viewModel.setDevMode(true) },
                 )
             }
 
@@ -315,7 +375,244 @@ fun ProvisioningScreen(
     }
 }
 
+// -- Capacity retry status -------------------------------------
+
+@Composable
+private fun CapacityRetryStatusCard(
+    session: CapacityRetrySession,
+    schedulerStatus: CapacityRetrySchedulerStatus?,
+    diagnosticEntries: List<CapacityRetryDiagnosticEntry>,
+    onRetry: () -> Unit,
+    onStop: () -> Unit,
+    onVpnOnlyInstead: () -> Unit,
+    onViewDiagnostics: () -> Unit,
+    onViewDevLog: () -> Unit,
+) {
+    var nowMillis by remember(session.sessionId, session.nextEligibleAttemptAtUtc) {
+        mutableStateOf(System.currentTimeMillis())
+    }
+    LaunchedEffect(session.sessionId, session.nextEligibleAttemptAtUtc, session.state) {
+        while (true) {
+            nowMillis = System.currentTimeMillis()
+            delay(1_000L)
+        }
+    }
+    val now = Instant.ofEpochMilli(nowMillis)
+    val deadline = Instant.parse(session.deadlineUtc)
+    val rawRemaining = Duration.between(now, deadline)
+    val remaining = if (rawRemaining.isNegative) Duration.ZERO else rawRemaining
+    val localFormat = remember { SimpleDateFormat("MMM d, HH:mm", Locale.getDefault()) }
+    val workerTimeFormat = remember { SimpleDateFormat("MMM d, HH:mm:ss", Locale.getDefault()) }
+    val lastAttempt = session.lastLaunchAttemptFinishedAtUtc
+        ?: session.lastWorkerFinishedAtUtc
+        ?: session.lastWorkerStartedAtUtc
+    val nextEligible = session.nextEligibleAttemptAtUtc?.let { runCatching { Instant.parse(it) }.getOrNull() }
+    val cooldown = nextEligible?.let { Duration.between(now, it) }
+        ?.takeUnless { it.isNegative }
+        ?: Duration.ZERO
+    val eligibilityReached = nextEligible?.let { !now.isBefore(it) } == true
+    val active = session.state in setOf(
+        CapacityRetryState.WAITING_FOR_RETRY,
+        CapacityRetryState.ACTIVE,
+        CapacityRetryState.ACQUIRING,
+        CapacityRetryState.PAUSED_AUTH_REQUIRED,
+    )
+    val reconciliationRequired =
+        session.state == CapacityRetryState.FAILED_AMBIGUOUS_RECONCILIATION_REQUIRED
+    val displayedScheduler = schedulerStatus ?: CapacityRetrySchedulerStatus.checking(now)
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(Surface, RoundedCornerShape(8.dp))
+            .padding(12.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        Text(
+            text = when (session.state) {
+                CapacityRetryState.WAITING_FOR_RETRY -> "Private Chat retry waiting for first interval"
+                CapacityRetryState.ACTIVE, CapacityRetryState.ACQUIRING -> "Private Chat capacity retry active"
+                CapacityRetryState.PAUSED_AUTH_REQUIRED -> "Private Chat retry paused"
+                CapacityRetryState.TIMED_OUT -> "Private Chat retry timed out"
+                CapacityRetryState.CANCELLED -> "Private Chat retry cancelled"
+                CapacityRetryState.INSTANCE_ACQUIRED, CapacityRetryState.RESUME_PROVISIONING_REQUIRED -> "Oracle VM acquired"
+                CapacityRetryState.FAILED_AMBIGUOUS_RECONCILIATION_REQUIRED -> "Retry needs reconciliation"
+                CapacityRetryState.FAILED_TERMINAL -> "Private Chat retry stopped"
+                else -> "Private Chat retry status"
+            },
+            fontSize = 15.sp,
+            fontWeight = FontWeight.SemiBold,
+            color = TextPrimary,
+        )
+        InfoRow("Scheduler", displayedScheduler.displayLabel)
+        Text(
+            text = displayedScheduler.detail,
+            fontSize = 12.sp,
+            color = TextDim,
+            lineHeight = 17.sp,
+        )
+        displayedScheduler.reconciliationMessage?.let { message ->
+            Text(
+                text = message,
+                fontSize = 12.sp,
+                color = WarningYellow,
+                lineHeight = 17.sp,
+            )
+        }
+        if (
+            eligibilityReached &&
+            displayedScheduler.state == CapacityRetrySchedulerState.ENQUEUED
+        ) {
+            Text(
+                text = "Waiting for Android to schedule the next attempt. Android controls background timing.",
+                fontSize = 12.sp,
+                color = WarningYellow,
+                lineHeight = 17.sp,
+            )
+        }
+        InfoRow("Background retries attempted", session.retryCycleCount.toString())
+        InfoRow("Last attempt", lastAttempt?.let { localFormat.format(Date.from(Instant.parse(it))) } ?: "not yet")
+        if (session.lastResult == "RATE_LIMITED") {
+            Text(
+                text = "Oracle is temporarily rate limiting VM requests.",
+                fontSize = 13.sp,
+                color = WarningYellow,
+                lineHeight = 18.sp,
+            )
+        }
+        InfoRow("Last result", session.lastResult ?: session.lastSafeErrorCategory ?: "not yet")
+        InfoRow(
+            "Next target attempt",
+            if (reconciliationRequired) {
+                "blocked pending reconciliation"
+            } else {
+                session.nextEligibleAttemptAtUtc
+                    ?.let { localFormat.format(Date.from(Instant.parse(it))) }
+                    ?: "waiting for Android"
+            },
+        )
+        InfoRow("Next configuration", "A1 Flex, 1 OCPU / ${session.pendingMemoryGb} GB")
+        if (!cooldown.isZero) InfoRow("Cooldown", formatCooldown(cooldown))
+        InfoRow("Time remaining", formatRemaining(remaining))
+        InfoRow("Deadline", localFormat.format(Date.from(deadline)))
+        InfoRow("Preferred", "A1 Flex, 1 OCPU / 6 GB")
+        InfoRow("Fallback", "A1 Flex, 1 OCPU / 4 GB")
+        if (session.terminalReason != null) {
+            Text(
+                text = session.terminalReason,
+                fontSize = 12.sp,
+                color = TextDim,
+                lineHeight = 17.sp,
+            )
+        }
+        if (reconciliationRequired) {
+            Text(
+                text = "VPN-only provisioning and further launch attempts are unavailable until reconciliation confirms that Oracle did not create an A1 instance.",
+                fontSize = 12.sp,
+                color = WarningYellow,
+                lineHeight = 17.sp,
+            )
+        }
+        if (diagnosticEntries.isNotEmpty()) {
+            Text(
+                text = "BACKGROUND WORKER LOG",
+                fontSize = 11.sp,
+                fontWeight = FontWeight.SemiBold,
+                color = TextDim,
+            )
+            diagnosticEntries.takeLast(8).forEach { entry ->
+                val timestamp = runCatching {
+                    workerTimeFormat.format(Date.from(Instant.parse(entry.timestampUtc)))
+                }.getOrDefault(entry.timestampUtc)
+                Text(
+                    text = timestamp + "  " + entry.message,
+                    fontSize = 10.sp,
+                    fontFamily = FontFamily.Monospace,
+                    color = TextDim,
+                    lineHeight = 14.sp,
+                )
+            }
+        }
+        OutlinedButton(
+            onClick = onRetry,
+            enabled = session.state in setOf(CapacityRetryState.WAITING_FOR_RETRY, CapacityRetryState.ACTIVE) && cooldown.isZero,
+            modifier = Modifier.fillMaxWidth().height(40.dp),
+        ) {
+            Text(
+                text = if (cooldown.isZero) "Retry now" else "Next attempt in ${formatCooldown(cooldown)}",
+                fontSize = 12.sp,
+                color = if (cooldown.isZero) Accent else TextDim,
+            )
+        }
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            OutlinedButton(
+                onClick = onStop,
+                enabled = active,
+                modifier = Modifier.weight(1f).height(40.dp),
+            ) { Text("Stop retrying", fontSize = 12.sp, color = if (active) Danger else TextDim) }
+            if (!reconciliationRequired) {
+                OutlinedButton(
+                    onClick = onVpnOnlyInstead,
+                    modifier = Modifier.weight(1f).height(40.dp),
+                ) { Text("VPN only", fontSize = 12.sp, color = Accent) }
+            }
+        }
+        OutlinedButton(
+            onClick = if (reconciliationRequired) onViewDiagnostics else onViewDevLog,
+            modifier = Modifier.fillMaxWidth().height(40.dp),
+        ) {
+            Text(
+                if (reconciliationRequired) "View diagnostics" else "View Dev Mode log",
+                fontSize = 12.sp,
+                color = TextPrimary,
+            )
+        }
+    }
+}
+
+private fun formatRemaining(duration: Duration): String {
+    if (duration.isZero) return "expired"
+    val hours = duration.toHours()
+    val minutes = duration.minusHours(hours).toMinutes()
+    return when {
+        hours > 0 -> "${hours}h ${minutes}m"
+        else -> "${minutes}m"
+    }
+}
+
+private fun formatCooldown(duration: Duration): String {
+    val seconds = duration.seconds.coerceAtLeast(0L)
+    return "${seconds / 60}m ${seconds % 60}s"
+}
+
 // -- Pre-start -------------------------------------------------
+
+internal enum class PrivateChatSwitchRole {
+    PRIVATE_CHAT_REQUEST,
+    CAPACITY_RETRY_POLICY,
+}
+
+internal fun isPrivateChatRequestToggleEnabled(hasActiveCapacityRetry: Boolean): Boolean =
+    !hasActiveCapacityRetry
+
+internal fun visiblePrivateChatSwitchRoles(
+    privateChatRequested: Boolean,
+    onboardingState: OracleOnboardingState,
+    hasActiveCapacityRetry: Boolean,
+): List<PrivateChatSwitchRole> = buildList {
+    add(PrivateChatSwitchRole.PRIVATE_CHAT_REQUEST)
+    val beforeAuthentication = onboardingState in setOf(
+        OracleOnboardingState.NotStarted,
+        OracleOnboardingState.SignupLaunched,
+        OracleOnboardingState.WaitingForAccountSetup,
+        OracleOnboardingState.ReadyToAuthenticate,
+    )
+    if (privateChatRequested && beforeAuthentication && !hasActiveCapacityRetry) {
+        add(PrivateChatSwitchRole.CAPACITY_RETRY_POLICY)
+    }
+}
 
 @Composable
 private fun OracleOnboardingContent(
@@ -323,7 +620,11 @@ private fun OracleOnboardingContent(
     selectedRegion: String?,
     regions: List<OciRegion>,
     privateChatRequested: Boolean,
+    capacityRetryPolicyEnabled: Boolean,
+    privateChatToggleEnabled: Boolean,
+    hasActiveCapacityRetry: Boolean,
     onPrivateChatRequestedChange: (Boolean) -> Unit,
+    onCapacityRetryPolicyChange: (Boolean) -> Unit,
     onSelectRegion: (String?) -> Unit,
     onExistingAccount: () -> Unit,
     onCreateAccount: () -> Unit,
@@ -332,6 +633,11 @@ private fun OracleOnboardingContent(
 ) {
     var showNext by remember { mutableStateOf(false) }
     var regionMenuExpanded by remember { mutableStateOf(false) }
+    val visibleSwitchRoles = visiblePrivateChatSwitchRoles(
+        privateChatRequested = privateChatRequested,
+        onboardingState = onboardingState,
+        hasActiveCapacityRetry = hasActiveCapacityRetry,
+    )
     Column(
         modifier = Modifier.fillMaxWidth(),
         verticalArrangement = Arrangement.spacedBy(16.dp),
@@ -393,6 +699,15 @@ private fun OracleOnboardingContent(
                 Switch(
                     checked = privateChatRequested,
                     onCheckedChange = onPrivateChatRequestedChange,
+                    enabled = privateChatToggleEnabled,
+                )
+            }
+            if (hasActiveCapacityRetry) {
+                Text(
+                    text = "Private Chat stays on while a capacity retry session is active. Use the status card to review the available actions.",
+                    fontSize = 12.sp,
+                    color = TextDim,
+                    lineHeight = 17.sp,
                 )
             }
             if (privateChatRequested) {
@@ -402,6 +717,32 @@ private fun OracleOnboardingContent(
                     color = WarningYellow,
                     lineHeight = 17.sp,
                 )
+                if (PrivateChatSwitchRole.CAPACITY_RETRY_POLICY in visibleSwitchRoles) {
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "Automatically retry if A1 capacity is unavailable",
+                                fontSize = 14.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                color = TextPrimary,
+                            )
+                        }
+                        Switch(
+                            checked = capacityRetryPolicyEnabled,
+                            onCheckedChange = onCapacityRetryPolicyChange,
+                        )
+                    }
+                    Text(
+                        text = "ZeroVPN will try once now. If Oracle has no A1 capacity, it will retry approximately every 15 minutes for up to 24 hours. You can stop retrying or choose VPN-only setup at any time.",
+                        fontSize = 12.sp,
+                        color = TextDim,
+                        lineHeight = 17.sp,
+                    )
+                }
             }
         }
 
@@ -1065,12 +1406,37 @@ private fun FailureContent(
     selectedRegion: String?,
     regions: List<OciRegion>,
     onSelectRegion: (String?) -> Unit,
+    capacityRetryPolicyEnabled: Boolean,
+    capacityRetrySchedulerStatuses: Map<String, CapacityRetrySchedulerStatus>,
+    capacityRetryDiagnostics: List<CapacityRetryDiagnosticEntry>,
+    capacityRetrySession: CapacityRetrySession?,
     onRetry: () -> Unit,
     onCleanup: () -> Unit,
+    onKeepTrying24h: () -> Unit,
+    onStopRetry: () -> Unit,
+    onVpnOnlyInstead: () -> Unit,
+    onViewDiagnostics: () -> Unit,
+    onViewDevLog: () -> Unit,
 ) {
     val scrollState = rememberScrollState()
     val timeFormat = SimpleDateFormat("HH:mm:ss", Locale.getDefault())
     var regionMenuExpanded by remember { mutableStateOf(false) }
+    val isCapacityFailure = failedPhase == Phase.VM_LAUNCH && (
+        capacityRetrySession != null ||
+            errorMessage?.contains("A1 host capacity", ignoreCase = true) == true ||
+            errorMessage?.contains("rate limiting VM requests", ignoreCase = true) == true
+        )
+    val isActiveCapacityRetry = capacityRetrySession?.state in setOf(
+        CapacityRetryState.WAITING_FOR_RETRY,
+        CapacityRetryState.ACTIVE,
+        CapacityRetryState.ACQUIRING,
+    )
+    val isRateLimited = when {
+        capacityRetrySession?.lastResult == "RATE_LIMITED" -> true
+        errorMessage?.contains("rate limiting VM requests", ignoreCase = true) == true -> true
+        else -> false
+    }
+    val failureStatusColor = if (isActiveCapacityRetry) WarningYellow else Danger
 
     Column(
         modifier = Modifier.fillMaxWidth(),
@@ -1083,29 +1449,37 @@ private fun FailureContent(
             Icon(
                 imageVector = Icons.Default.Warning,
                 contentDescription = null,
-                tint = Danger,
+                tint = failureStatusColor,
                 modifier = Modifier.size(32.dp),
             )
             Column {
                 Text(
-                    text = "Provisioning failed",
+                    text = when {
+                        isRateLimited && isActiveCapacityRetry -> "VM request temporarily limited"
+                        isActiveCapacityRetry -> "Private Chat capacity retry active"
+                        else -> "Provisioning failed"
+                    },
                     fontSize = 18.sp,
                     fontWeight = FontWeight.SemiBold,
-                    color = Danger,
+                    color = failureStatusColor,
                 )
                 Text(
-                    text = "Failed at: ${failedPhase.label}",
+                    text = if (isActiveCapacityRetry) {
+                        "Waiting for the next eligible VM launch"
+                    } else {
+                        "Failed at: ${failedPhase.label}"
+                    },
                     fontSize = 13.sp,
                     color = TextDim,
                 )
-                if (lastSuccessPhase != null) {
+                if (!isActiveCapacityRetry && lastSuccessPhase != null) {
                     Text(
                         text = "Last success: ${lastSuccessPhase.label}",
                         fontSize = 13.sp,
                         color = TextDim,
                     )
                 }
-                if (errorMessage != null) {
+                if (!isActiveCapacityRetry && errorMessage != null) {
                     Text(
                         text = errorMessage,
                         fontSize = 12.sp,
@@ -1167,6 +1541,66 @@ private fun FailureContent(
                             )
                         }
                     }
+                }
+            }
+        }
+
+        if (isCapacityFailure) {
+            if (capacityRetrySession != null) {
+                CapacityRetryStatusCard(
+                    session = capacityRetrySession,
+                    schedulerStatus = capacityRetrySchedulerStatuses[capacityRetrySession.sessionId],
+                    diagnosticEntries = capacityRetryDiagnostics.filter {
+                        it.sessionId == capacityRetrySession.sessionId
+                    },
+                    onRetry = onRetry,
+                    onStop = onStopRetry,
+                    onVpnOnlyInstead = onVpnOnlyInstead,
+                    onViewDiagnostics = onViewDiagnostics,
+                    onViewDevLog = onViewDevLog,
+                )
+            } else {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(Surface, RoundedCornerShape(8.dp))
+                        .padding(12.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    Text(
+                        text = "Oracle login and API signing succeeded, but the single 6 GB launch request could not run now. ZeroVPN did not send an immediate 4 GB request, and no VM was created if no instance OCID exists.",
+                        fontSize = 13.sp,
+                        color = TextPrimary,
+                        lineHeight = 18.sp,
+                    )
+                    Text(
+                        text = if (capacityRetryPolicyEnabled) {
+                            "Automatic retry was enabled before Oracle sign-in. ZeroVPN is preserving the saved signing credentials for the next eligible 15-minute slot. Android scheduling is best-effort and the fixed window is 24 hours."
+                        } else {
+                            "Background retry is Android best-effort. If you opt in now, the fixed retry window lasts 24 hours. You can stop it later or create the normal VPN-only exit and add Private Chat on a second capable VM."
+                        },
+                        fontSize = 12.sp,
+                        color = TextDim,
+                        lineHeight = 17.sp,
+                    )
+                    if (!capacityRetryPolicyEnabled) {
+                        Button(
+                            onClick = onKeepTrying24h,
+                            modifier = Modifier.fillMaxWidth().height(44.dp),
+                            colors = ButtonDefaults.buttonColors(containerColor = Accent, contentColor = Bg),
+                        ) { Text("Keep trying for 24 hours", fontSize = 13.sp, fontWeight = FontWeight.Bold) }
+                    } else {
+                        OutlinedButton(
+                            onClick = onStopRetry,
+                            modifier = Modifier.fillMaxWidth().height(44.dp),
+                            colors = ButtonDefaults.outlinedButtonColors(contentColor = Danger),
+                        ) { Text("Stop automatic retry", fontSize = 13.sp, fontWeight = FontWeight.Medium) }
+                    }
+                    OutlinedButton(
+                        onClick = onVpnOnlyInstead,
+                        modifier = Modifier.fillMaxWidth().height(44.dp),
+                        colors = ButtonDefaults.outlinedButtonColors(contentColor = Accent),
+                    ) { Text("Set up VPN only instead", fontSize = 13.sp, fontWeight = FontWeight.Medium) }
                 }
             }
         }
@@ -1255,22 +1689,24 @@ private fun FailureContent(
                 Spacer(modifier = Modifier.width(8.dp))
                 Text("Cleanup", fontSize = 14.sp, fontWeight = FontWeight.Medium)
             }
-            Button(
-                onClick = onRetry,
-                modifier = Modifier.weight(1f).height(48.dp),
-                shape = RoundedCornerShape(8.dp),
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = Accent,
-                    contentColor = Bg,
-                ),
-            ) {
-                Icon(
-                    imageVector = Icons.Default.Refresh,
-                    contentDescription = null,
-                    modifier = Modifier.size(20.dp),
-                )
-                Spacer(modifier = Modifier.width(8.dp))
-                Text("Retry", fontSize = 14.sp, fontWeight = FontWeight.Bold)
+            if (capacityRetrySession == null) {
+                Button(
+                    onClick = onRetry,
+                    modifier = Modifier.weight(1f).height(48.dp),
+                    shape = RoundedCornerShape(8.dp),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = Accent,
+                        contentColor = Bg,
+                    ),
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Refresh,
+                        contentDescription = null,
+                        modifier = Modifier.size(20.dp),
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text("Retry now", fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                }
             }
         }
     }

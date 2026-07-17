@@ -22,51 +22,86 @@ import org.json.JSONObject
 import com.zerovpn.app.ui.provisioning.Phase
 import com.zerovpn.app.ui.provisioning.ProvisioningEvent
 import com.zerovpn.app.ui.provisioning.Status
-import java.io.IOException
 import java.net.URLEncoder
 import java.security.interfaces.RSAPublicKey
 import java.util.concurrent.TimeUnit
 
 sealed class VmLaunchFailure {
     data class OutOfHostCapacity(val message: String) : VmLaunchFailure()
+    data class RateLimited(val message: String, val retryAfterSeconds: Long?) : VmLaunchFailure()
     data class Other(val message: String) : VmLaunchFailure()
 }
 
 class VmLaunchFailureException(val failure: VmLaunchFailure) : Exception(
     when (failure) {
         is VmLaunchFailure.OutOfHostCapacity -> failure.message
+        is VmLaunchFailure.RateLimited -> failure.message
         is VmLaunchFailure.Other -> failure.message
     },
 )
 
-internal enum class LaunchAttemptResult { SUCCESS, RETRY_4GB, FAIL_CAPACITY, FAIL_OTHER }
+internal enum class LaunchAttemptResult { SUCCESS, FAIL_CAPACITY, RATE_LIMITED, FAIL_OTHER }
 
-internal fun isOutOfHostCapacity(responseBody: String): Boolean =
-    responseBody.contains("InternalError", ignoreCase = true) &&
-        responseBody.contains("Out of host capacity", ignoreCase = true)
+internal const val A1_CAPACITY_MESSAGE =
+    "Oracle has no A1 host capacity in your home region right now. ZeroVPN will wait before trying the 4 GB configuration."
+internal const val OCI_RATE_LIMIT_MESSAGE = "Oracle is temporarily rate limiting VM requests."
+
+internal data class VmLaunchHttpResponse(
+    val code: Int,
+    val body: String,
+    val retryAfterSeconds: Long? = null,
+)
+
+internal fun isOutOfHostCapacity(responseBody: String): Boolean = runCatching {
+    val error = JSONObject(responseBody)
+    val code = error.optString("code").trim()
+    val message = error.optString("message").trim().removeSuffix(".").trim()
+    code.equals("InternalError", ignoreCase = true) &&
+        message.equals("Out of host capacity", ignoreCase = true)
+}.getOrDefault(false)
 
 internal fun classifyLaunchResponse(code: Int, body: String): LaunchAttemptResult {
     return when {
         code in 200..299 -> LaunchAttemptResult.SUCCESS
-        code == 500 && isOutOfHostCapacity(body) -> LaunchAttemptResult.RETRY_4GB
-        else -> LaunchAttemptResult.FAIL_OTHER
-    }
-}
-
-internal fun classifyFinalFailure(code: Int, body: String): LaunchAttemptResult {
-    return when {
-        code in 200..299 -> LaunchAttemptResult.SUCCESS
+        code == 429 -> LaunchAttemptResult.RATE_LIMITED
         code == 500 && isOutOfHostCapacity(body) -> LaunchAttemptResult.FAIL_CAPACITY
         else -> LaunchAttemptResult.FAIL_OTHER
     }
 }
+
+internal fun classifyFinalFailure(code: Int, body: String): LaunchAttemptResult =
+    classifyLaunchResponse(code, body)
+
+internal fun parseRetryAfterSeconds(value: String?): Long? =
+    value?.trim()?.toLongOrNull()?.coerceAtLeast(0L)
+
+internal suspend fun executeSinglePrivateChatLaunchAttempt(
+    memoryGb: Int,
+    request: suspend (memoryGb: Int) -> VmLaunchHttpResponse,
+): JSONObject {
+    require(memoryGb == 4 || memoryGb == 6) { "Private Chat memory must be 4 GB or 6 GB." }
+    val response = request(memoryGb)
+    return when (classifyLaunchResponse(response.code, response.body)) {
+        LaunchAttemptResult.SUCCESS -> JSONObject(response.body)
+        LaunchAttemptResult.FAIL_CAPACITY -> throw VmLaunchFailureException(
+            VmLaunchFailure.OutOfHostCapacity(A1_CAPACITY_MESSAGE),
+        )
+        LaunchAttemptResult.RATE_LIMITED -> throw VmLaunchFailureException(
+            VmLaunchFailure.RateLimited(OCI_RATE_LIMIT_MESSAGE, response.retryAfterSeconds),
+        )
+        LaunchAttemptResult.FAIL_OTHER -> throw VmLaunchFailureException(
+            VmLaunchFailure.Other("POST /20160918/instances failed: ${response.code} ${response.body}"),
+        )
+    }
+}
 /**
- * Real OCI provisioner — ports the Python state_machine.py to Kotlin.
+ * Real OCI provisioner â€” ports the Python state_machine.py to Kotlin.
  *
- * Flow: browser auth → preflight → API key upload → network → VM → SSH/WireGuard → done
+ * Flow: browser auth â†’ preflight â†’ API key upload â†’ network â†’ VM â†’ SSH/WireGuard â†’ done
  *
- * All secrets (private keys, tokens, client configs) are kept in memory only.
- * No secrets are written to disk, SharedPreferences, or logs.
+ * Secrets are never written to ordinary preferences or logs. The owning workflow may
+ * copy the generated signing input into Android Keystore-backed storage after the API
+ * key upload succeeds so an explicitly enabled capacity retry can reuse the same key.
  */
 class OciProvisioner(
     private val context: Context,
@@ -199,6 +234,7 @@ class OciProvisioner(
         val code: Int,
         val body: String,
         val isSuccessful: Boolean,
+        val retryAfterSeconds: Long? = null,
     )
 
     data class ResourceIds(
@@ -720,7 +756,11 @@ class OciProvisioner(
     }
     // --- Phase 3: API Key Upload ---
 
-    private suspend fun uploadApiKey(auth: AuthResult, homeRegion: String): String {
+    private suspend fun uploadApiKey(
+        auth: AuthResult,
+        homeRegion: String,
+        onUploaded: ((String) -> Unit)? = null,
+    ): String {
         emit(Phase.API_KEY, Status.RUNNING, "Uploading API key...")
         val idHost = OciEndpoints.identityHost(homeRegion)
         val path = "/20160918/users/${auth.userOcid}/apiKeys"
@@ -730,12 +770,12 @@ class OciProvisioner(
         val pubPem = OciRequestSigner.publicKeyToPem(publicKey)
         val jsonBody = JSONObject().put("key", pubPem).toString()
 
-        // Compute body headers � must match what OkHttp actually sends
+        // Compute body headers ï¿½ must match what OkHttp actually sends
         val bodyBytes = jsonBody.toByteArray(Charsets.UTF_8)
         val contentSha256 = java.util.Base64.getEncoder().encodeToString(
             java.security.MessageDigest.getInstance("SHA-256").digest(bodyBytes)
         )
-        // Don't set content-length manually � OkHttp computes it from the request body
+        // Don't set content-length manually ï¿½ OkHttp computes it from the request body
         // The signing string must use the same value OkHttp will send
         val contentLength = bodyBytes.size.toString()
 
@@ -788,6 +828,7 @@ class OciProvisioner(
         if (uploadedFingerprint != auth.fingerprint) {
             emit(Phase.API_KEY, Status.WARNING, "Uploaded API key fingerprint differs from local fingerprint; using OCI response")
         }
+        onUploaded?.invoke(uploadedFingerprint)
 
         emit(Phase.API_KEY, Status.RUNNING, "Waiting for propagation...")
         kotlinx.coroutines.delay(5000)
@@ -853,7 +894,7 @@ class OciProvisioner(
         val slResp = ociPost(auth, iaasHost, "/20160918/securityLists", slBody)
         rids.slId = slResp.getString("id")
 
-        // Create subnet (use VCN default DHCP options � no need to fetch them)
+        // Create subnet (use VCN default DHCP options ï¿½ no need to fetch them)
         emit(Phase.NETWORK, Status.RUNNING, "Creating subnet...")
 
         val subnetBody = JSONObject()
@@ -898,12 +939,13 @@ class OciProvisioner(
 
     // --- Phase 5: VM Launch ---
 
-    private suspend fun launchVm(
+    internal suspend fun launchVm(
         auth: AuthResult,
         homeRegion: String,
         rids: ResourceIds,
         sshPublicKey: String,
         privateChatRequested: Boolean,
+        privateChatMemoryGb: Int = 6,
     ): String {
         val cid = auth.tenancyOcid
         val idHost = OciEndpoints.identityHost(homeRegion)
@@ -945,10 +987,13 @@ class OciProvisioner(
         // Launch instance
         val launchPath = "/20160918/instances"
         val launchResp = if (privateChatRequested) {
+            require(privateChatMemoryGb == 4 || privateChatMemoryGb == 6) {
+                "Private Chat memory must be 4 GB or 6 GB."
+            }
             emit(
                 Phase.VM_LAUNCH,
                 Status.RUNNING,
-                "Private Chat requested: using VM.Standard.A1.Flex with 1 OCPU and 6 GB RAM. " +
+                "Private Chat requested: using VM.Standard.A1.Flex with 1 OCPU and $privateChatMemoryGb GB RAM. " +
                     "Requested resources appear Free Tier eligible. Oracle, not ZeroVPN, determines actual billing.",
             )
 
@@ -974,79 +1019,38 @@ class OciProvisioner(
                 )
                 .toString()
 
-            suspend fun postLaunch(memoryInGBs: Int, attempt: Int): OciPostResponse {
+            suspend fun postLaunch(memoryInGBs: Int): OciPostResponse {
                 emit(
                     Phase.VM_LAUNCH,
                     Status.RUNNING,
-                    "Launching Private Chat Node VM Attempt $attempt: VM.Standard.A1.Flex — 1 OCPU / $memoryInGBs GB",
+                    "Launching Private Chat Node VM: VM.Standard.A1.Flex â€” 1 OCPU / $memoryInGBs GB",
                 )
                 return ociPostWithResponse(auth, iaasHost, launchPath, buildLaunchBody(memoryInGBs))
             }
 
-            val firstAttempt = try {
-                postLaunch(memoryInGBs = 6, attempt = 1)
-            } catch (e: IOException) {
-                throw e
-            }
-            when (classifyLaunchResponse(firstAttempt.code, firstAttempt.body)) {
-                LaunchAttemptResult.SUCCESS -> JSONObject(firstAttempt.body)
-                LaunchAttemptResult.RETRY_4GB -> {
-                    if (isDevMode) {
-                        emitDeveloperOnly(
-                            Phase.VM_LAUNCH,
-                            Status.RUNNING,
-                            "OCI launch error response (6 GB): HTTP ${firstAttempt.code} ${firstAttempt.body}",
-                        )
-                    }
-                    emit(Phase.VM_LAUNCH, Status.RUNNING, "Oracle reported no A1 host capacity")
-                    emit(Phase.VM_LAUNCH, Status.RUNNING, "Retrying compact configuration")
-                    val secondAttempt = try {
-                        postLaunch(memoryInGBs = 4, attempt = 2)
-                    } catch (e: IOException) {
-                        throw e
-                    }
-                    when (classifyFinalFailure(secondAttempt.code, secondAttempt.body)) {
-                        LaunchAttemptResult.SUCCESS -> JSONObject(secondAttempt.body)
-                        LaunchAttemptResult.FAIL_CAPACITY -> {
-                            if (isDevMode) {
-                                emitDeveloperOnly(
-                                    Phase.VM_LAUNCH,
-                                    Status.RUNNING,
-                                    "OCI launch error response (4 GB): HTTP ${secondAttempt.code} ${secondAttempt.body}",
-                                )
-                            }
-                            val capacityMessage = "Oracle has no A1 host capacity in your home region right now. Try again later, or try a different region."
-                            emit(Phase.VM_LAUNCH, Status.ERROR, capacityMessage)
-                            throw VmLaunchFailureException(VmLaunchFailure.OutOfHostCapacity(capacityMessage))
-                        }
-                        LaunchAttemptResult.FAIL_OTHER -> {
-                            if (isDevMode) {
-                                emitDeveloperOnly(
-                                    Phase.VM_LAUNCH,
-                                    Status.RUNNING,
-                                    "OCI launch error response (4 GB): HTTP ${secondAttempt.code} ${secondAttempt.body}",
-                                )
-                            }
-                            throw VmLaunchFailureException(
-                                VmLaunchFailure.Other("POST $launchPath failed: ${secondAttempt.code} ${secondAttempt.body}"),
-                            )
-                        }
-                        LaunchAttemptResult.RETRY_4GB -> error("Unexpected final launch retry classification")
-                    }
-                }
-                LaunchAttemptResult.FAIL_OTHER -> {
-                    if (isDevMode) {
-                        emitDeveloperOnly(
-                            Phase.VM_LAUNCH,
-                            Status.RUNNING,
-                            "OCI launch error response (6 GB): HTTP ${firstAttempt.code} ${firstAttempt.body}",
-                        )
-                    }
-                    throw VmLaunchFailureException(
-                        VmLaunchFailure.Other("POST $launchPath failed: ${firstAttempt.code} ${firstAttempt.body}"),
+            try {
+                executeSinglePrivateChatLaunchAttempt(privateChatMemoryGb) { memoryGb ->
+                    val response = postLaunch(memoryGb)
+                    VmLaunchHttpResponse(
+                        code = response.code,
+                        body = response.body,
+                        retryAfterSeconds = response.retryAfterSeconds,
                     )
                 }
-                LaunchAttemptResult.FAIL_CAPACITY -> error("Unexpected initial launch capacity classification")
+            } catch (error: VmLaunchFailureException) {
+                if (isDevMode) {
+                    emitDeveloperOnly(
+                        Phase.VM_LAUNCH,
+                        Status.RUNNING,
+                        "OCI launch result ($privateChatMemoryGb GB): ${error.failure::class.simpleName}",
+                    )
+                }
+                when (val failure = error.failure) {
+                    is VmLaunchFailure.OutOfHostCapacity -> emit(Phase.VM_LAUNCH, Status.ERROR, failure.message)
+                    is VmLaunchFailure.RateLimited -> emit(Phase.VM_LAUNCH, Status.WARNING, failure.message)
+                    is VmLaunchFailure.Other -> Unit
+                }
+                throw error
             }
         } else {
             emit(Phase.VM_LAUNCH, Status.RUNNING, "Launching instance ($shape)...")
@@ -1565,12 +1569,14 @@ class OciProvisioner(
         auth: AuthResult,
         preflight: PreflightResult,
         privateChatRequested: Boolean = false,
+        onApiKeyUploaded: ((String) -> Unit)? = null,
+        onLaunchContextReady: ((ResourceIds, String) -> Unit)? = null,
     ): Pair<ResourceIds, ProvisionResult> {
         val homeRegion = preflight.homeRegion
 
         // Upload API key
         try {
-            uploadApiKey(auth, homeRegion)
+            uploadApiKey(auth, homeRegion, onApiKeyUploaded)
         } catch (e: Exception) {
             emit(Phase.API_KEY, Status.ERROR, "Upload failed: ${e.javaClass.simpleName}: ${e.message}")
             throw e
@@ -1597,6 +1603,7 @@ class OciProvisioner(
         val rids = createNetwork(auth, homeRegion)
 
         // Launch VM
+        onLaunchContextReady?.invoke(rids, sshPublicKey)
         val publicIp = launchVm(auth, homeRegion, rids, sshPublicKey, privateChatRequested)
 
         // Setup WireGuard via SSH
@@ -1793,6 +1800,7 @@ class OciProvisioner(
                 code = resp.code,
                 body = resp.body?.string() ?: "",
                 isSuccessful = resp.isSuccessful,
+                retryAfterSeconds = parseRetryAfterSeconds(resp.header("Retry-After")),
             )
         }
     }

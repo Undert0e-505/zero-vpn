@@ -50,6 +50,11 @@ import com.zerovpn.app.chat.node.PrivateChatNodeState
 import com.zerovpn.app.chat.node.PrivateChatSelfTestStatus
 import com.zerovpn.app.chat.node.PrivateChatStageStatus
 import com.zerovpn.app.chat.node.redactPrivateChatDiagnostic
+import com.zerovpn.app.chat.retry.CapacityRetryDiagnosticEntry
+import com.zerovpn.app.chat.retry.CapacityRetrySession
+import com.zerovpn.app.chat.retry.CapacityRetryState
+import com.zerovpn.app.chat.retry.DeferredCandidateState
+import com.zerovpn.app.chat.retry.PrivateChatCandidate
 import com.zerovpn.app.friends.InviteSlot
 import com.zerovpn.app.friends.SharedExitProfile
 import com.zerovpn.app.ui.theme.Accent
@@ -77,6 +82,8 @@ import com.zerovpn.app.volunteer.tun2socks.HevNativeLoader
 import com.zerovpn.app.volunteer.vpn.VolunteerVpnDiagnostics
 import com.zerovpn.app.volunteer.vpn.VolunteerVpnState
 import java.text.DateFormat
+import java.time.Duration
+import java.time.Instant
 import java.util.Date
 
 private val DiagnosticsWarning = Color(0xFFFFC107)
@@ -97,6 +104,9 @@ fun DiagnosticsScreen(
     val sharedExitProfiles by provisioningViewModel.sharedExitProfiles.collectAsState()
     val lastInviteOperationError by provisioningViewModel.lastInviteOperationError.collectAsState()
     val oracleOperationDiagnostics by provisioningViewModel.oracleOperationDiagnostics.collectAsState()
+    val capacityRetrySessions by provisioningViewModel.capacityRetrySessions.collectAsState()
+    val capacityRetryDiagnostics by provisioningViewModel.capacityRetryDiagnostics.collectAsState()
+    val privateChatCandidates by provisioningViewModel.privateChatCandidates.collectAsState()
     val selectedExitId by provisioningViewModel.selectedExitId.collectAsState()
     val providerSwitchDiagnostics by provisioningViewModel.providerSwitchDiagnostics.collectAsState()
     val vpnState by vpnViewModel.state.collectAsState()
@@ -188,6 +198,20 @@ fun DiagnosticsScreen(
             },
         )
 
+        Spacer(modifier = Modifier.height(12.dp))
+        CapacityRetryDiagnosticsCard(
+            sessions = capacityRetrySessions,
+            diagnosticEntries = capacityRetryDiagnostics,
+            isDevMode = isDevMode,
+        )
+
+        Spacer(modifier = Modifier.height(12.dp))
+        DeferredCandidateDiagnosticsCard(
+            candidates = privateChatCandidates,
+            exits = exits,
+            selectedExitId = selectedExitId,
+        )
+
         if (isDevMode) {
             Spacer(modifier = Modifier.height(12.dp))
             WireGuardDebugCard(vpnDiagnostics)
@@ -251,6 +275,163 @@ fun DiagnosticsScreen(
         }
     }
 }
+
+@Composable
+private fun CapacityRetryDiagnosticsCard(
+    sessions: List<CapacityRetrySession>,
+    diagnosticEntries: List<CapacityRetryDiagnosticEntry>,
+    isDevMode: Boolean,
+) {
+    val session = sessions.lastOrNull()
+    val failureDiagnostics = session?.let { current ->
+        diagnosticEntries.lastOrNull {
+            it.sessionId == current.sessionId && it.failureDiagnostics != null
+        }?.failureDiagnostics
+    }
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(Surface, RoundedCornerShape(8.dp))
+            .border(1.dp, Border, RoundedCornerShape(8.dp))
+            .padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        Text(text = "CAPACITY RETRY", style = SectionTitleStyle)
+        if (session == null) {
+            DebugValue("Retry status", "NOT TESTED")
+            return@Column
+        }
+        DebugValue("Retry status", retryStatusLabel(session.state))
+        DebugValue("Started", session.createdAtUtc)
+        DebugValue("Deadline", session.deadlineUtc)
+        DebugValue("Time remaining", retryRemainingText(session))
+        DebugValue("Background retry cycles attempted", session.retryCycleCount.toString())
+        DebugValue("6 GB launch requests", session.launchRequestCount6Gb.toString())
+        DebugValue("4 GB launch requests", session.launchRequestCount4Gb.toString())
+        DebugValue("Last attempted configuration", session.lastAttemptMemoryGb?.let { "1 OCPU / ${it} GB" } ?: "NOT TESTED")
+        DebugValue("Last result", session.lastResult ?: "NOT TESTED")
+        DebugValue(
+            "Next target attempt",
+            if (session.state == CapacityRetryState.FAILED_AMBIGUOUS_RECONCILIATION_REQUIRED) {
+                "BLOCKED - RECONCILIATION REQUIRED"
+            } else {
+                session.nextEligibleAttemptAtUtc ?: "NOT TESTED"
+            },
+        )
+        DebugValue(
+            "Work scheduled",
+            if (session.state in setOf(CapacityRetryState.WAITING_FOR_RETRY, CapacityRetryState.ACTIVE)) {
+                "PASS"
+            } else {
+                "NOT TESTED"
+            },
+        )
+        DebugValue("Instance acquired", if (session.instanceOcid.isNullOrBlank()) "NOT INSTALLED" else "PASS")
+        DebugValue("Cleanup required", if (session.state == CapacityRetryState.FAILED_AMBIGUOUS_RECONCILIATION_REQUIRED) "WARNING" else "NOT TESTED")
+        if (isDevMode) {
+            Text(text = "LATEST LAUNCH FAILURE", style = SectionTitleStyle)
+            if (failureDiagnostics == null) {
+                DebugValue("Failure diagnostics", "NOT TESTED")
+            } else {
+                DebugValue("Exception class", failureDiagnostics.exceptionClass)
+                DebugBlock("Safe exception message", failureDiagnostics.safeExceptionMessage)
+                DebugValue("Root cause class", failureDiagnostics.rootCauseClass ?: "N/A")
+                DebugBlock("Safe root cause message", failureDiagnostics.safeRootCauseMessage ?: "N/A")
+                DebugValue("Failing operation", failureDiagnostics.failingOperation)
+                DebugValue("Failing component", failureDiagnostics.failingComponent ?: "N/A")
+                DebugValue("Progress stage", failureDiagnostics.progress)
+                DebugValue(
+                    "Request construction completed",
+                    failureDiagnostics.requestConstructionCompleted.diagnosticFlag(),
+                )
+                DebugValue(
+                    "Request signing completed",
+                    failureDiagnostics.requestSigningCompleted.diagnosticFlag(),
+                )
+                DebugValue("Transmission started", failureDiagnostics.transmissionStarted.diagnosticFlag())
+                DebugValue(
+                    "Response headers received",
+                    failureDiagnostics.responseHeadersReceived.diagnosticFlag(),
+                )
+                DebugValue("Redacted request ID", failureDiagnostics.redactedRequestId ?: "N/A")
+                DebugValue("Retry token", failureDiagnostics.retryTokenAbbreviated)
+                DebugValue("Session ID", failureDiagnostics.sessionIdAbbreviated)
+                DebugBlock("Redacted stack trace", failureDiagnostics.safeStackTrace)
+            }
+        }
+    }
+}
+
+private fun Boolean?.diagnosticFlag(): String = when (this) {
+    true -> "yes"
+    false -> "no"
+    null -> "unknown"
+}
+
+@Composable
+private fun DeferredCandidateDiagnosticsCard(
+    candidates: List<PrivateChatCandidate>,
+    exits: List<ConfiguredExit>,
+    selectedExitId: String?,
+) {
+    val candidate = candidates.lastOrNull()
+    val source = candidate?.sourceExitId?.let { id -> exits.firstOrNull { it.id == id } }
+    val candidateExit = candidate?.candidateExitId?.let { id -> exits.firstOrNull { it.id == id } }
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(Surface, RoundedCornerShape(8.dp))
+            .border(1.dp, Border, RoundedCornerShape(8.dp))
+            .padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        Text(text = "DEFERRED CHAT CANDIDATE", style = SectionTitleStyle)
+        if (candidate == null) {
+            DebugValue("Candidate state", "NOT TESTED")
+            return@Column
+        }
+        DebugValue("Source exit", source?.name ?: candidate.sourceExitId)
+        DebugValue("Candidate state", candidateStatusLabel(candidate.state))
+        DebugValue("Candidate instance", candidateExit?.instanceId?.prefixForDiagnostics() ?: "NOT INSTALLED")
+        DebugValue("Candidate VPN health", if (candidateExit?.wireGuardConfig?.isNotBlank() == true) "PASS" else "NOT TESTED")
+        DebugValue("Candidate chat health", candidateExit?.privateChat?.status?.name ?: "NOT INSTALLED")
+        DebugValue("Ready to switch", if (candidate.state == DeferredCandidateState.READY_TO_SWITCH) "PASS" else "NOT TESTED")
+        DebugValue("Current active exit", selectedExitId ?: "N/A")
+        DebugValue("Previous rollback exit", candidateExit?.previousExitId ?: "N/A")
+    }
+}
+
+private fun retryStatusLabel(state: CapacityRetryState): String = when (state) {
+    CapacityRetryState.WAITING_FOR_RETRY,
+    CapacityRetryState.ACTIVE,
+    CapacityRetryState.ACQUIRING -> "PASS"
+    CapacityRetryState.PAUSED_AUTH_REQUIRED,
+    CapacityRetryState.FAILED_AMBIGUOUS_RECONCILIATION_REQUIRED -> "WARNING"
+    CapacityRetryState.TIMED_OUT,
+    CapacityRetryState.CANCELLED,
+    CapacityRetryState.FAILED_TERMINAL -> "FAIL"
+    CapacityRetryState.INSTANCE_ACQUIRED,
+    CapacityRetryState.RESUME_PROVISIONING_REQUIRED,
+    CapacityRetryState.SUCCEEDED -> "PASS"
+    CapacityRetryState.NONE -> "NOT TESTED"
+}
+
+private fun candidateStatusLabel(state: DeferredCandidateState): String = when (state) {
+    DeferredCandidateState.NONE -> "NOT TESTED"
+    DeferredCandidateState.ACQUIRING_CAPACITY,
+    DeferredCandidateState.PROVISIONING,
+    DeferredCandidateState.TESTING -> "WARNING"
+    DeferredCandidateState.READY_TO_SWITCH,
+    DeferredCandidateState.SWITCHED -> "PASS"
+    DeferredCandidateState.FAILED,
+    DeferredCandidateState.CANCELLED -> "FAIL"
+}
+
+private fun retryRemainingText(session: CapacityRetrySession): String = runCatching {
+    val remaining = Duration.between(Instant.now(), Instant.parse(session.deadlineUtc))
+    val safe = if (remaining.isNegative) Duration.ZERO else remaining
+    if (safe.isZero) "expired" else "${safe.toHours()}h ${safe.minusHours(safe.toHours()).toMinutes()}m"
+}.getOrDefault("NOT TESTED")
 
 @Composable
 private fun PrivateChatDiagnosticsCard(

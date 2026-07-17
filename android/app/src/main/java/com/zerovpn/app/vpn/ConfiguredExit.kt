@@ -1,6 +1,7 @@
 package com.zerovpn.app.vpn
 
 import com.zerovpn.app.chat.node.PrivateChatNodeState
+import com.zerovpn.app.chat.retry.PrivateChatCapabilityStatus
 
 enum class ExitProvider {
     OCI,
@@ -55,5 +56,9 @@ data class ConfiguredExit(
     val udpSupported: Boolean? = null,
     val dnsStatus: String? = null,
     val destroyMeaning: String? = null,
+    val privateChatStatus: PrivateChatCapabilityStatus = PrivateChatCapabilityStatus.NOT_REQUESTED,
+    val privateChatCandidateId: String? = null,
+    val sourceExitId: String? = null,
+    val previousExitId: String? = null,
     val privateChat: PrivateChatNodeState? = null,
 )

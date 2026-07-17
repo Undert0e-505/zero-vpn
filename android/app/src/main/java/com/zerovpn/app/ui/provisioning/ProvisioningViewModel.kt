@@ -5,9 +5,12 @@ import android.content.Intent
 import android.content.SharedPreferences
 import android.net.Uri
 import android.util.Log
+import androidx.lifecycle.LiveData
+import androidx.lifecycle.Observer
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.browser.customtabs.CustomTabsIntent
+import androidx.work.WorkInfo
 import com.zerovpn.app.chat.node.PrivateChatInstallStatus
 import com.zerovpn.app.chat.node.PrivateChatHealthChecks
 import com.zerovpn.app.chat.node.PrivateChatNodeManifest
@@ -22,6 +25,40 @@ import com.zerovpn.app.chat.node.PrivateChatStageState
 import com.zerovpn.app.chat.node.PrivateChatStageStatus
 import com.zerovpn.app.chat.node.PRIVATE_CHAT_STAGE_ORDER
 import com.zerovpn.app.chat.node.redactPrivateChatDiagnostic
+import com.zerovpn.app.chat.retry.CapacityRetryMode
+import com.zerovpn.app.chat.retry.BackgroundLaunchCredentials
+import com.zerovpn.app.chat.retry.BackgroundLaunchParams
+import com.zerovpn.app.chat.retry.BackgroundLaunchResult
+import com.zerovpn.app.chat.retry.CapacityRetryDiagnosticEntry
+import com.zerovpn.app.chat.retry.CapacityRetryDiagnosticLog
+import com.zerovpn.app.chat.retry.CapacityRetryReconciliationAction
+import com.zerovpn.app.chat.retry.CapacityRetryRepository
+import com.zerovpn.app.chat.retry.CapacityRetrySchedulerState
+import com.zerovpn.app.chat.retry.CapacityRetrySchedulerStatus
+import com.zerovpn.app.chat.retry.CapacityRetrySession
+import com.zerovpn.app.chat.retry.CapacityRetrySessionStarter
+import com.zerovpn.app.chat.retry.CapacityRetryStartContext
+import com.zerovpn.app.chat.retry.CapacityRetryStartResult
+import com.zerovpn.app.chat.retry.CapacityRetryState
+import com.zerovpn.app.chat.retry.CapacityRetryWorkMonitor
+import com.zerovpn.app.chat.retry.CapacityRetryWorkScheduler
+import com.zerovpn.app.chat.retry.DeferredCandidateState
+import com.zerovpn.app.chat.retry.OciBackgroundLauncher
+import com.zerovpn.app.chat.retry.PrivateChatCandidate
+import com.zerovpn.app.chat.retry.PrivateChatCapabilityStatus
+import com.zerovpn.app.chat.retry.ProvisioningLeaseOperation
+import com.zerovpn.app.chat.retry.ProvisioningOperationLease
+import com.zerovpn.app.chat.retry.RetryCredentialVault
+import com.zerovpn.app.chat.retry.candidatesFromJson
+import com.zerovpn.app.chat.retry.capacityRetrySchedulerStatus
+import com.zerovpn.app.chat.retry.decideCapacityRetryReconciliation
+import com.zerovpn.app.chat.retry.failureDiagnosticsOrNull
+import com.zerovpn.app.chat.retry.hasAuthoritativePrivateChatRetry
+import com.zerovpn.app.chat.retry.sessionsFromJson
+import com.zerovpn.app.chat.retry.shouldEnqueueCapacityRetry
+import com.zerovpn.app.chat.retry.cooldownRemaining
+import com.zerovpn.app.chat.retry.isLaunchEligible
+import com.zerovpn.app.chat.retry.nextEligibleLaunchAt
 import com.zerovpn.app.friends.FriendsRepository
 import com.zerovpn.app.friends.HandshakeQueryResult
 import com.zerovpn.app.friends.InviteHandshakeChecker
@@ -48,10 +85,15 @@ import com.zerovpn.app.vpn.ProviderSwitchDiagnostics
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
+import java.time.Duration
+import java.time.Instant
 import java.util.UUID
 
 sealed interface InviteClaimCheckResult {
@@ -98,6 +140,7 @@ internal fun classifyProvisioningFailure(
 ): Pair<Phase, String> {
     when (val launchFailure = OciProvisioner.classifyLaunchFailure(error)) {
         is VmLaunchFailure.OutOfHostCapacity -> return Phase.VM_LAUNCH to launchFailure.message
+        is VmLaunchFailure.RateLimited -> return Phase.VM_LAUNCH to launchFailure.message
         is VmLaunchFailure.Other -> return Phase.VM_LAUNCH to launchFailure.message
         null -> Unit
     }
@@ -107,6 +150,29 @@ internal fun classifyProvisioningFailure(
         ?: Phase.AUTH
     val displayMessage = error.message ?: error.javaClass.simpleName
     return failedPhase to displayMessage
+}
+
+internal sealed interface ManualCapacityRetryDecision {
+    data class Attempt(val sessionId: String) : ManualCapacityRetryDecision
+    data class Cooldown(val remaining: Duration) : ManualCapacityRetryDecision
+    data object StartSession : ManualCapacityRetryDecision
+    data object AuthenticationRequired : ManualCapacityRetryDecision
+    data object NotAvailable : ManualCapacityRetryDecision
+}
+
+internal fun decideManualCapacityRetry(
+    session: CapacityRetrySession?,
+    pendingCapacityRetryEligible: Boolean,
+    now: Instant,
+): ManualCapacityRetryDecision = when {
+    session?.state == CapacityRetryState.PAUSED_AUTH_REQUIRED -> ManualCapacityRetryDecision.AuthenticationRequired
+    session != null &&
+        session.state in setOf(CapacityRetryState.WAITING_FOR_RETRY, CapacityRetryState.ACTIVE) &&
+        session.isLaunchEligible(now) -> ManualCapacityRetryDecision.Attempt(session.sessionId)
+    session != null && session.state in setOf(CapacityRetryState.WAITING_FOR_RETRY, CapacityRetryState.ACTIVE) ->
+        ManualCapacityRetryDecision.Cooldown(session.cooldownRemaining(now))
+    session == null && pendingCapacityRetryEligible -> ManualCapacityRetryDecision.StartSession
+    else -> ManualCapacityRetryDecision.NotAvailable
 }
 
 class ProvisioningViewModel : ViewModel() {
@@ -131,6 +197,24 @@ class ProvisioningViewModel : ViewModel() {
 
     private val _privateChatRequested = MutableStateFlow(false)
     val privateChatRequested: StateFlow<Boolean> = _privateChatRequested.asStateFlow()
+
+    private val _capacityRetryPolicyEnabled = MutableStateFlow(false)
+    val capacityRetryPolicyEnabled: StateFlow<Boolean> = _capacityRetryPolicyEnabled.asStateFlow()
+
+    private val _capacityRetrySessions = MutableStateFlow<List<CapacityRetrySession>>(emptyList())
+    val capacityRetrySessions: StateFlow<List<CapacityRetrySession>> = _capacityRetrySessions.asStateFlow()
+
+    private val _capacityRetrySchedulerStatuses =
+        MutableStateFlow<Map<String, CapacityRetrySchedulerStatus>>(emptyMap())
+    val capacityRetrySchedulerStatuses: StateFlow<Map<String, CapacityRetrySchedulerStatus>> =
+        _capacityRetrySchedulerStatuses.asStateFlow()
+
+    private val _capacityRetryDiagnostics = MutableStateFlow<List<CapacityRetryDiagnosticEntry>>(emptyList())
+    val capacityRetryDiagnostics: StateFlow<List<CapacityRetryDiagnosticEntry>> =
+        _capacityRetryDiagnostics.asStateFlow()
+
+    private val _privateChatCandidates = MutableStateFlow<List<PrivateChatCandidate>>(emptyList())
+    val privateChatCandidates: StateFlow<List<PrivateChatCandidate>> = _privateChatCandidates.asStateFlow()
 
     private val _oracleOnboardingState = MutableStateFlow(OracleOnboardingState.NotStarted)
     val oracleOnboardingState: StateFlow<OracleOnboardingState> = _oracleOnboardingState.asStateFlow()
@@ -178,6 +262,8 @@ class ProvisioningViewModel : ViewModel() {
     private var authResult: OciProvisioner.AuthResult? = null
     private var preflightResult: OciProvisioner.PreflightResult? = null
     private var resourceIds: OciProvisioner.ResourceIds? = null
+    private var retryLaunchSshPublicKey: String? = null
+    private var retryLaunchSubnetId: String? = null
     private var clientConfig: String? = null
     private var wireGuardClientPublicKey: String? = null
     private var wireGuardServerPublicKey: String? = null
@@ -185,6 +271,8 @@ class ProvisioningViewModel : ViewModel() {
     private var homeRegion: String? = null
     private var apiKeyUserOcid: String? = null
     private var apiKeyTenancyOcid: String? = null
+    private var apiKeyTokenRegion: String? = null
+    private var apiKeyTokenRegionSource: String? = null
     // Capacity-fallback tracking for Diagnostics
     internal var chatLastAttemptedConfig: String = "NOT TESTED"
     internal var chatLastLaunchResult: String = "NOT TESTED"
@@ -192,6 +280,12 @@ class ProvisioningViewModel : ViewModel() {
     internal var chatCleanupRequired: String = "NOT TESTED"
     private var apiKeyFingerprint: String? = null
     private var pendingProvisionExitId: String? = null
+    private var pendingCapacityRetryEligible = false
+    private var pendingRetryLastLaunchFinishedAtUtc: String? = null
+    private var pendingRetryNextEligibleAtUtc: String? = null
+    private var pendingRetryMemoryGb: Int = 6
+    private var pendingRetryLastResult: String? = null
+    private var pendingRetryHttpStatus: Int? = null
     private var provisioningJob: Job? = null
     private var privateChatJob: Job? = null
     private var pendingOracleOperation = PendingOracleOperation.None
@@ -202,7 +296,26 @@ class ProvisioningViewModel : ViewModel() {
     private lateinit var prefs: SharedPreferences
     private lateinit var secretStore: SecureSecretStore
     private var friendsRepository: FriendsRepository? = null
+    private var capacityRetryRepository: CapacityRetryRepository? = null
+    private var provisioningLease: ProvisioningOperationLease? = null
     private var prefsLoaded = false
+    private var capacityRetryWorkMonitor: CapacityRetryWorkMonitor? = null
+    private var capacityRetryWorkObservationJob: Job? = null
+    private var capacityRetryReconciliationJob: Job? = null
+    private val capacityRetryWorkObservers =
+        mutableMapOf<String, WorkInfoObserverRegistration>()
+    private val capacityRetryPrefsListener =
+        SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
+            if (key == CapacityRetryDiagnosticLog.KEY_ENTRIES) {
+                refreshCapacityRetrySessionsFromRepository()
+                refreshCapacityRetryDiagnostics()
+            }
+        }
+
+    private data class WorkInfoObserverRegistration(
+        val liveData: LiveData<List<WorkInfo>>,
+        val observer: Observer<List<WorkInfo>>,
+    )
 
     private data class PendingOracleOperation(
         val type: OracleOperationType,
@@ -219,12 +332,20 @@ class ProvisioningViewModel : ViewModel() {
 
     fun initPrefs(context: Context) {
         if (prefsLoaded) return
-        prefs = context.getSharedPreferences("zerovpn_provisioning", Context.MODE_PRIVATE)
-        secretStore = SecureSecretStore(context)
+        val appContext = context.applicationContext
+        prefs = appContext.getSharedPreferences("zerovpn_provisioning", Context.MODE_PRIVATE)
+        secretStore = SecureSecretStore(appContext)
         friendsRepository = FriendsRepository(prefs)
+        capacityRetryRepository = CapacityRetryRepository(prefs)
+        provisioningLease = ProvisioningOperationLease(prefs).also { it.clearStaleLease() }
         loadPersistedState()
         loadFriendsState()
         prefsLoaded = true
+        prefs.registerOnSharedPreferenceChangeListener(capacityRetryPrefsListener)
+        refreshCapacityRetryDiagnostics()
+        startCapacityRetryWorkObservation(appContext)
+        maybeStartAutomaticCapacityRetry(appContext)
+        reconcileCapacityRetryWork(appContext)
     }
 
     private fun loadFriendsState() {
@@ -267,6 +388,8 @@ class ProvisioningViewModel : ViewModel() {
         if (!::prefs.isInitialized) return
         _isDevMode.value = prefs.getBoolean("is_dev_mode", false)
         _privateChatRequested.value = prefs.getBoolean("private_chat_requested", false)
+        _capacityRetryPolicyEnabled.value =
+            prefs.getBoolean(CapacityRetryRepository.KEY_POLICY_ENABLED, false)
         _oracleOnboardingState.value = runCatching {
             OracleOnboardingState.valueOf(
                 prefs.getString("oracle_onboarding_state", OracleOnboardingState.NotStarted.name)
@@ -275,11 +398,27 @@ class ProvisioningViewModel : ViewModel() {
         }.getOrDefault(OracleOnboardingState.NotStarted)
         homeRegion = prefs.getString("home_region", null)
         _selectedOracleRegion.value = prefs.getString("selected_oracle_region", null)
-            ?: homeRegion
+        retryLaunchSshPublicKey = prefs.getString("retry_launch_ssh_public_key", null)
+        retryLaunchSubnetId = prefs.getString("retry_launch_subnet_id", null)
         apiKeyUserOcid = prefs.getString("api_key_user_ocid", null)
         apiKeyTenancyOcid = prefs.getString("api_key_tenancy_ocid", null)
+        apiKeyTokenRegion = prefs.getString("api_key_token_region", null)
+        apiKeyTokenRegionSource = prefs.getString("api_key_token_region_source", null)
         apiKeyFingerprint = prefs.getString("api_key_fingerprint", null)
+        pendingProvisionExitId = prefs.getString("pending_provision_exit_id", null)
+        pendingCapacityRetryEligible = prefs.getBoolean("capacity_retry_eligible", false)
+        pendingRetryLastLaunchFinishedAtUtc = prefs.getString("capacity_retry_last_launch_finished_at_utc", null)
+        pendingRetryNextEligibleAtUtc = prefs.getString("capacity_retry_next_eligible_at_utc", null)
+        pendingRetryMemoryGb = prefs.getInt("capacity_retry_pending_memory_gb", 6).let { if (it == 4) 4 else 6 }
+        pendingRetryLastResult = prefs.getString("capacity_retry_last_result", null)
+        pendingRetryHttpStatus = prefs.getInt("capacity_retry_last_http_status", 0).takeIf { it > 0 }
+        val pendingProvisionResourceIds = if (pendingCapacityRetryEligible) loadResourceIds() else null
         _lastInviteOperationError.value = prefs.getString("last_invite_operation_error", null)
+        _capacityRetrySessions.value = sessionsFromJson(prefs.getString("private_chat_capacity_retry_sessions_json", null))
+        if (_capacityRetrySessions.value.hasAuthoritativePrivateChatRetry()) {
+            _privateChatRequested.value = true
+        }
+        _privateChatCandidates.value = candidatesFromJson(prefs.getString("private_chat_candidates_json", null))
         lastOracleOperationError = prefs.getString("last_oracle_operation_error", null)
         pendingOracleOperation = loadOracleOperation("pending_oracle_operation")
         failedOracleOperation = loadOracleOperation("failed_oracle_operation")
@@ -313,8 +452,16 @@ class ProvisioningViewModel : ViewModel() {
             wireGuardClientPublicKey = selected.clientPublicKey
             wireGuardServerPublicKey = selected.serverPublicKey
             wireGuardServerPeerPublicKey = selected.serverPeerPublicKey
-            resourceIds = selected.ociResourceIds?.toProvisionerResourceIds()
-            _state.value = ProvisioningState.Idle
+            resourceIds = if (pendingCapacityRetryEligible) {
+                pendingProvisionResourceIds
+            } else {
+                selected.ociResourceIds?.toProvisionerResourceIds()
+            }
+            _state.value = if (pendingCapacityRetryEligible) {
+                restoredCapacityFailureState()
+            } else {
+                ProvisioningState.Idle
+            }
             persistState()
             return
         }
@@ -349,9 +496,23 @@ class ProvisioningViewModel : ViewModel() {
                 }
                 _state.value = ProvisioningState.Idle
             }
-            // Don't restore Running state — if we were mid-provision, user needs to retry
+            // Don't restore Running state â€” if we were mid-provision, user needs to retry
+        }
+        if (pendingCapacityRetryEligible) {
+            _state.value = restoredCapacityFailureState()
         }
     }
+
+    private fun restoredCapacityFailureState(): ProvisioningState.Failure =
+        ProvisioningState.Failure(
+            failedPhase = Phase.VM_LAUNCH,
+            lastSuccessPhase = Phase.NETWORK,
+            errorMessage = if (pendingRetryLastResult == "RATE_LIMITED") {
+                "Oracle is temporarily rate limiting VM requests."
+            } else {
+                "Oracle has no A1 host capacity right now. ZeroVPN will wait before trying the ${pendingRetryMemoryGb} GB configuration."
+            },
+        )
 
     private fun persistState() {
         if (!::prefs.isInitialized) return
@@ -361,7 +522,16 @@ class ProvisioningViewModel : ViewModel() {
                 "selected_oracle_region",
                 "api_key_user_ocid",
                 "api_key_tenancy_ocid",
+                "api_key_token_region",
+                "api_key_token_region_source",
                 "api_key_fingerprint",
+                "pending_provision_exit_id",
+                "retry_launch_ssh_public_key",
+                "retry_launch_subnet_id",
+                "capacity_retry_last_launch_finished_at_utc",
+                "capacity_retry_next_eligible_at_utc",
+                "capacity_retry_last_result",
+                "capacity_retry_last_http_status",
                 "public_ip",
                 "wireguard_client_config",
                 "wireguard_client_public_key",
@@ -390,11 +560,23 @@ class ProvisioningViewModel : ViewModel() {
             putString("oracle_onboarding_state", _oracleOnboardingState.value.name)
             putBoolean("is_dev_mode", _isDevMode.value)
             putBoolean("private_chat_requested", _privateChatRequested.value)
+            putBoolean(CapacityRetryRepository.KEY_POLICY_ENABLED, _capacityRetryPolicyEnabled.value)
+            putBoolean("capacity_retry_eligible", pendingCapacityRetryEligible)
+            putInt("capacity_retry_pending_memory_gb", pendingRetryMemoryGb)
             homeRegion?.let { putString("home_region", it) }
             _selectedOracleRegion.value?.let { putString("selected_oracle_region", it) }
+            retryLaunchSshPublicKey?.let { putString("retry_launch_ssh_public_key", it) }
+            retryLaunchSubnetId?.let { putString("retry_launch_subnet_id", it) }
             apiKeyUserOcid?.let { putString("api_key_user_ocid", it) }
             apiKeyTenancyOcid?.let { putString("api_key_tenancy_ocid", it) }
+            apiKeyTokenRegion?.let { putString("api_key_token_region", it) }
+            apiKeyTokenRegionSource?.let { putString("api_key_token_region_source", it) }
             apiKeyFingerprint?.let { putString("api_key_fingerprint", it) }
+            pendingProvisionExitId?.let { putString("pending_provision_exit_id", it) }
+            pendingRetryLastLaunchFinishedAtUtc?.let { putString("capacity_retry_last_launch_finished_at_utc", it) }
+            pendingRetryNextEligibleAtUtc?.let { putString("capacity_retry_next_eligible_at_utc", it) }
+            pendingRetryLastResult?.let { putString("capacity_retry_last_result", it) }
+            pendingRetryHttpStatus?.let { putInt("capacity_retry_last_http_status", it) }
             _publicIp.value?.let { putString("public_ip", it) }
             putInt("wireguard_port", _wireGuardPort.value)
             wireGuardClientPublicKey?.let { putString("wireguard_client_public_key", it) }
@@ -552,6 +734,7 @@ class ProvisioningViewModel : ViewModel() {
         if (_state.value is ProvisioningState.Running || _state.value is ProvisioningState.Destroying) {
             return
         }
+        clearPendingRetryCredentials()
         _events.value = emptyList()
         _currentPhase.value = null
         _publicIp.value = null
@@ -568,9 +751,16 @@ class ProvisioningViewModel : ViewModel() {
         homeRegion = null
         apiKeyUserOcid = null
         apiKeyTenancyOcid = null
+        apiKeyTokenRegion = null
+        apiKeyTokenRegionSource = null
         apiKeyFingerprint = null
+        retryLaunchSshPublicKey = null
         pendingProvisionExitId = null
+        pendingCapacityRetryEligible = false
+        clearPendingCapacityRetryMetadata()
         _privateChatRequested.value = false
+        _capacityRetryPolicyEnabled.value = false
+        capacityRetryRepository?.setCapacityRetryPolicyEnabled(false)
         clearOracleOperationState()
         _state.value = ProvisioningState.PreStart
         _oracleOnboardingState.value = OracleOnboardingState.NotStarted
@@ -585,7 +775,23 @@ class ProvisioningViewModel : ViewModel() {
 
     fun setPrivateChatRequested(requested: Boolean) {
         if (_state.value is ProvisioningState.Running || _state.value is ProvisioningState.Destroying) return
+        if (_capacityRetrySessions.value.hasAuthoritativePrivateChatRetry()) {
+            _privateChatRequested.value = true
+            persistState()
+            return
+        }
         _privateChatRequested.value = requested
+        if (!requested) {
+            _capacityRetryPolicyEnabled.value = false
+            capacityRetryRepository?.setCapacityRetryPolicyEnabled(false)
+        }
+        persistState()
+    }
+
+    fun setCapacityRetryPolicyEnabled(enabled: Boolean) {
+        if (_state.value is ProvisioningState.Running || _state.value is ProvisioningState.Destroying) return
+        _capacityRetryPolicyEnabled.value = enabled && _privateChatRequested.value
+        capacityRetryRepository?.setCapacityRetryPolicyEnabled(_capacityRetryPolicyEnabled.value)
         persistState()
     }
 
@@ -616,6 +822,7 @@ class ProvisioningViewModel : ViewModel() {
     }
 
     fun cancel() {
+        clearPendingRetryCredentials()
         _events.value = emptyList()
         _currentPhase.value = null
         _publicIp.value = null
@@ -628,9 +835,12 @@ class ProvisioningViewModel : ViewModel() {
         authResult = null
         preflightResult = null
         pendingProvisionExitId = null
+        pendingCapacityRetryEligible = false
+        clearPendingCapacityRetryMetadata()
         clearOracleOperationState()
         provisioningJob?.cancel()
-        provisioningJob = null
+        _capacityRetryPolicyEnabled.value = false
+        capacityRetryRepository?.setCapacityRetryPolicyEnabled(false)
         _oracleOnboardingState.value = OracleOnboardingState.NotStarted
         restoreStateFromSelectedExitOrIdle()
         persistState()
@@ -658,6 +868,515 @@ class ProvisioningViewModel : ViewModel() {
         }
         refreshOracleOperationDiagnostics()
         persistState()
+    }
+
+    fun startCapacityRetry(context: Context) {
+        if (!::prefs.isInitialized) initPrefs(context)
+        _capacityRetryPolicyEnabled.value = true
+        capacityRetryRepository?.setCapacityRetryPolicyEnabled(true)
+        startCapacityRetryFromStoredCredentials(context.applicationContext)
+    }
+
+    private fun startCapacityRetryFromStoredCredentials(context: Context): CapacityRetrySession? {
+        val lease = provisioningLease
+        if (
+            _state.value is ProvisioningState.Running ||
+            provisioningJob?.isActive == true ||
+            lease?.isHeldByLiveProcess() == true
+        ) {
+            emit(
+                Phase.VM_LAUNCH,
+                Status.WARNING,
+                "Capacity retry will wait until foreground provisioning releases its lease.",
+            )
+            return null
+        }
+        val repository = capacityRetryRepository ?: CapacityRetryRepository(prefs).also { capacityRetryRepository = it }
+        val existing = repository.activeSession()
+        if (existing?.state == CapacityRetryState.FAILED_AMBIGUOUS_RECONCILIATION_REQUIRED) {
+            CapacityRetryWorkScheduler(context.applicationContext).cancel(existing)
+            _capacityRetrySessions.value = repository.sessions()
+            emit(
+                Phase.VM_LAUNCH,
+                Status.ERROR,
+                CapacityRetryRepository.AMBIGUOUS_RECONCILIATION_MESSAGE,
+            )
+            persistState()
+            return existing
+        }
+        if (!pendingCapacityRetryEligible && existing == null) {
+            emit(
+                Phase.VM_LAUNCH,
+                Status.ERROR,
+                "Capacity retry can start only after a foreground A1 launch is deferred.",
+            )
+            persistState()
+            return null
+        }
+        val session = existing ?: run {
+            val provisioningId = pendingProvisionExitId
+            if (provisioningId.isNullOrBlank()) {
+                emit(Phase.VM_LAUNCH, Status.ERROR, "The saved provisioning session ID is missing; capacity retry was not started.")
+                return null
+            }
+            val startResult = CapacityRetrySessionStarter(
+                repository = repository,
+                vault = RetryCredentialVault(secretStore),
+            ).start(
+                CapacityRetryStartContext(
+                    provisioningId = provisioningId,
+                    candidateId = provisioningId,
+                    mode = CapacityRetryMode.INITIAL_PRIVATE_CHAT,
+                    sourceExitId = null,
+                    compartmentOcid = apiKeyTenancyOcid,
+                    userOcid = apiKeyUserOcid,
+                    tenancyOcid = apiKeyTenancyOcid,
+                    fingerprint = apiKeyFingerprint,
+                    selectedRegion = homeRegion ?: _selectedOracleRegion.value,
+                    tokenRegion = apiKeyTokenRegion,
+                    tokenRegionSource = apiKeyTokenRegionSource,
+                    subnetId = retryLaunchSubnetId,
+                    sshPublicKey = retryLaunchSshPublicKey,
+                    initialLaunchAttemptFinishedAtUtc = pendingRetryLastLaunchFinishedAtUtc,
+                    initialNextEligibleAttemptAtUtc = pendingRetryNextEligibleAtUtc,
+                    pendingMemoryGb = pendingRetryMemoryGb,
+                    initialAttemptMemoryGb = 6,
+                    initialHttpStatus = pendingRetryHttpStatus,
+                    initialOciErrorCode = if (pendingRetryLastResult == "OUT_OF_HOST_CAPACITY") "InternalError" else "TooManyRequests",
+                    initialLastResult = pendingRetryLastResult,
+                ),
+            )
+            if (startResult is CapacityRetryStartResult.MissingStoredCredentials) {
+                _capacityRetrySessions.value = repository.sessions()
+                emit(
+                    Phase.VM_LAUNCH,
+                    Status.ERROR,
+                    "The original API signing credentials are missing or unreadable. ZeroVPN did not create another API key.",
+                )
+                persistState()
+                return null
+            }
+            (startResult as CapacityRetryStartResult.Started).session
+        }
+        pendingCapacityRetryEligible = false
+        _capacityRetrySessions.value = repository.sessions()
+        emit(
+            Phase.VM_LAUNCH,
+            Status.WARNING,
+            if (session.lastResult == "RATE_LIMITED") {
+                "Oracle is temporarily rate limiting VM requests. The saved session will wait for its next eligible slot."
+            } else {
+                "Capacity retry is waiting for the next 15-minute slot and will stop at ${session.deadlineUtc} UTC."
+            },
+        )
+        if (
+            (_capacityRetryPolicyEnabled.value || session.mode == CapacityRetryMode.DEFERRED_PRIVATE_CHAT_CANDIDATE) &&
+            shouldEnqueueCapacityRetry(
+                session = session,
+                topLevelProvisioningRunning = _state.value is ProvisioningState.Running,
+                provisioningJobActive = provisioningJob?.isActive == true,
+                provisioningLeaseHeld = lease?.isHeldByLiveProcess() == true,
+            )
+        ) {
+            CapacityRetryWorkScheduler(context.applicationContext).enqueue(session)
+        }
+        persistState()
+        return session
+    }
+
+    private fun maybeStartAutomaticCapacityRetry(context: Context) {
+        if (
+            (_capacityRetryPolicyEnabled.value || pendingRetryLastResult == "RATE_LIMITED") &&
+            pendingCapacityRetryEligible &&
+            _privateChatRequested.value &&
+            _state.value !is ProvisioningState.Running &&
+            provisioningJob?.isActive != true
+        ) {
+            startCapacityRetryFromStoredCredentials(context.applicationContext)
+        }
+    }
+
+    private fun startCapacityRetryWorkObservation(context: Context) {
+        if (capacityRetryWorkObservationJob != null) return
+        val appContext = context.applicationContext
+        capacityRetryWorkMonitor = capacityRetryWorkMonitor ?: CapacityRetryWorkMonitor(appContext)
+        capacityRetryWorkObservationJob = viewModelScope.launch {
+            _capacityRetrySessions.collect { sessions ->
+                syncCapacityRetryWorkObservers(sessions)
+            }
+        }
+    }
+
+    private fun syncCapacityRetryWorkObservers(sessions: List<CapacityRetrySession>) {
+        val monitor = capacityRetryWorkMonitor ?: return
+        val desired = sessions
+            .filter {
+                it.state != CapacityRetryState.NONE &&
+                    it.state != CapacityRetryState.SUCCEEDED
+            }
+            .associateBy(CapacityRetrySession::sessionId)
+
+        capacityRetryWorkObservers.keys
+            .filterNot(desired::containsKey)
+            .toList()
+            .forEach { sessionId ->
+                capacityRetryWorkObservers.remove(sessionId)?.let { registration ->
+                    registration.liveData.removeObserver(registration.observer)
+                }
+            }
+
+        desired.values.forEach { session ->
+            if (capacityRetryWorkObservers.containsKey(session.sessionId)) return@forEach
+            if (!_capacityRetrySchedulerStatuses.value.containsKey(session.sessionId)) {
+                publishCapacityRetrySchedulerStatus(
+                    session.sessionId,
+                    CapacityRetrySchedulerStatus.checking(),
+                )
+            }
+            val liveData = monitor.liveData(session.uniqueWorkName)
+            val observer = Observer<List<WorkInfo>> { workInfos ->
+                val previous = _capacityRetrySchedulerStatuses.value[session.sessionId]
+                val observed = capacityRetrySchedulerStatus(workInfos.orEmpty()).copy(
+                    reconciliationMessage = previous?.reconciliationMessage,
+                )
+                publishCapacityRetrySchedulerStatus(session.sessionId, observed)
+                refreshCapacityRetrySessionsFromRepository()
+                refreshCapacityRetryDiagnostics()
+            }
+            capacityRetryWorkObservers[session.sessionId] =
+                WorkInfoObserverRegistration(liveData, observer)
+            liveData.observeForever(observer)
+        }
+    }
+
+    private fun publishCapacityRetrySchedulerStatus(
+        sessionId: String,
+        status: CapacityRetrySchedulerStatus,
+    ) {
+        _capacityRetrySchedulerStatuses.value =
+            _capacityRetrySchedulerStatuses.value + (sessionId to status)
+    }
+
+    private fun refreshCapacityRetryDiagnostics() {
+        if (!::prefs.isInitialized) return
+        _capacityRetryDiagnostics.value = CapacityRetryDiagnosticLog(prefs).entries()
+    }
+
+    private fun refreshCapacityRetrySessionsFromRepository() {
+        val repository = capacityRetryRepository ?: return
+        _capacityRetrySessions.value = repository.sessions()
+        if (_capacityRetrySessions.value.hasAuthoritativePrivateChatRetry()) {
+            _privateChatRequested.value = true
+        }
+    }
+
+    private suspend fun reconcileActiveCapacityRetrySessions(context: Context) {
+        val repository = capacityRetryRepository ?: if (::prefs.isInitialized) {
+            CapacityRetryRepository(prefs).also { capacityRetryRepository = it }
+        } else {
+            return
+        }
+        val appContext = context.applicationContext
+        val monitor = capacityRetryWorkMonitor ?: CapacityRetryWorkMonitor(appContext).also {
+            capacityRetryWorkMonitor = it
+        }
+        val scheduler = CapacityRetryWorkScheduler(appContext)
+        val diagnosticLog = CapacityRetryDiagnosticLog.fromContext(appContext)
+        val vault = RetryCredentialVault(secretStore)
+        val now = Instant.now()
+        val topLevelProvisioningRunning = _state.value is ProvisioningState.Running
+        val provisioningJobActive = provisioningJob?.isActive == true
+        val provisioningLeaseHeld = provisioningLease?.isHeldByLiveProcess() == true
+        repository.sessions().forEach { session ->
+            if (
+                session.state in setOf(CapacityRetryState.WAITING_FOR_RETRY, CapacityRetryState.ACTIVE) &&
+                runCatching { !now.isBefore(Instant.parse(session.deadlineUtc)) }.getOrDefault(true)
+            ) {
+                val timedOut = repository.markTimedOutIfNeeded(session.sessionId) ?: session
+                scheduler.cancel(timedOut)
+                vault.clearCredentials(session.sessionId)
+                diagnosticLog.append(
+                    session.sessionId,
+                    "Scheduler reconciliation: retry deadline expired; background work cancelled",
+                )
+                return@forEach
+            }
+            if (session.state !in setOf(CapacityRetryState.WAITING_FOR_RETRY, CapacityRetryState.ACTIVE)) {
+                return@forEach
+            }
+
+            val observed = try {
+                capacityRetrySchedulerStatus(monitor.query(session.uniqueWorkName), now)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                diagnosticLog.append(
+                    session.sessionId,
+                    "Scheduler reconciliation: WorkManager query failed (" +
+                        error.javaClass.simpleName + ")",
+                )
+                CapacityRetrySchedulerStatus(
+                    state = CapacityRetrySchedulerState.CHECKING,
+                    detail = "Android's scheduler state could not be read yet.",
+                    observedAtUtc = now.toString(),
+                    reconciliationMessage = "Scheduler query failed; existing work was not replaced.",
+                )
+            }
+            publishCapacityRetrySchedulerStatus(session.sessionId, observed)
+            if (observed.state == CapacityRetrySchedulerState.CHECKING) return@forEach
+
+            val schedulingAllowed = shouldEnqueueCapacityRetry(
+                session = session,
+                topLevelProvisioningRunning = topLevelProvisioningRunning,
+                provisioningJobActive = provisioningJobActive,
+                provisioningLeaseHeld = provisioningLeaseHeld,
+            )
+            val credentialsAvailable = if (!schedulingAllowed || observed.hasScheduledWork) {
+                true
+            } else {
+                withContext(Dispatchers.IO) {
+                    vault.loadCredentials(session.sessionId) != null
+                }
+            }
+            when (
+                decideCapacityRetryReconciliation(
+                    session = session,
+                    schedulerState = observed.state,
+                    now = now,
+                    schedulingAllowed = schedulingAllowed,
+                    credentialsAvailable = credentialsAvailable,
+                )
+            ) {
+                CapacityRetryReconciliationAction.KEEP -> {
+                    diagnosticLog.append(
+                        session.sessionId,
+                        "Scheduler reconciliation: " + observed.state.name,
+                    )
+                }
+                CapacityRetryReconciliationAction.REENQUEUE -> {
+                    val reEnqueued = scheduler.enqueueAndAwait(session)
+                    val message = if (reEnqueued) {
+                        "Re-enqueued background work. Android will schedule the next attempt."
+                    } else {
+                        "Background work needs re-enqueueing, but WorkManager did not confirm the request."
+                    }
+                    publishCapacityRetrySchedulerStatus(
+                        session.sessionId,
+                        observed.copy(reconciliationMessage = message),
+                    )
+                    diagnosticLog.append(session.sessionId, "Scheduler reconciliation: " + message)
+                    emit(
+                        Phase.VM_LAUNCH,
+                        Status.WARNING,
+                        message,
+                    )
+                }
+                CapacityRetryReconciliationAction.PAUSE_AUTH_REQUIRED -> {
+                    repository.updateSession(session.sessionId) {
+                        it.copy(
+                            state = CapacityRetryState.PAUSED_AUTH_REQUIRED,
+                            lastResult = "PAUSED_AUTH_REQUIRED",
+                            lastSafeErrorCategory = "auth-required",
+                            requiresUserAction = true,
+                            terminalReason = "The saved Oracle signing credentials are missing or unreadable.",
+                        )
+                    }
+                    diagnosticLog.append(
+                        session.sessionId,
+                        "Scheduler reconciliation: credentials unavailable; session paused",
+                    )
+                }
+                CapacityRetryReconciliationAction.NONE -> Unit
+            }
+        }
+        _capacityRetrySessions.value = repository.sessions()
+        if (_capacityRetrySessions.value.hasAuthoritativePrivateChatRetry()) {
+            _privateChatRequested.value = true
+        }
+        refreshCapacityRetryDiagnostics()
+    }
+
+    fun reconcileCapacityRetryWork(context: Context) {
+        if (!::prefs.isInitialized) {
+            initPrefs(context)
+            return
+        }
+        val appContext = context.applicationContext
+        startCapacityRetryWorkObservation(appContext)
+        capacityRetryReconciliationJob?.cancel()
+        capacityRetryReconciliationJob = viewModelScope.launch {
+            reconcileActiveCapacityRetrySessions(appContext)
+            persistState()
+        }
+    }
+
+    fun stopActiveCapacityRetry(context: Context) {
+        if (!::prefs.isInitialized) initPrefs(context)
+        capacityRetryReconciliationJob?.cancel()
+        val repository = capacityRetryRepository ?: CapacityRetryRepository(prefs).also { capacityRetryRepository = it }
+        val session = repository.activeSession()
+        _capacityRetryPolicyEnabled.value = false
+        repository.setCapacityRetryPolicyEnabled(false)
+        if (session == null) {
+            clearPendingRetryCredentials()
+            pendingCapacityRetryEligible = false
+            clearPendingCapacityRetryMetadata()
+            persistState()
+            return
+        }
+        if (session.state == CapacityRetryState.FAILED_AMBIGUOUS_RECONCILIATION_REQUIRED) {
+            CapacityRetryWorkScheduler(context.applicationContext).cancel(session)
+            _capacityRetrySessions.value = repository.sessions()
+            emit(
+                Phase.VM_LAUNCH,
+                Status.ERROR,
+                "The ambiguous Oracle launch must be reconciled before this session can be cancelled.",
+            )
+            persistState()
+            return
+        }
+        val cancelled = repository.cancelSession(session.sessionId) ?: session
+        RetryCredentialVault(secretStore).clearCredentials(session.sessionId)
+        CapacityRetryWorkScheduler(context.applicationContext).cancel(cancelled)
+        _capacityRetrySessions.value = repository.sessions()
+        clearPendingCapacityRetryMetadata()
+        emit(Phase.VM_LAUNCH, Status.WARNING, "Capacity retry session cancelled by user.")
+        persistState()
+    }
+
+    fun setupVpnOnlyInstead(context: Context) {
+        if (!::prefs.isInitialized) initPrefs(context)
+        val reconciliationBlocker = capacityRetryRepository
+            ?.activeSession()
+            ?.takeIf { it.state == CapacityRetryState.FAILED_AMBIGUOUS_RECONCILIATION_REQUIRED }
+        if (reconciliationBlocker != null) {
+            emit(
+                Phase.VM_LAUNCH,
+                Status.ERROR,
+                "Reconcile the ambiguous Oracle launch before starting VPN-only provisioning.",
+            )
+            _state.value = ProvisioningState.Failure(
+                Phase.VM_LAUNCH,
+                Phase.NETWORK,
+                reconciliationBlocker.terminalReason
+                    ?: CapacityRetryRepository.AMBIGUOUS_RECONCILIATION_MESSAGE,
+            )
+            persistState()
+            return
+        }
+        stopActiveCapacityRetry(context)
+        _privateChatRequested.value = false
+        _capacityRetryPolicyEnabled.value = false
+        pendingCapacityRetryEligible = false
+        clearPendingCapacityRetryMetadata()
+        clearPendingRetryCredentials()
+        emit(Phase.VM_LAUNCH, Status.WARNING, "VPN-only bypass selected. Private Chat is deferred and will not be installed on this VM.")
+        _state.value = ProvisioningState.PreStart
+        persistState()
+        startProvisioning(context)
+    }
+
+    fun addPrivateChatCandidate(context: Context, sourceExitId: String) {
+        if (!::prefs.isInitialized) initPrefs(context)
+        val source = _configuredExits.value.firstOrNull { it.id == sourceExitId && it.provider == ExitProvider.OCI } ?: return
+        val repository = capacityRetryRepository ?: CapacityRetryRepository(prefs).also { capacityRetryRepository = it }
+        val candidate = repository.createCandidate(sourceExitId)
+        _privateChatCandidates.value = repository.candidates()
+        updateExit(source.id) {
+            it.copy(
+                privateChatStatus = PrivateChatCapabilityStatus.DEFERRED,
+                privateChatCandidateId = candidate.candidateId,
+            )
+        }
+        val session = repository.createSession(
+            candidateId = candidate.candidateId,
+            mode = CapacityRetryMode.DEFERRED_PRIVATE_CHAT_CANDIDATE,
+            sourceExitId = source.id,
+            compartmentOcid = source.apiKeyTenancyOcid,
+        )
+        _capacityRetrySessions.value = repository.sessions()
+        CapacityRetryWorkScheduler(context.applicationContext).enqueue(session)
+        emit(Phase.VM_LAUNCH, Status.WARNING, "Deferred chat candidate created for ${source.name}; current VPN remains active.")
+        persistState()
+    }
+
+    fun markCandidateReadyToSwitch(candidateId: String) {
+        if (!::prefs.isInitialized) return
+        val repository = capacityRetryRepository ?: CapacityRetryRepository(prefs).also { capacityRetryRepository = it }
+        val candidate = repository.candidates().firstOrNull { it.candidateId == candidateId } ?: return
+        val candidateExit = candidate.candidateExitId?.let { id -> _configuredExits.value.firstOrNull { it.id == id } } ?: return
+        if (!candidateExit.isReadyPrivateChatCandidate()) {
+            emit(Phase.PRIVATE_CHAT_ENCRYPTION_SELF_TEST, Status.WARNING, "Candidate is not ready to switch; required runtime checks have not all passed.")
+            return
+        }
+        if (!acquireProvisioningLease(ProvisioningLeaseOperation.CANDIDATE_RECONCILIATION)) return
+        try {
+            val now = Instant.now().toString()
+            repository.replaceCandidate(
+                candidate.copy(
+                    state = DeferredCandidateState.READY_TO_SWITCH,
+                    readyToSwitchAtUtc = now,
+                    updatedAtUtc = now,
+                ),
+            )
+            _privateChatCandidates.value = repository.candidates()
+            updateExit(candidateExit.id) { it.copy(privateChatStatus = PrivateChatCapabilityStatus.READY_TO_SWITCH) }
+            updateExit(candidate.sourceExitId) { it.copy(privateChatStatus = PrivateChatCapabilityStatus.READY_TO_SWITCH) }
+            emit(Phase.PRIVATE_CHAT_ENCRYPTION_SELF_TEST, Status.SUCCESS, "Deferred chat candidate ready to switch.")
+            persistState()
+        } finally {
+            provisioningLease?.release()
+        }
+    }
+
+    fun switchToPrivateChatCandidate(candidateId: String) {
+        val repository = capacityRetryRepository ?: return
+        val candidate = repository.candidates().firstOrNull { it.candidateId == candidateId } ?: return
+        val source = _configuredExits.value.firstOrNull { it.id == candidate.sourceExitId } ?: return
+        val candidateExit = candidate.candidateExitId?.let { id -> _configuredExits.value.firstOrNull { it.id == id } } ?: return
+        if (!candidateExit.isReadyPrivateChatCandidate() || candidate.state != DeferredCandidateState.READY_TO_SWITCH) {
+            emit(Phase.PRIVATE_CHAT_ENCRYPTION_SELF_TEST, Status.WARNING, "Switch blocked until candidate VPN and Private Chat checks pass.")
+            return
+        }
+        if (!acquireProvisioningLease(ProvisioningLeaseOperation.CANDIDATE_SWITCH)) return
+        try {
+            emit(Phase.PRIVATE_CHAT_ENCRYPTION_SELF_TEST, Status.RUNNING, "Switch started. Old VM will be retained for rollback.")
+            val previousSelected = _selectedExitId.value
+            runCatching {
+                _configuredExits.value = _configuredExits.value.map { exit ->
+                    when (exit.id) {
+                        source.id -> exit.copy(
+                            privateChatStatus = PrivateChatCapabilityStatus.DEFERRED,
+                            privateChatCandidateId = null,
+                        )
+                        candidateExit.id -> exit.copy(
+                            privateChatStatus = PrivateChatCapabilityStatus.HEALTHY,
+                            sourceExitId = source.id,
+                            previousExitId = source.id,
+                        )
+                        else -> exit
+                    }
+                }
+                _selectedExitId.value = candidateExit.id
+                repository.replaceCandidate(candidate.copy(state = DeferredCandidateState.SWITCHED, updatedAtUtc = Instant.now().toString()))
+                _privateChatCandidates.value = repository.candidates()
+                persistState()
+            }.onFailure { error ->
+                _selectedExitId.value = previousSelected ?: source.id
+                updateExit(candidateExit.id) {
+                    it.copy(
+                        privateChatStatus = PrivateChatCapabilityStatus.SWITCH_FAILED,
+                        lastError = error.message?.sanitizeInviteDiagnostic() ?: "Candidate switch failed; old exit restored.",
+                    )
+                }
+                emit(Phase.PRIVATE_CHAT_ENCRYPTION_SELF_TEST, Status.ERROR, "Switch failed and old exit restored.")
+                persistState()
+                return
+            }
+            emit(Phase.PRIVATE_CHAT_ENCRYPTION_SELF_TEST, Status.SUCCESS, "Switch succeeded. Old VM retained as rollback.")
+        } finally {
+            provisioningLease?.release()
+        }
     }
 
     fun setDevMode(enabled: Boolean) {
@@ -1157,7 +1876,24 @@ class ProvisioningViewModel : ViewModel() {
     }
 
     fun startProvisioning(context: Context) {
-        if (_state.value is ProvisioningState.Running) return
+        if (!::prefs.isInitialized) initPrefs(context)
+        capacityRetryRepository?.setCapacityRetryPolicyEnabled(_capacityRetryPolicyEnabled.value)
+        if (_state.value is ProvisioningState.Running || provisioningJob?.isActive == true) return
+        val retrySession = capacityRetryRepository?.activeSession()
+        if (
+            retrySession?.state in setOf(
+                CapacityRetryState.WAITING_FOR_RETRY,
+                CapacityRetryState.ACTIVE,
+                CapacityRetryState.ACQUIRING,
+            )
+        ) {
+            emit(Phase.VM_LAUNCH, Status.WARNING, "Stop the active capacity retry before starting another Oracle exit.")
+            return
+        }
+        if (!acquireProvisioningLease(ProvisioningLeaseOperation.FOREGROUND_PROVISIONING)) return
+        pendingProvisionExitId = pendingProvisionExitId ?: newExitId()
+        pendingCapacityRetryEligible = false
+        clearPendingCapacityRetryMetadata()
         setPendingOracleOperation(PendingOracleOperation.Provision)
         _oracleOnboardingState.value = OracleOnboardingState.AuthLaunched
         // Read the latest dev mode setting from SharedPreferences
@@ -1172,13 +1908,13 @@ class ProvisioningViewModel : ViewModel() {
         wireGuardServerPeerPublicKey = null
         _state.value = ProvisioningState.Running
         persistState()
-        provisioningJob?.cancel()
-        provisioningJob = viewModelScope.launch {
+        launchProvisioningJob(context.applicationContext) {
             runProvisioning(context)
         }
     }
 
     fun retry(context: Context) {
+        if (!::prefs.isInitialized) initPrefs(context)
         val operation = when {
             failedOracleOperation.type != OracleOperationType.NONE -> failedOracleOperation
             pendingOracleOperation.type != OracleOperationType.NONE -> pendingOracleOperation
@@ -1197,32 +1933,354 @@ class ProvisioningViewModel : ViewModel() {
             persistState()
             return
         }
-        setPendingOracleOperation(PendingOracleOperation.Provision)
-        if (::prefs.isInitialized) {
-            _isDevMode.value = prefs.getBoolean("is_dev_mode", false)
+        val repository = capacityRetryRepository ?: CapacityRetryRepository(prefs).also { capacityRetryRepository = it }
+        val now = Instant.now()
+        var session = repository.activeSession()?.let { active ->
+            repository.markTimedOutIfNeeded(active.sessionId) ?: active
         }
-        _events.value = emptyList()
-        _currentPhase.value = null
-        _publicIp.value = null
-        _sshDebugInfo.value = null
-        clientConfig = null
-        wireGuardClientPublicKey = null
-        wireGuardServerPublicKey = null
-        wireGuardServerPeerPublicKey = null
-        _oracleOnboardingState.value = OracleOnboardingState.AuthLaunched
-        _state.value = ProvisioningState.Running
-        persistState()
-        provisioningJob?.cancel()
-        provisioningJob = viewModelScope.launch {
-            runProvisioning(context)
+        if (session?.state == CapacityRetryState.TIMED_OUT) {
+            _capacityRetrySessions.value = repository.sessions()
+            _state.value = ProvisioningState.Failure(
+                failedPhase = Phase.VM_LAUNCH,
+                lastSuccessPhase = Phase.NETWORK,
+                errorMessage = "The fixed 24-hour capacity retry window has expired.",
+            )
+            persistState()
+            return
+        }
+        when (val decision = decideManualCapacityRetry(session, pendingCapacityRetryEligible, now)) {
+            ManualCapacityRetryDecision.StartSession -> {
+                session = startCapacityRetryFromStoredCredentials(context.applicationContext)
+                if (session == null) {
+                    showCapacityRetryAuthenticationRequired()
+                    return
+                }
+                retryExistingCapacitySession(context, session)
+            }
+            is ManualCapacityRetryDecision.Attempt -> retryExistingCapacitySession(context, session!!)
+            is ManualCapacityRetryDecision.Cooldown -> {
+                val message = "Next VM launch is available in ${formatCooldown(decision.remaining)}."
+                emit(Phase.VM_LAUNCH, Status.WARNING, message)
+                _capacityRetrySessions.value = repository.sessions()
+                _state.value = ProvisioningState.Failure(
+                    failedPhase = Phase.VM_LAUNCH,
+                    lastSuccessPhase = Phase.NETWORK,
+                    errorMessage = if (session?.lastResult == "RATE_LIMITED") {
+                        "Oracle is temporarily rate limiting VM requests. $message"
+                    } else {
+                        message
+                    },
+                )
+                persistState()
+            }
+            ManualCapacityRetryDecision.AuthenticationRequired -> showCapacityRetryAuthenticationRequired()
+            ManualCapacityRetryDecision.NotAvailable -> {
+                _state.value = ProvisioningState.Failure(
+                    failedPhase = Phase.AUTH,
+                    lastSuccessPhase = null,
+                    errorMessage = "The authenticated capacity retry session is unavailable. Start a new Oracle setup when you are ready to authenticate again.",
+                )
+                persistState()
+            }
         }
     }
 
-    fun continueAfterUkWarning(context: Context) {
+    private fun retryExistingCapacitySession(context: Context, session: CapacityRetrySession) {
+        val repository = capacityRetryRepository ?: return
+        val refreshed = repository.markTimedOutIfNeeded(session.sessionId) ?: return
+        if (refreshed.state == CapacityRetryState.TIMED_OUT) {
+            _capacityRetrySessions.value = repository.sessions()
+            _state.value = ProvisioningState.Failure(
+                failedPhase = Phase.VM_LAUNCH,
+                lastSuccessPhase = Phase.NETWORK,
+                errorMessage = "The fixed 24-hour capacity retry window has expired.",
+            )
+            persistState()
+            return
+        }
+        val remaining = refreshed.cooldownRemaining(Instant.now())
+        if (!remaining.isZero) {
+            emit(Phase.VM_LAUNCH, Status.WARNING, "Next VM launch is available in ${formatCooldown(remaining)}.")
+            _capacityRetrySessions.value = repository.sessions()
+            persistState()
+            return
+        }
+        if (!acquireProvisioningLease(ProvisioningLeaseOperation.FOREGROUND_MANUAL_RETRY)) return
+        _currentPhase.value = Phase.VM_LAUNCH
         _state.value = ProvisioningState.Running
-        viewModelScope.launch {
+        emit(
+            Phase.VM_LAUNCH,
+            Status.RUNNING,
+            "Retrying the saved ${refreshed.pendingMemoryGb} GB A1 configuration with the existing authenticated session.",
+        )
+        persistState()
+        launchProvisioningJob(context.applicationContext) {
+            attemptSingleForegroundCapacityRetry(context.applicationContext, refreshed.sessionId)
+        }
+    }
+
+    internal suspend fun attemptSingleForegroundCapacityRetry(context: Context, sessionId: String? = null) {
+        val repository = capacityRetryRepository ?: return
+        val current = sessionId?.let(repository::session) ?: repository.activeSession() ?: return
+        val started = repository.beginWorkerCycle(current.sessionId) ?: return
+        if (started.state != CapacityRetryState.ACQUIRING) {
+            val remaining = started.cooldownRemaining(Instant.now())
+            emit(Phase.VM_LAUNCH, Status.WARNING, "Next VM launch is available in ${formatCooldown(remaining)}.")
+            _capacityRetrySessions.value = repository.sessions()
+            _state.value = ProvisioningState.Failure(Phase.VM_LAUNCH, Phase.NETWORK, "The launch cooldown is still active.")
+            persistState()
+            return
+        }
+
+        val vault = RetryCredentialVault(secretStore)
+        val credentials = vault.loadCredentials(started.sessionId)
+        val privateKey = credentials?.let { runCatching { vault.loadPrivateKey(it.privateKeyPem) }.getOrNull() }
+        if (credentials == null || privateKey == null) {
+            repository.updateSession(started.sessionId) { session ->
+                if (session.state != CapacityRetryState.ACQUIRING) session else session.copy(
+                    state = CapacityRetryState.PAUSED_AUTH_REQUIRED,
+                    lastWorkerFinishedAtUtc = Instant.now().toString(),
+                    lastResult = "PAUSED_AUTH_REQUIRED",
+                    lastSafeErrorCategory = "auth-required",
+                    requiresUserAction = true,
+                    terminalReason = "The saved Oracle signing credentials are missing or unreadable.",
+                )
+            }
+            _capacityRetrySessions.value = repository.sessions()
+            showCapacityRetryAuthenticationRequired()
+            return
+        }
+
+        val missingContext = listOfNotNull(
+            "userOcid".takeIf { started.userOcid.isNullOrBlank() },
+            "tenancyOcid".takeIf { started.tenancyOcid.isNullOrBlank() },
+            "fingerprint".takeIf { started.fingerprint.isNullOrBlank() },
+            "selectedRegion".takeIf { started.selectedRegion.isNullOrBlank() },
+            "compartmentOcid".takeIf { started.compartmentOcid.isNullOrBlank() },
+            "subnetId".takeIf { started.subnetId.isNullOrBlank() },
+            "sshPublicKey".takeIf { started.sshPublicKey.isNullOrBlank() },
+        )
+        if (missingContext.isNotEmpty()) {
+            val failed = repository.updateSession(started.sessionId) { session ->
+                if (session.state != CapacityRetryState.ACQUIRING) session else session.copy(
+                    state = CapacityRetryState.FAILED_TERMINAL,
+                    lastWorkerFinishedAtUtc = Instant.now().toString(),
+                    lastResult = "MISSING_LAUNCH_CONTEXT",
+                    lastSafeErrorCategory = "invalid-launch-context",
+                    requiresUserAction = true,
+                    terminalReason = "The saved launch context is incomplete: ${missingContext.joinToString()}.",
+                )
+            }
+            failed?.let { CapacityRetryWorkScheduler(context.applicationContext).cancel(it) }
+            vault.clearCredentials(started.sessionId)
+            _capacityRetrySessions.value = repository.sessions()
+            _state.value = ProvisioningState.Failure(Phase.VM_LAUNCH, Phase.NETWORK, "The saved VM launch context is incomplete.")
+            persistState()
+            return
+        }
+
+        val retryToken = if (started.pendingMemoryGb == 4) {
+            started.compactRetryToken
+        } else {
+            started.preferredRetryToken
+        }
+        val diagnosticLog = CapacityRetryDiagnosticLog.fromContext(context.applicationContext)
+        val result = try {
+            OciBackgroundLauncher().launchA1Instance(
+                credentials = BackgroundLaunchCredentials(
+                    securityToken = credentials.securityToken,
+                    privateKey = privateKey,
+                    tenancyOcid = started.tenancyOcid!!,
+                    userOcid = started.userOcid!!,
+                    fingerprint = started.fingerprint!!,
+                ),
+                params = BackgroundLaunchParams(
+                    compartmentOcid = started.compartmentOcid!!,
+                    region = started.selectedRegion!!,
+                    subnetId = started.subnetId!!,
+                    sshPublicKey = started.sshPublicKey!!,
+                ),
+                pendingMemoryGb = started.pendingMemoryGb,
+                retryToken = retryToken,
+                sessionId = started.sessionId,
+            )
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Exception) {
+            val diagnostics = com.zerovpn.app.chat.retry.LaunchFailureDiagnostics.capture(
+                error = error,
+                failingOperation = "unknown-launch-operation",
+                retryToken = retryToken,
+                sessionId = started.sessionId,
+            )
+            diagnosticLog.append(started.sessionId, "Launch result: ${diagnostics.summaryLine()}")
+            diagnosticLog.appendFailure(started.sessionId, diagnostics)
+            val ambiguous = repository.updateSession(started.sessionId) { session ->
+                if (session.state != CapacityRetryState.ACQUIRING) session else session.copy(
+                    state = CapacityRetryState.FAILED_AMBIGUOUS_RECONCILIATION_REQUIRED,
+                    lastWorkerFinishedAtUtc = Instant.now().toString(),
+                    lastResult = "AMBIGUOUS_EXCEPTION_RECONCILIATION_REQUIRED",
+                    lastSafeErrorCategory = diagnostics.safeCategory(),
+                    requiresUserAction = true,
+                    terminalReason = CapacityRetryRepository.AMBIGUOUS_RECONCILIATION_MESSAGE,
+                    nextEligibleAttemptAtUtc = null,
+                    lastHttpStatus = null,
+                    lastOciErrorCode = null,
+                    lastRedactedRequestId = null,
+                )
+            } ?: return
+            CapacityRetryWorkScheduler(context.applicationContext).cancel(ambiguous)
+            _capacityRetrySessions.value = repository.sessions()
+            refreshCapacityRetryDiagnostics()
+            _state.value = ProvisioningState.Failure(
+                Phase.VM_LAUNCH,
+                Phase.NETWORK,
+                CapacityRetryRepository.AMBIGUOUS_RECONCILIATION_MESSAGE,
+            )
+            persistState()
+            return
+        }
+        result.failureDiagnosticsOrNull()?.let { diagnostics ->
+            diagnosticLog.append(started.sessionId, "Launch result: ${diagnostics.summaryLine()}")
+            diagnosticLog.appendFailure(started.sessionId, diagnostics)
+        }
+        val updated = repository.finishLaunchAttempt(started.sessionId, result) ?: return
+        _capacityRetrySessions.value = repository.sessions()
+        refreshCapacityRetryDiagnostics()
+        when (updated.state) {
+            CapacityRetryState.INSTANCE_ACQUIRED -> {
+                CapacityRetryWorkScheduler(context.applicationContext).cancel(updated)
+                emit(Phase.VM_LAUNCH, Status.SUCCESS, "Oracle VM acquired. Open ZeroVPN to continue Private Chat setup.")
+                _state.value = ProvisioningState.Idle
+            }
+            CapacityRetryState.ACTIVE -> {
+                val message = if (updated.lastResult == "RATE_LIMITED") {
+                    "Oracle is temporarily rate limiting VM requests."
+                } else {
+                    "Oracle has no A1 host capacity right now. The next slot will try ${updated.pendingMemoryGb} GB."
+                }
+                emit(Phase.VM_LAUNCH, Status.WARNING, message)
+                _state.value = ProvisioningState.Failure(Phase.VM_LAUNCH, Phase.NETWORK, message)
+            }
+            CapacityRetryState.FAILED_TERMINAL -> {
+                CapacityRetryWorkScheduler(context.applicationContext).cancel(updated)
+                vault.clearCredentials(updated.sessionId)
+                _state.value = ProvisioningState.Failure(
+                    Phase.VM_LAUNCH,
+                    Phase.NETWORK,
+                    updated.terminalReason ?: "Oracle rejected the VM launch request.",
+                )
+            }
+            CapacityRetryState.FAILED_AMBIGUOUS_RECONCILIATION_REQUIRED -> {
+                CapacityRetryWorkScheduler(context.applicationContext).cancel(updated)
+                _state.value = ProvisioningState.Failure(
+                    Phase.VM_LAUNCH,
+                    Phase.NETWORK,
+                    updated.terminalReason ?: CapacityRetryRepository.AMBIGUOUS_RECONCILIATION_MESSAGE,
+                )
+            }
+            else -> _state.value = ProvisioningState.Failure(
+                Phase.VM_LAUNCH,
+                Phase.NETWORK,
+                updated.terminalReason ?: "The capacity retry could not continue.",
+            )
+        }
+        persistState()
+    }
+
+    private fun showCapacityRetryAuthenticationRequired() {
+        emit(
+            Phase.AUTH,
+            Status.ERROR,
+            "The saved Oracle signing credentials are missing or invalid. Authentication is required before retry can continue.",
+        )
+        _state.value = ProvisioningState.Failure(
+            failedPhase = Phase.AUTH,
+            lastSuccessPhase = null,
+            errorMessage = "Authentication is required to continue this capacity retry session.",
+        )
+        persistState()
+    }
+
+    private fun formatCooldown(duration: Duration): String {
+        val seconds = duration.seconds.coerceAtLeast(0L)
+        return "${seconds / 60}m ${seconds % 60}s"
+    }
+
+    fun continueAfterUkWarning(context: Context) {
+        if (!::prefs.isInitialized) initPrefs(context)
+        if (!acquireProvisioningLease(ProvisioningLeaseOperation.FOREGROUND_AUTH_CONTINUATION)) return
+        _state.value = ProvisioningState.Running
+        persistState()
+        launchProvisioningJob(context.applicationContext) {
             continueProvisioningAfterWarning(context)
         }
+    }
+
+    private fun acquireProvisioningLease(operation: ProvisioningLeaseOperation): Boolean {
+        val acquired = provisioningLease?.tryAcquire(operation) == true
+        if (!acquired) {
+            emit(
+                Phase.VM_LAUNCH,
+                Status.WARNING,
+                "Another provisioning or capacity operation is active. Wait for it to finish before retrying.",
+            )
+        }
+        return acquired
+    }
+
+    private fun launchProvisioningJob(context: Context, block: suspend () -> Unit) {
+        val job = viewModelScope.launch {
+            try {
+                block()
+            } finally {
+                provisioningLease?.release()
+            }
+        }
+        provisioningJob = job
+        job.invokeOnCompletion { cause ->
+            if (cause == null) {
+                viewModelScope.launch {
+                    maybeStartAutomaticCapacityRetry(context.applicationContext)
+                }
+            }
+        }
+    }
+
+    private fun cancelCapacityRetryAfterForegroundSuccess(context: Context, provisioningId: String) {
+        val repository = capacityRetryRepository ?: return
+        val session = repository.sessions().firstOrNull {
+            it.candidateId == provisioningId && !it.isTerminal()
+        } ?: return
+        val succeeded = repository.updateSession(session.sessionId) {
+            it.copy(
+                state = CapacityRetryState.SUCCEEDED,
+                lastResult = "FOREGROUND_PROVISIONING_SUCCEEDED",
+                requiresUserAction = false,
+                terminalReason = null,
+            )
+        } ?: session
+        CapacityRetryWorkScheduler(context.applicationContext).cancel(succeeded)
+        RetryCredentialVault(secretStore).clearCredentials(session.sessionId)
+        _capacityRetrySessions.value = repository.sessions()
+    }
+
+    private fun clearPendingRetryCredentials(provisioningId: String? = pendingProvisionExitId) {
+        if (!provisioningId.isNullOrBlank() && ::secretStore.isInitialized) {
+            RetryCredentialVault(secretStore).clearProvisioningCredentials(provisioningId)
+        }
+        if (provisioningId == pendingProvisionExitId) {
+            retryLaunchSubnetId = null
+            retryLaunchSshPublicKey = null
+        }
+    }
+
+    private fun clearPendingCapacityRetryMetadata() {
+        pendingRetryLastLaunchFinishedAtUtc = null
+        pendingRetryNextEligibleAtUtc = null
+        pendingRetryMemoryGb = 6
+        pendingRetryLastResult = null
+        pendingRetryHttpStatus = null
     }
 
     fun retryPrivateChat(context: Context, exitId: String) {
@@ -1595,7 +2653,14 @@ class ProvisioningViewModel : ViewModel() {
     }
 
     fun cleanup(context: Context) {
-        viewModelScope.launch {
+        if (!::prefs.isInitialized) initPrefs(context)
+        if (!acquireProvisioningLease(ProvisioningLeaseOperation.CLEANUP)) return
+        stopActiveCapacityRetry(context)
+        clearPendingRetryCredentials()
+        pendingCapacityRetryEligible = false
+        clearPendingCapacityRetryMetadata()
+        provisioningJob = viewModelScope.launch {
+            try {
             val currentRids = resourceIds
             val currentAuth = authResult
             val currentRegion = homeRegion ?: _selectedOracleRegion.value
@@ -1636,6 +2701,9 @@ class ProvisioningViewModel : ViewModel() {
             clearOracleOperationState()
             restoreStateFromSelectedExitOrIdle()
             persistState()
+            } finally {
+                provisioningLease?.release()
+            }
         }
     }
 
@@ -1745,6 +2813,7 @@ class ProvisioningViewModel : ViewModel() {
             if (launchFailure != null) {
                 chatLastLaunchResult = when (launchFailure) {
                     is VmLaunchFailure.OutOfHostCapacity -> "FAIL"
+                    is VmLaunchFailure.RateLimited -> "RATE_LIMITED"
                     is VmLaunchFailure.Other -> "FAIL"
                 }
                 chatInstanceCreated = "No"
@@ -1821,14 +2890,19 @@ class ProvisioningViewModel : ViewModel() {
     }
 
     private suspend fun doProvision(context: Context, prov: OciProvisioner) {
+        val privateChatRequested = _privateChatRequested.value
+        val provisioningId = pendingProvisionExitId ?: newExitId().also {
+            pendingProvisionExitId = it
+        }
         try {
             val auth = authResult!!
             val preflight = preflightResult!!
-            val privateChatRequested = _privateChatRequested.value
             homeRegion = preflight.homeRegion
             _selectedOracleRegion.value = preflight.homeRegion
             apiKeyUserOcid = auth.userOcid
             apiKeyTenancyOcid = auth.tenancyOcid
+            apiKeyTokenRegion = auth.tokenRegion
+            apiKeyTokenRegionSource = auth.tokenRegionSource
             apiKeyFingerprint = auth.fingerprint
             persistState()
 
@@ -1836,6 +2910,27 @@ class ProvisioningViewModel : ViewModel() {
                 auth = auth,
                 preflight = preflight,
                 privateChatRequested = privateChatRequested,
+                onApiKeyUploaded = { uploadedFingerprint ->
+                    apiKeyFingerprint = uploadedFingerprint
+                    if (privateChatRequested) {
+                        val stored = RetryCredentialVault(secretStore).storeProvisioningCredentials(
+                            provisioningId = provisioningId,
+                            securityToken = auth.securityToken,
+                            privateKey = auth.privateKey,
+                        )
+                        check(stored) {
+                            "ZeroVPN could not securely retain the original Oracle signing credentials. " +
+                                "Provisioning was stopped before VM launch."
+                        }
+                    }
+                    persistState()
+                },
+                onLaunchContextReady = { readyResourceIds, sshPublicKey ->
+                    resourceIds = readyResourceIds
+                    retryLaunchSubnetId = readyResourceIds.subnetId
+                    retryLaunchSshPublicKey = sshPublicKey
+                    persistState()
+                },
             )
             resourceIds = rids
             clientConfig = result.clientConfig
@@ -1850,7 +2945,7 @@ class ProvisioningViewModel : ViewModel() {
                 privateKeyPresent = true,
             )
             val configuredExit = buildConfiguredExit(
-                exitId = pendingProvisionExitId ?: newExitId(),
+                exitId = provisioningId,
                 name = nextExitName(),
                 publicIp = result.publicIp,
                 wireGuardPort = result.wireGuardPort,
@@ -1864,6 +2959,11 @@ class ProvisioningViewModel : ViewModel() {
             )
             _configuredExits.value = _configuredExits.value + configuredExit
             _selectedExitId.value = configuredExit.id
+            pendingCapacityRetryEligible = false
+            clearPendingCapacityRetryMetadata()
+            clearPendingRetryCredentials(provisioningId)
+            cancelCapacityRetryAfterForegroundSuccess(context.applicationContext, provisioningId)
+            pendingProvisionExitId = null
             createInviteSlotsForProvisionedExit(
                 ownerExitId = configuredExit.id,
                 inviteProfiles = result.inviteProfiles,
@@ -1903,8 +3003,24 @@ class ProvisioningViewModel : ViewModel() {
                 currentPhase = _currentPhase.value,
             )
             val launchFailure = OciProvisioner.classifyLaunchFailure(e)
+            val exactCapacityFailure = privateChatRequested && launchFailure is VmLaunchFailure.OutOfHostCapacity
+            val rateLimited = privateChatRequested && launchFailure is VmLaunchFailure.RateLimited
+            val retryableLaunchFailure = exactCapacityFailure || rateLimited
+            pendingCapacityRetryEligible = retryableLaunchFailure
+            if (retryableLaunchFailure) {
+                val finishedAt = Instant.now()
+                val retryAfterSeconds = (launchFailure as? VmLaunchFailure.RateLimited)?.retryAfterSeconds
+                pendingRetryLastLaunchFinishedAtUtc = finishedAt.toString()
+                pendingRetryNextEligibleAtUtc = nextEligibleLaunchAt(finishedAt, retryAfterSeconds).toString()
+                pendingRetryMemoryGb = if (exactCapacityFailure) 4 else 6
+                pendingRetryLastResult = if (rateLimited) "RATE_LIMITED" else "OUT_OF_HOST_CAPACITY"
+                pendingRetryHttpStatus = if (rateLimited) 429 else 500
+            } else {
+                clearPendingCapacityRetryMetadata()
+                clearPendingRetryCredentials(provisioningId)
+            }
             if (launchFailure != null) {
-                chatLastLaunchResult = "FAIL"
+                chatLastLaunchResult = if (rateLimited) "RATE_LIMITED" else "FAIL"
                 chatInstanceCreated = "No"
                 chatCleanupRequired = if (resourceIds?.instanceId != null) "WARNING" else "No"
             } else if (failedPhase == Phase.AUTH || failedPhase == Phase.API_KEY) {
@@ -1916,8 +3032,12 @@ class ProvisioningViewModel : ViewModel() {
             setFailedOracleOperation(PendingOracleOperation.Provision, errorMessage)
             _state.value = ProvisioningState.Failure(
                 failedPhase = failedPhase,
-                lastSuccessPhase = null,
-                errorMessage = errorMessage,
+                lastSuccessPhase = if (failedPhase == Phase.VM_LAUNCH) Phase.NETWORK else null,
+                errorMessage = if (rateLimited) {
+                    "Oracle is temporarily rate limiting VM requests."
+                } else {
+                    errorMessage
+                },
             )
             if (failedPhase == Phase.AUTH) {
                 _oracleOnboardingState.value = OracleOnboardingState.AuthFailed
@@ -2524,6 +3644,10 @@ class ProvisioningViewModel : ViewModel() {
         .put("udpSupported", udpSupported)
         .put("dnsStatus", dnsStatus)
         .put("destroyMeaning", destroyMeaning)
+        .put("privateChatStatus", privateChatStatus.name)
+        .put("privateChatCandidateId", privateChatCandidateId)
+        .put("sourceExitId", sourceExitId)
+        .put("previousExitId", previousExitId)
         .put("privateChat", privateChat?.toJson())
         .put("ociResourceIds", ociResourceIds?.toJson())
 
@@ -2656,6 +3780,12 @@ class ProvisioningViewModel : ViewModel() {
             udpSupported = optBooleanOrNull("udpSupported"),
             dnsStatus = optNullableString("dnsStatus"),
             destroyMeaning = optNullableString("destroyMeaning"),
+            privateChatStatus = runCatching {
+                PrivateChatCapabilityStatus.valueOf(optString("privateChatStatus", PrivateChatCapabilityStatus.NOT_REQUESTED.name))
+            }.getOrDefault(PrivateChatCapabilityStatus.NOT_REQUESTED),
+            privateChatCandidateId = optNullableString("privateChatCandidateId"),
+            sourceExitId = optNullableString("sourceExitId"),
+            previousExitId = optNullableString("previousExitId"),
             privateChat = privateChatJson?.toPrivateChatNodeState(),
         )
     }
@@ -2732,6 +3862,25 @@ class ProvisioningViewModel : ViewModel() {
         )
     }
 
+    private fun ConfiguredExit.isReadyPrivateChatCandidate(): Boolean {
+        val chat = privateChat ?: return false
+        return wireGuardConfig.isNotBlank() &&
+            publicIp.isNotBlank() &&
+            chat.status == PrivateChatInstallStatus.HEALTHY &&
+            chat.healthChecks.postgresqlProcessOk == true &&
+            chat.healthChecks.postgresqlConnectionOk == true &&
+            chat.healthChecks.synapseProcessOk == true &&
+            chat.healthChecks.synapseLoopbackListenerOk == true &&
+            chat.healthChecks.tlsEndpointOk == true &&
+            chat.healthChecks.matrixVersionsOk == true &&
+            chat.healthChecks.ownerAccountExists == true &&
+            chat.healthChecks.firewallServiceActive == true &&
+            chat.healthChecks.privateFirewallPolicyActive == true &&
+            chat.healthChecks.chatOnlyPolicyChainsReady == true &&
+            chat.lastSelfTestStatus == PrivateChatSelfTestStatus.PASS &&
+            !chat.tlsSpkiSha256.isNullOrBlank()
+    }
+
     private fun JSONObject.optNullableString(name: String): String? =
         if (has(name) && !isNull(name)) optString(name).takeIf { it.isNotBlank() } else null
 
@@ -2740,6 +3889,19 @@ class ProvisioningViewModel : ViewModel() {
 
     private fun JSONObject.optBooleanOrNull(name: String): Boolean? =
         if (has(name) && !isNull(name)) optBoolean(name) else null
+
+    override fun onCleared() {
+        capacityRetryReconciliationJob?.cancel()
+        capacityRetryWorkObservationJob?.cancel()
+        capacityRetryWorkObservers.values.forEach { registration ->
+            registration.liveData.removeObserver(registration.observer)
+        }
+        capacityRetryWorkObservers.clear()
+        if (::prefs.isInitialized) {
+            prefs.unregisterOnSharedPreferenceChangeListener(capacityRetryPrefsListener)
+        }
+        super.onCleared()
+    }
 
     companion object {
         const val ORACLE_SIGNUP_URL = "https://signup.oraclecloud.com/"

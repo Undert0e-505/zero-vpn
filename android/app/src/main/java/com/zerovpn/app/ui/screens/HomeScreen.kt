@@ -40,6 +40,7 @@ import androidx.compose.ui.unit.sp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.zerovpn.app.ui.components.StatusCard
 import com.zerovpn.app.chat.node.PrivateChatInstallStatus
+import com.zerovpn.app.chat.retry.PrivateChatCapabilityStatus
 import com.zerovpn.app.ui.provisioning.ProvisioningViewModel
 import com.zerovpn.app.ui.theme.*
 import com.zerovpn.app.vpn.ConfiguredExit
@@ -641,6 +642,11 @@ fun HomeScreen(
                     } else {
                         null
                     },
+                    onAddPrivateChat = if (exit.provider == ExitProvider.OCI && exit.privateChat == null) {
+                        { viewModel.addPrivateChatCandidate(context, exit.id) }
+                    } else {
+                        null
+                    },
                     onRename = if (exit.provider == ExitProvider.SHARED_WIREGUARD) {
                         { renameTarget = exit }
                     } else {
@@ -723,6 +729,7 @@ private fun ExitCard(
     onRefreshPrivateChat: (() -> Unit)?,
     onVerifyPrivateChatOwner: (() -> Unit)?,
     onRemovePrivateChat: (() -> Unit)?,
+    onAddPrivateChat: (() -> Unit)?,
     onRename: (() -> Unit)?,
 ) {
     Column(
@@ -783,6 +790,37 @@ private fun ExitCard(
                 fontWeight = FontWeight.Medium,
                 color = if (active || switchingTarget) Accent else TextDim,
             )
+        }
+        if (exit.privateChat == null && onAddPrivateChat != null &&
+            (exit.privateChatStatus == PrivateChatCapabilityStatus.DEFERRED || exit.privateChatStatus == PrivateChatCapabilityStatus.NOT_REQUESTED)
+        ) {
+            Spacer(modifier = Modifier.height(10.dp))
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(Bg.copy(alpha = 0.45f), RoundedCornerShape(6.dp))
+                    .padding(10.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                Text(
+                    text = if (exit.privateChatStatus == PrivateChatCapabilityStatus.DEFERRED) "Private Chat deferred" else "Private Chat not installed",
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = TextDim,
+                )
+                Text(
+                    text = "Add Private Chat creates a second A1-capable candidate VM and keeps this VPN active until you explicitly switch.",
+                    fontSize = 11.sp,
+                    color = TextDim,
+                    lineHeight = 15.sp,
+                )
+                OutlinedButton(
+                    onClick = onAddPrivateChat,
+                    modifier = Modifier.fillMaxWidth().height(36.dp),
+                ) {
+                    Text("Add Private Chat", fontSize = 12.sp, color = Accent)
+                }
+            }
         }
         exit.privateChat?.let { chat ->
             Spacer(modifier = Modifier.height(10.dp))

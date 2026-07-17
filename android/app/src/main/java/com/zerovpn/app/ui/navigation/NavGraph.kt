@@ -67,7 +67,10 @@ private val screens = listOf(
 )
 
 @Composable
-fun NavGraph() {
+fun NavGraph(
+    openDiagnostics: Boolean = false,
+    onDiagnosticsOpened: () -> Unit = {},
+) {
     val navController = rememberNavController()
     val snackbarHostState = remember { SnackbarHostState() }
     val provisioningViewModel: ProvisioningViewModel = viewModel()
@@ -84,6 +87,15 @@ fun NavGraph() {
 
     LaunchedEffect(Unit) {
         provisioningViewModel.initPrefs(context)
+    }
+
+    LaunchedEffect(openDiagnostics) {
+        if (openDiagnostics) {
+            navController.navigate(Screen.Diagnostics.route) {
+                launchSingleTop = true
+            }
+            onDiagnosticsOpened()
+        }
     }
 
     LaunchedEffect(Unit) {
@@ -250,6 +262,11 @@ fun NavGraph() {
                     onBack = { navController.popBackStack() },
                     viewModel = provisioningViewModel,
                     vpnViewModel = vpnViewModel,
+                    onViewDiagnostics = {
+                        navController.navigate(Screen.Diagnostics.route) {
+                            launchSingleTop = true
+                        }
+                    },
                     onConnectedHome = {
                         provisioningViewModel.clearTransientProvisioningSuccess()
                         navController.navigate(Screen.Home.route) {
