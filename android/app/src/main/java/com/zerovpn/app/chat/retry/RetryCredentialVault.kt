@@ -257,6 +257,11 @@ data class CapacityRetryStartContext(
     val initialHttpStatus: Int? = null,
     val initialOciErrorCode: String? = null,
     val initialLastResult: String? = null,
+    val availabilityDomain: String? = null,
+    val ubuntuImageOcid: String? = null,
+    val vcnOcid: String? = null,
+    val identityHost: String? = null,
+    val iaasHost: String? = null,
 )
 
 sealed interface CapacityRetryStartResult {
@@ -307,6 +312,10 @@ class CapacityRetrySessionStarter(
             initialHttpStatus = context.initialHttpStatus,
             initialOciErrorCode = context.initialOciErrorCode,
             initialLastResult = context.initialLastResult,
+            ubuntuImageOcid = context.ubuntuImageOcid,
+            vcnOcid = context.vcnOcid,
+            identityHost = context.identityHost,
+            iaasHost = context.iaasHost,
         )
         if (!vault.promoteProvisioningCredentials(context.provisioningId, session.sessionId)) {
             vault.clearCredentials(session.sessionId)

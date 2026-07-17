@@ -328,3 +328,59 @@ received HTTP 401, incorrectly classified as `LOCAL_PREPARATION_FAILURE`.
 D:\dev\zero-vpn\artifacts\zerovpn-shared-oci-signer-fix-debug.apk
 D:\dev\zero-vpn\artifacts\zerovpn-shared-oci-signer-fix-debug.apk.sha256
 ` ` `
+## Transient network retry fix (2026-07-17)
+
+### Android unit tests
+
+The Android JVM test suite now includes tests for transient network failure
+classification and durable launch context:
+
+- `UnknownHostException` before request construction → `TransientNetworkFailure`
+- `ConnectException` before transmission → `TransientNetworkFailure`
+- `SocketTimeoutException` before transmission → `TransientNetworkFailure`
+- Transient failure does NOT become `FAILED_TERMINAL` or `AMBIGUOUS_FAILURE`
+- Transient failure sends no instance POST (no launch counter increment)
+- Transient failure does not change `pendingMemoryGb`
+- Transient failure preserves the retry token
+- Transient failure schedules next eligible work (session → ACTIVE)
+- Transient failure preserves the original deadline
+- Transient failure increments only `transientNetworkDeferrals`
+- Later worker run succeeds after a previous transient failure
+- Durable AD context prevents Identity lookup GET
+- Durable image context prevents image lookup GET
+- Both durable context values skip all lookups (only POST sent)
+- `TransientNetworkFailure` result has safe diagnostics (no secrets)
+- `workerCyclesStarted` increments on each `beginWorkerCycle`
+- Legacy counters migrate to 0 for legacy sessions
+- `capacityMiss` increments accurate counters (`instanceLaunchRequests6Gb`,
+  `backgroundLaunchAttempts`)
+- Durable launch context survives repository reconstruction
+- Existing 401 → `AuthenticationFailure` and 429 → `RateLimited` tests preserved
+- Existing VPN-only and Private Chat tests preserved
+
+### Validation
+
+```powershell
+Set-Location D:\dev\zero-vpn\android
+$env:JAVA_HOME = 'C:\Program Files\Java\jdk-21'
+$env:ANDROID_HOME = 'D:\dev\android-sdk'
+$env:ANDROID_SDK_ROOT = 'D:\dev\android-sdk'
+.\gradlew.bat clean
+.\gradlew.bat test
+.\gradlew.bat lint
+.\gradlew.bat assembleDebug
+```
+
+Python tests:
+
+```powershell
+Set-Location D:\dev\zero-vpn
+& .\.venv-test\Scripts\python.exe -m pytest -v
+```
+
+### Build artifact
+
+```text
+D:\dev\zero-vpn\artifacts\zerovpn-transient-network-retry-fix-debug.apk
+D:\dev\zero-vpn\artifacts\zerovpn-transient-network-retry-fix-debug.apk.sha256
+```

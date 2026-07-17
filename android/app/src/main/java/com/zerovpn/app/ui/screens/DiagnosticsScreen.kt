@@ -313,6 +313,7 @@ private fun CapacityRetryDiagnosticsCard(
         DebugValue("Instance launch requests (6 GB)", session.instanceLaunchRequests6Gb.toString())
         DebugValue("Instance launch requests (4 GB)", session.instanceLaunchRequests4Gb.toString())
         DebugValue("Background launch attempts", session.backgroundLaunchAttempts.toString())
+        DebugValue("Transient network deferrals", session.transientNetworkDeferrals.toString())
         DebugValue("Last attempted configuration", session.lastAttemptMemoryGb?.let { "1 OCPU / ${it} GB" } ?: "NOT TESTED")
         DebugValue("Last result", session.lastResult ?: "NOT TESTED")
         DebugValue(

@@ -46,6 +46,8 @@ internal interface BackgroundLaunchExecutor {
         pendingMemoryGb: Int,
         retryToken: String,
         sessionId: String = "",
+        durableAvailabilityDomain: String? = null,
+        durableImageOcid: String? = null,
     ): BackgroundLaunchResult
 }
 
@@ -89,6 +91,18 @@ internal sealed class BackgroundLaunchResult {
         val redactedRequestId: String?,
         val diagnostics: LaunchFailureDiagnostics,
     ) : BackgroundLaunchResult()
+
+    /**
+     * A transient network failure (DNS resolution, connectivity, TLS before transmission) that
+     * occurred before any OCI request was transmitted. The session stays ACTIVE and retries.
+     */
+    data class TransientNetworkFailure(
+        val category: String,
+        val safeMessage: String,
+        val exceptionClass: String,
+        val failedHostname: String?,
+        val diagnostics: LaunchFailureDiagnostics,
+    ) : BackgroundLaunchResult()
 }
 
 internal fun BackgroundLaunchResult.failureDiagnosticsOrNull(): LaunchFailureDiagnostics? = when (this) {
@@ -96,6 +110,7 @@ internal fun BackgroundLaunchResult.failureDiagnosticsOrNull(): LaunchFailureDia
     is BackgroundLaunchResult.TransmissionFailure -> diagnostics
     is BackgroundLaunchResult.AmbiguousFailure -> diagnostics
     is BackgroundLaunchResult.AuthenticationFailure -> diagnostics
+    is BackgroundLaunchResult.TransientNetworkFailure -> diagnostics
     else -> null
 }
 
@@ -200,6 +215,8 @@ internal class OciBackgroundLauncher(
         pendingMemoryGb: Int,
         retryToken: String,
         sessionId: String,
+        durableAvailabilityDomain: String?,
+        durableImageOcid: String?,
     ): BackgroundLaunchResult {
         val tracker = LaunchProgressTracker()
         try {
@@ -208,16 +225,28 @@ internal class OciBackgroundLauncher(
             }
             val identityHost = identityHostOverride ?: OciEndpoints.identityHost(params.region)
             val iaasHost = iaasHostOverride ?: OciEndpoints.iaasHost(params.region)
-            tracker.failingOperation = "availability-domain-lookup"
-            val adName = getArray(
-                credentials,
-                identityHost,
-                "/20160918/availabilityDomains?compartmentId=${encode(params.compartmentOcid)}",
-                tracker,
-                "availability-domain-lookup",
-            ).getJSONObject(0).getString("name")
-            val imageId = latestUbuntuImage(credentials, iaasHost, params.compartmentOcid, tracker)
-                ?: throw IllegalStateException("No supported Ubuntu A1 image was returned by OCI.")
+
+            // Use durable AD context if available; skip the Identity lookup GET entirely.
+            val adName = if (!durableAvailabilityDomain.isNullOrBlank()) {
+                durableAvailabilityDomain
+            } else {
+                tracker.failingOperation = "availability-domain-lookup"
+                getArray(
+                    credentials,
+                    identityHost,
+                    "/20160918/availabilityDomains?compartmentId=${encode(params.compartmentOcid)}",
+                    tracker,
+                    "availability-domain-lookup",
+                ).getJSONObject(0).getString("name")
+            }
+
+            // Use durable image context if available; skip the image lookup GET entirely.
+            val imageId = if (!durableImageOcid.isNullOrBlank()) {
+                durableImageOcid
+            } else {
+                latestUbuntuImage(credentials, iaasHost, params.compartmentOcid, tracker)
+                    ?: throw IllegalStateException("No supported Ubuntu A1 image was returned by OCI.")
+            }
 
             tracker.progress = LaunchProgress.PREPARING_REQUEST
             tracker.failingOperation = "construct-launch-request-body"
@@ -259,6 +288,21 @@ internal class OciBackgroundLauncher(
             )
         } catch (error: Exception) {
             val diagnostics = tracker.capture(error, retryToken, sessionId)
+
+            // Check for transient network failures BEFORE other classification.
+            // DNS resolution failures, connectivity errors, and pre-transmission TLS failures
+            // are transient — the session stays ACTIVE and retries.
+            if (isTransientNetworkError(error) && !tracker.transmissionStarted) {
+                val hostname = extractHostname(error)
+                return BackgroundLaunchResult.TransientNetworkFailure(
+                    category = "transient-network-failure",
+                    safeMessage = "Network unavailable during Oracle preparation: ${error.javaClass.simpleName}",
+                    exceptionClass = error.javaClass.simpleName,
+                    failedHostname = hostname,
+                    diagnostics = diagnostics,
+                )
+            }
+
             return when {
                 tracker.transmissionStarted && !tracker.responseHeadersReceived ->
                     BackgroundLaunchResult.TransmissionFailure(
@@ -284,6 +328,37 @@ internal class OciBackgroundLauncher(
                 )
             }
         }
+    }
+
+    /**
+     * Returns true if the error (or any cause in its chain) is a transient network failure:
+     * - UnknownHostException (DNS resolution failure)
+     * - ConnectException (connection refused/timeout before transmission)
+     * - SocketTimeoutException (socket timeout before response)
+     * - SSLException (TLS handshake failure before transmission)
+     */
+    private fun isTransientNetworkError(error: Throwable): Boolean {
+        var current: Throwable? = error
+        while (current != null) {
+            when (current) {
+                is java.net.UnknownHostException -> return true
+                is java.net.ConnectException -> return true
+                is java.net.SocketTimeoutException -> return true
+                is javax.net.ssl.SSLException -> return true
+            }
+            current = current.cause
+        }
+        return false
+    }
+
+    /**
+     * Extracts the hostname from a DNS resolution failure message.
+     * Example message: Unable to resolve host "identity.eu-zurich-1.oci.oraclecloud.com"
+     */
+    private fun extractHostname(error: Throwable): String? {
+        val message = error.message ?: return null
+        val match = Regex("Unable to resolve host \"([^\"]+)\"").find(message)
+        return match?.groupValues?.getOrNull(1)
     }
 
     private suspend fun latestUbuntuImage(

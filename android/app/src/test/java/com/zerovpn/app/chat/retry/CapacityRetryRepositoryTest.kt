@@ -631,6 +631,234 @@ class CapacityRetryRepositoryTest {
         assertEquals(CapacityRetryState.CANCELLED, acquiringRepository.sessions().single().state)
     }
 
+    @Test fun transientNetworkFailureStaysActiveAndSchedulesNextAttempt() {
+        val prefs = FakeSharedPreferences()
+        val session = repositoryAt(start, prefs).createSession(
+            "candidate:transient",
+            CapacityRetryMode.INITIAL_PRIVATE_CHAT,
+            null,
+            "tenancy",
+        )
+        val repo = repositoryAt(start.plusSeconds(15 * 60), prefs)
+        repo.beginWorkerCycle(session.sessionId)
+        val diagnostics = launchDiagnostics(
+            progress = LaunchProgress.SIGNING_REQUEST,
+            transmissionStarted = false,
+            responseHeadersReceived = false,
+        )
+
+        repo.finishLaunchAttempt(
+            session.sessionId,
+            BackgroundLaunchResult.TransientNetworkFailure(
+                category = "transient-network-failure",
+                safeMessage = "Network unavailable during Oracle preparation: UnknownHostException",
+                exceptionClass = "UnknownHostException",
+                failedHostname = "identity.eu-zurich-1.oci.oraclecloud.com",
+                diagnostics = diagnostics,
+            ),
+        )
+
+        val active = repo.sessions().single()
+        assertEquals(CapacityRetryState.ACTIVE, active.state)
+        assertEquals("TRANSIENT_NETWORK_FAILURE", active.lastResult)
+        assertEquals("transient-network-failure", active.lastSafeErrorCategory)
+        assertEquals(6, active.pendingMemoryGb)
+        assertEquals(1, active.transientNetworkDeferrals)
+        assertFalse(active.requiresUserAction)
+        assertNull(active.terminalReason)
+        // Next eligible attempt should be scheduled 15+ minutes later
+        assertNotNull(active.nextEligibleAttemptAtUtc)
+        // Deadline should NOT be reset
+        assertEquals(session.deadlineUtc, active.deadlineUtc)
+    }
+
+    @Test fun transientNetworkFailureDoesNotIncrementLaunchCounters() {
+        val prefs = FakeSharedPreferences()
+        val session = repositoryAt(start, prefs).createSession(
+            "candidate:transient-counters",
+            CapacityRetryMode.INITIAL_PRIVATE_CHAT,
+            null,
+            "tenancy",
+        )
+        val repo = repositoryAt(start.plusSeconds(15 * 60), prefs)
+        repo.beginWorkerCycle(session.sessionId)
+        val diagnostics = launchDiagnostics(
+            progress = LaunchProgress.SIGNING_REQUEST,
+            transmissionStarted = false,
+            responseHeadersReceived = false,
+        )
+
+        repo.finishLaunchAttempt(
+            session.sessionId,
+            BackgroundLaunchResult.TransientNetworkFailure(
+                category = "transient-network-failure",
+                safeMessage = "Network unavailable",
+                exceptionClass = "UnknownHostException",
+                failedHostname = "identity.test",
+                diagnostics = diagnostics,
+            ),
+        )
+
+        val active = repo.sessions().single()
+        assertEquals(0, active.launchRequestCount6Gb)
+        assertEquals(0, active.launchRequestCount4Gb)
+        assertEquals(0, active.instanceLaunchRequests6Gb)
+        assertEquals(0, active.instanceLaunchRequests4Gb)
+        assertEquals(0, active.backgroundLaunchAttempts)
+        assertEquals(1, active.transientNetworkDeferrals)
+    }
+
+    @Test fun transientNetworkFailurePreservesRetryTokenAndDoesNotGenerateNewOne() {
+        val prefs = FakeSharedPreferences()
+        val session = repositoryAt(start, prefs).createSession(
+            "candidate:transient-token",
+            CapacityRetryMode.INITIAL_PRIVATE_CHAT,
+            null,
+            "tenancy",
+        )
+        val repo = repositoryAt(start.plusSeconds(15 * 60), prefs)
+        val acquiring = requireNotNull(repo.beginWorkerCycle(session.sessionId))
+        val diagnostics = launchDiagnostics(
+            progress = LaunchProgress.SIGNING_REQUEST,
+            transmissionStarted = false,
+            responseHeadersReceived = false,
+        )
+
+        repo.finishLaunchAttempt(
+            session.sessionId,
+            BackgroundLaunchResult.TransientNetworkFailure(
+                category = "transient-network-failure",
+                safeMessage = "Network unavailable",
+                exceptionClass = "UnknownHostException",
+                failedHostname = "identity.test",
+                diagnostics = diagnostics,
+            ),
+        )
+
+        val active = repo.sessions().single()
+        assertEquals(acquiring.preferredRetryToken, active.preferredRetryToken)
+        assertEquals(acquiring.compactRetryToken, active.compactRetryToken)
+    }
+
+    @Test fun laterWorkerSucceedsAfterPreviousTransientFailure() {
+        val prefs = FakeSharedPreferences()
+        val session = repositoryAt(start, prefs).createSession(
+            "candidate:transient-then-success",
+            CapacityRetryMode.INITIAL_PRIVATE_CHAT,
+            null,
+            "tenancy",
+        )
+        // First attempt: transient network failure
+        val firstRepo = repositoryAt(start.plusSeconds(15 * 60), prefs)
+        firstRepo.beginWorkerCycle(session.sessionId)
+        val diagnostics = launchDiagnostics(
+            progress = LaunchProgress.SIGNING_REQUEST,
+            transmissionStarted = false,
+            responseHeadersReceived = false,
+        )
+        firstRepo.finishLaunchAttempt(
+            session.sessionId,
+            BackgroundLaunchResult.TransientNetworkFailure(
+                category = "transient-network-failure",
+                safeMessage = "Network unavailable",
+                exceptionClass = "UnknownHostException",
+                failedHostname = "identity.test",
+                diagnostics = diagnostics,
+            ),
+        )
+
+        // Second attempt: should be eligible since session is ACTIVE
+        val secondRepo = repositoryAt(start.plusSeconds(30 * 60), prefs)
+        val eligible = secondRepo.sessions().single()
+        assertEquals(CapacityRetryState.ACTIVE, eligible.state)
+        assertTrue(eligible.isLaunchEligible(start.plusSeconds(30 * 60)))
+        val started = secondRepo.beginWorkerCycle(session.sessionId)
+        assertNotNull(started)
+        assertEquals(CapacityRetryState.ACQUIRING, started!!.state)
+    }
+
+    @Test fun beginWorkerCycleIncrementsWorkerCyclesStarted() {
+        val prefs = FakeSharedPreferences()
+        val session = repositoryAt(start, prefs).createSession(
+            "candidate:worker-count",
+            CapacityRetryMode.INITIAL_PRIVATE_CHAT,
+            null,
+            "tenancy",
+        )
+        val repo = repositoryAt(start.plusSeconds(15 * 60), prefs)
+        assertEquals(0, repo.sessions().single().workerCyclesStarted)
+        repo.beginWorkerCycle(session.sessionId)
+        assertEquals(1, repo.sessions().single().workerCyclesStarted)
+        // A second beginWorkerCycle on an ACQUIRING session doesn't re-increment
+        repo.beginWorkerCycle(session.sessionId)
+        assertEquals(1, repo.sessions().single().workerCyclesStarted)
+    }
+
+    @Test fun legacyCountersMigratedToZeroForLegacySessions() {
+        val prefs = FakeSharedPreferences()
+        val session = repositoryAt(start, prefs).createSession(
+            "candidate:legacy",
+            CapacityRetryMode.INITIAL_PRIVATE_CHAT,
+            null,
+            "tenancy",
+        )
+        // Simulate a legacy session: has retryCycleCount > 0 but workerCyclesStarted == 0
+        // and has non-zero legacy launch counters
+        repo(prefs, start).replaceSession(
+            session.copy(
+                retryCycleCount = 3,
+                workerCyclesStarted = 0,
+                launchRequestCount6Gb = 5,
+                launchRequestCount4Gb = 2,
+            ),
+        )
+
+        // Reconstruct from JSON (simulating process restart)
+        val reconstructed = repositoryAt(start.plusSeconds(60), prefs).sessions().single()
+        // Legacy counters should be reset to 0
+        assertEquals(0, reconstructed.launchRequestCount6Gb)
+        assertEquals(0, reconstructed.launchRequestCount4Gb)
+        // retryCycleCount preserved
+        assertEquals(3, reconstructed.retryCycleCount)
+    }
+
+    @Test fun capacityMissIncrementsAccurateCounters() {
+        val prefs = FakeSharedPreferences()
+        val session = repositoryAt(start, prefs).createSession(
+            "candidate:accurate-counters",
+            CapacityRetryMode.INITIAL_PRIVATE_CHAT,
+            null,
+            "tenancy",
+        )
+        val repo = repositoryAt(start.plusSeconds(15 * 60), prefs)
+        repo.beginWorkerCycle(session.sessionId)
+        repo.finishCapacityMiss(session.sessionId)
+
+        val active = repo.sessions().single()
+        assertEquals(1, active.instanceLaunchRequests6Gb)
+        assertEquals(0, active.instanceLaunchRequests4Gb)
+        assertEquals(1, active.backgroundLaunchAttempts)
+        // Legacy also incremented for backward compat
+        assertEquals(1, active.launchRequestCount6Gb)
+    }
+
+    @Test fun durableLaunchContextSurvivesRepositoryReconstruction() {
+        val prefs = FakeSharedPreferences()
+        val session = repositoryAt(start, prefs).createSession(
+            "candidate:durable-context",
+            CapacityRetryMode.INITIAL_PRIVATE_CHAT,
+            null,
+            "tenancy",
+            ubuntuImageOcid = "ocid1.image.oc1..ubuntu",
+            vcnOcid = "ocid1.vcn.oc1..vcn",
+        )
+        val reconstructed = repositoryAt(start.plusSeconds(60), prefs).sessions().single()
+        assertEquals("ocid1.image.oc1..ubuntu", reconstructed.ubuntuImageOcid)
+        assertEquals("ocid1.vcn.oc1..vcn", reconstructed.vcnOcid)
+    }
+
+    private fun repo(prefs: FakeSharedPreferences, instant: Instant) = repositoryAt(instant, prefs)
+
     private fun launchDiagnostics(
         progress: LaunchProgress,
         transmissionStarted: Boolean,

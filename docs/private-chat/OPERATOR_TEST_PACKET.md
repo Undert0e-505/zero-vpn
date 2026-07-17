@@ -291,3 +291,61 @@ The OCI authentication fix changes how the background retry worker authenticates
 D:\dev\zero-vpn\artifacts\zerovpn-shared-oci-signer-fix-debug.apk
 D:\dev\zero-vpn\artifacts\zerovpn-shared-oci-signer-fix-debug.apk.sha256
 ` ` `
+## Transient network retry fix (2026-07-17)
+
+The transient network retry fix changes how DNS resolution failures and
+pre-transmission network errors are classified during background capacity retry:
+
+- `UnknownHostException`, `ConnectException`, `SocketTimeoutException`, and
+  pre-transmission `SSLException` are classified as `TransientNetworkFailure`,
+  NOT `LocalPreparationFailure` (terminal) or `AmbiguousFailure`
+- The session stays `ACTIVE` and retries automatically — no terminal state
+- No instance launch POST is sent (no Oracle request was transmitted)
+- The 6 GB / 4 GB launch counters are NOT incremented
+- The fixed 24-hour deadline is NOT reset
+- The retry token is preserved (not regenerated)
+- `transientNetworkDeferrals` counter increments for each transient failure
+- A notification appears only after 3+ consecutive transient failures
+- Durable availability-domain and image context is persisted from the foreground
+  flow so the worker skips Identity/image lookups on subsequent cycles
+- `workerCyclesStarted` is incremented on each `beginWorkerCycle`
+- Legacy `launchRequestCount6Gb/4Gb` counters are migrated to 0 for sessions
+  created before accurate counters existed
+- Accurate counters (`instanceLaunchRequests6Gb/4Gb`, `backgroundLaunchAttempts`)
+  are incremented ONLY when an instance POST is actually transmitted
+- Network diagnostics (transport, DNS servers, private DNS mode) are collected
+  after transient failures and logged to the diagnostic trace
+
+### Test APK for this lane
+
+```text
+D:\dev\zero-vpn\artifacts\zerovpn-transient-network-retry-fix-debug.apk
+D:\dev\zero-vpn\artifacts\zerovpn-transient-network-retry-fix-debug.apk.sha256
+```
+
+### Test 4 - Transient network failure classification
+
+1. Install the debug APK and enable Developer Mode.
+2. Start a Private Chat provisioning run and reach the capacity retry flow
+   (tap **Keep trying for 24 hours** after a capacity failure).
+3. Put the device in airplane mode or disable Wi-Fi/cellular data.
+4. Wait for the next scheduled worker cycle (within 15 minutes).
+5. Open ZeroVPN and check the retry card. It should show:
+   - **Private Chat capacity retry active** (NOT stopped/terminal)
+   - **Last result: TRANSIENT_NETWORK_FAILURE**
+   - **Transient deferrals: 1** (or higher)
+   - **Next configuration: unchanged** (same 6 GB or 4 GB)
+   - Deadline unchanged from the original value
+6. Re-enable network connectivity.
+7. Wait for the next worker cycle. Verify the retry resumes normally.
+8. Check the Diagnostics **CAPACITY RETRY** card for:
+   - **Transient network deferrals** counter
+   - **Worker cycles started** counter incrementing
+   - Legacy 6 GB / 4 GB counters at 0 (migrated)
+   - Accurate counters only increment on actual POST transmission
+9. If 3+ consecutive transient failures occur, verify a notification appears:
+   "Private Chat retry: network unavailable"
+10. Verify no notification appears for 1-2 transient failures (only 3+).
+
+Redact Oracle account identifiers, full OCIDs, request IDs, and any private key
+material in screenshots/logs.

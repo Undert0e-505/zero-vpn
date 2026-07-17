@@ -202,6 +202,131 @@ class OciBackgroundLauncherTest {
         assertEquals(0, transport.requests.count { it.method == "POST" })
     }
 
+    @Test fun unknownHostExceptionBeforeRequestConstructionBecomesTransientNetworkFailure() = runBlocking {
+        val pair = OciRequestSigner.generateKeyPair()
+        val transport = FakeTransport()
+        transport.failNextGetWith = java.net.UnknownHostException("Unable to resolve host \"identity.eu-zurich-1.oci.oraclecloud.com\": No address associated with hostname")
+        val result = OciBackgroundLauncher(transport, identityHostOverride = "identity.eu-zurich-1.oci.oraclecloud.com", iaasHostOverride = "iaas.eu-zurich-1.oci.oraclecloud.com")
+            .launchA1Instance(credentials(pair.private), params(), pendingMemoryGb = 6, retryToken = "test-token")
+
+        assertTrue(result is BackgroundLaunchResult.TransientNetworkFailure)
+        val failure = result as BackgroundLaunchResult.TransientNetworkFailure
+        assertEquals("transient-network-failure", failure.category)
+        assertEquals("UnknownHostException", failure.exceptionClass)
+        assertTrue(failure.failedHostname?.contains("identity.eu-zurich-1.oci.oraclecloud.com") == true)
+        // No POST should have been sent
+        assertEquals(0, transport.requests.count { it.method == "POST" })
+    }
+
+    @Test fun transientNetworkFailureDoesNotBecomeTerminalOrAmbiguous() = runBlocking {
+        val pair = OciRequestSigner.generateKeyPair()
+        val transport = FakeTransport()
+        transport.failNextGetWith = java.net.UnknownHostException("Unable to resolve host \"identity.test\": No address associated with hostname")
+        val result = launcher(transport).launchA1Instance(
+            credentials(pair.private), params(), pendingMemoryGb = 6, retryToken = "dns-token", sessionId = "session:dns",
+        )
+
+        assertFalse(result is BackgroundLaunchResult.LocalPreparationFailure)
+        assertFalse(result is BackgroundLaunchResult.AmbiguousFailure)
+        assertFalse(result is BackgroundLaunchResult.TerminalFailure)
+        assertTrue(result is BackgroundLaunchResult.TransientNetworkFailure)
+    }
+
+    @Test fun transientNetworkFailureHasSafeDiagnosticsWithoutSecrets() = runBlocking {
+        val pair = OciRequestSigner.generateKeyPair()
+        val secret = "do-not-leak-this-secret"
+        val transport = FakeTransport()
+        transport.failNextGetWith = java.net.UnknownHostException("Unable to resolve host \"identity.test\" Authorization: Bearer $secret")
+        val result = launcher(transport).launchA1Instance(
+            credentials(pair.private), params(), pendingMemoryGb = 6, retryToken = "safe-diag-token", sessionId = "session:safe-diag",
+        )
+
+        val failure = result as BackgroundLaunchResult.TransientNetworkFailure
+        assertFalse(failure.diagnostics.fullDiagnosticBlock().contains(secret))
+        assertFalse(failure.safeMessage.contains(secret))
+    }
+
+    @Test fun connectExceptionBeforeTransmissionIsTransientNetworkFailure() = runBlocking {
+        val pair = OciRequestSigner.generateKeyPair()
+        val transport = FakeTransport()
+        transport.failNextGetWith = java.net.ConnectException("Connection refused")
+        val result = launcher(transport).launchA1Instance(
+            credentials(pair.private), params(), pendingMemoryGb = 6, retryToken = "connect-token",
+        )
+
+        assertTrue(result is BackgroundLaunchResult.TransientNetworkFailure)
+        assertEquals("ConnectException", (result as BackgroundLaunchResult.TransientNetworkFailure).exceptionClass)
+    }
+
+    @Test fun socketTimeoutExceptionBeforeTransmissionIsTransientNetworkFailure() = runBlocking {
+        val pair = OciRequestSigner.generateKeyPair()
+        val transport = FakeTransport()
+        transport.failNextGetWith = java.net.SocketTimeoutException("connect timed out")
+        val result = launcher(transport).launchA1Instance(
+            credentials(pair.private), params(), pendingMemoryGb = 6, retryToken = "timeout-token",
+        )
+
+        assertTrue(result is BackgroundLaunchResult.TransientNetworkFailure)
+        assertEquals("SocketTimeoutException", (result as BackgroundLaunchResult.TransientNetworkFailure).exceptionClass)
+    }
+
+    @Test fun durableAvailabilityDomainSkipsIdentityLookup() = runBlocking {
+        val pair = OciRequestSigner.generateKeyPair()
+        val transport = FakeTransport(
+            // Only image lookup + launch response needed (no AD lookup)
+            OciHttpResponse(200, """[{"id":"ocid1.image.oc1..ubuntu"}]"""),
+            OciHttpResponse(200, """{"id":"ocid1.instance.oc1..vm","displayName":"zerovpn-exit-01"}"""),
+        )
+        val result = OciBackgroundLauncher(transport, identityHostOverride = "identity.test", iaasHostOverride = "iaas.test")
+            .launchA1Instance(
+                credentials(pair.private), params(), pendingMemoryGb = 6, retryToken = "durable-ad-token",
+                durableAvailabilityDomain = "AD-1",
+            )
+
+        assertTrue(result is BackgroundLaunchResult.Success)
+        // No GET to identity host should have been sent
+        assertEquals(0, transport.requests.count { it.method == "GET" && it.url.host == "identity.test" })
+        // But image lookup GET to iaas host should still happen (no durable image)
+        assertTrue(transport.requests.any { it.method == "GET" && it.url.host == "iaas.test" })
+    }
+
+    @Test fun durableImageOcidSkipsImageLookup() = runBlocking {
+        val pair = OciRequestSigner.generateKeyPair()
+        val transport = FakeTransport(
+            // Only AD lookup + launch response needed (no image lookup)
+            OciHttpResponse(200, """[{"name":"AD-1"}]"""),
+            OciHttpResponse(200, """{"id":"ocid1.instance.oc1..vm","displayName":"zerovpn-exit-01"}"""),
+        )
+        val result = OciBackgroundLauncher(transport, identityHostOverride = "identity.test", iaasHostOverride = "iaas.test")
+            .launchA1Instance(
+                credentials(pair.private), params(), pendingMemoryGb = 6, retryToken = "durable-image-token",
+                durableImageOcid = "ocid1.image.oc1..durable-ubuntu",
+            )
+
+        assertTrue(result is BackgroundLaunchResult.Success)
+        // No image lookup GET should have been sent
+        assertFalse(transport.requests.any { it.method == "GET" && it.url.encodedPath.contains("images") })
+    }
+
+    @Test fun bothDurableContextValuesSkipAllLookups() = runBlocking {
+        val pair = OciRequestSigner.generateKeyPair()
+        val transport = FakeTransport(
+            // Only launch response needed
+            OciHttpResponse(200, """{"id":"ocid1.instance.oc1..vm","displayName":"zerovpn-exit-01"}"""),
+        )
+        val result = OciBackgroundLauncher(transport, identityHostOverride = "identity.test", iaasHostOverride = "iaas.test")
+            .launchA1Instance(
+                credentials(pair.private), params(), pendingMemoryGb = 6, retryToken = "durable-both-token",
+                durableAvailabilityDomain = "AD-1",
+                durableImageOcid = "ocid1.image.oc1..durable-ubuntu",
+            )
+
+        assertTrue(result is BackgroundLaunchResult.Success)
+        // No GET at all — only the POST
+        assertEquals(0, transport.requests.count { it.method == "GET" })
+        assertEquals(1, transport.requests.count { it.method == "POST" })
+    }
+
     private fun launcher(transport: OciHttpTransport) = OciBackgroundLauncher(
         transport,
         identityHostOverride = "identity.test",
@@ -232,8 +357,15 @@ class OciBackgroundLauncherTest {
     private class FakeTransport(vararg responses: OciHttpResponse) : OciHttpTransport {
         private val queue = ArrayDeque(responses.toList())
         val requests = mutableListOf<Request>()
+        var failNextGetWith: Exception? = null
+
         override suspend fun execute(request: Request): OciHttpResponse {
             requests += request
+            if (request.method == "GET" && failNextGetWith != null) {
+                val error = failNextGetWith!!
+                failNextGetWith = null
+                throw error
+            }
             return queue.removeFirst()
         }
     }

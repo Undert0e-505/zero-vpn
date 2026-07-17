@@ -140,3 +140,30 @@ The 24-hour deadline is anchored to that first exact foreground capacity respons
 
 The app-state switch path is explicit and rollback-safe, and it refuses candidates that do not have persisted runtime health evidence. Android/WorkManager timing, device restart behavior, expired or revoked security tokens, final VPN reconnect, WireGuard handshake, regional exit-IP proof, Matrix reachability through the private path, and old-VM rollback evidence still require Aaron's owner-operated Android/Oracle run. No code-preparation test here logs into Oracle, creates/destroys VMs, or proves real A1 capacity behavior.
 
+
+## Transient network failure behavior (2026-07-17)
+
+DNS resolution failures (`UnknownHostException`), connection errors
+(`ConnectException`), socket timeouts (`SocketTimeoutException`), and
+pre-transmission TLS failures (`SSLException`) that occur before an OCI
+request is transmitted are classified as `TransientNetworkFailure`, not
+`LocalPreparationFailure` (terminal) or `AmbiguousFailure`.
+
+- The session stays `ACTIVE` and retries automatically.
+- No instance launch POST is sent, so launch counters are NOT incremented.
+- The fixed 24-hour deadline is NOT reset.
+- The retry token is preserved.
+- `transientNetworkDeferrals` increments for each transient failure.
+- A user notification appears only after 3+ consecutive transient failures.
+- Durable availability-domain and image context (persisted from the foreground
+  flow) allows the worker to skip Identity/image lookups on subsequent cycles,
+  reducing the surface for transient failures.
+- Network diagnostics (transport type, DNS servers, private DNS mode) are
+  collected after transient failures and written to the diagnostic trace.
+  These do NOT include user traffic, VPN keys, Oracle credentials, or request
+  signatures.
+
+Legacy `launchRequestCount6Gb/4Gb` counters are migrated to 0 for sessions
+created before `workerCyclesStarted` was introduced. Accurate counters
+(`instanceLaunchRequests6Gb/4Gb`, `backgroundLaunchAttempts`) are incremented
+ONLY when an instance POST is actually transmitted.

@@ -62,6 +62,10 @@ class CapacityRetryRepository(
         initialHttpStatus: Int? = null,
         initialOciErrorCode: String? = null,
         initialLastResult: String? = null,
+        ubuntuImageOcid: String? = null,
+        vcnOcid: String? = null,
+        identityHost: String? = null,
+        iaasHost: String? = null,
     ): CapacityRetrySession = synchronized(REPOSITORY_LOCK) {
         val existing = sessions().firstOrNull {
             it.candidateId == candidateId && it.blocksReplacementLaunchSession()
@@ -87,6 +91,10 @@ class CapacityRetryRepository(
             initialHttpStatus = initialHttpStatus,
             initialOciErrorCode = initialOciErrorCode,
             initialLastResult = initialLastResult,
+            ubuntuImageOcid = ubuntuImageOcid,
+            vcnOcid = vcnOcid,
+            identityHost = identityHost,
+            iaasHost = iaasHost,
             clock = clock,
         )
         replaceSession(session)
@@ -158,6 +166,7 @@ class CapacityRetryRepository(
         val updated = current.copy(
             state = CapacityRetryState.ACQUIRING,
             lastWorkerStartedAtUtc = now.toString(),
+            workerCyclesStarted = current.workerCyclesStarted + 1,
             preferredRetryToken = CapacityRetrySession.retryToken(current.sessionId, current.candidateId, 6, launchGeneration),
             compactRetryToken = CapacityRetrySession.retryToken(current.sessionId, current.candidateId, 4, launchGeneration),
         )
@@ -176,13 +185,21 @@ class CapacityRetryRepository(
             val finished = session.copy(
                 lastWorkerFinishedAtUtc = now.toString(),
             )
-            val counted = if (result is BackgroundLaunchResult.LocalPreparationFailure ||
-                result is BackgroundLaunchResult.AuthenticationFailure) {
-                finished
-            } else {
+            // Only results that represent an actual instance POST transmission increment
+            // launch request counters. LocalPreparationFailure, AuthenticationFailure, and
+            // TransientNetworkFailure do NOT (no POST was transmitted).
+            val instancePostTransmitted = result !is BackgroundLaunchResult.LocalPreparationFailure &&
+                result !is BackgroundLaunchResult.AuthenticationFailure &&
+                result !is BackgroundLaunchResult.TransientNetworkFailure
+            val counted = if (instancePostTransmitted) {
                 finished.copy(
+                    // Legacy counters (deprecated but still maintained for migration)
                     launchRequestCount6Gb = session.launchRequestCount6Gb + if (attemptedMemoryGb == 6) 1 else 0,
                     launchRequestCount4Gb = session.launchRequestCount4Gb + if (attemptedMemoryGb == 4) 1 else 0,
+                    // Accurate counters
+                    instanceLaunchRequests6Gb = session.instanceLaunchRequests6Gb + if (attemptedMemoryGb == 6) 1 else 0,
+                    instanceLaunchRequests4Gb = session.instanceLaunchRequests4Gb + if (attemptedMemoryGb == 4) 1 else 0,
+                    backgroundLaunchAttempts = session.backgroundLaunchAttempts + 1,
                     lastAttemptMemoryGb = attemptedMemoryGb,
                     lastLaunchAttemptFinishedAtUtc = now.toString(),
                     nextEligibleAttemptAtUtc = nextEligibleLaunchAt(
@@ -190,6 +207,8 @@ class CapacityRetryRepository(
                         retryAfterSeconds = (result as? BackgroundLaunchResult.RateLimited)?.retryAfterSeconds,
                     ).toString(),
                 )
+            } else {
+                finished
             }
             when (result) {
                 is BackgroundLaunchResult.Success -> counted.copy(
@@ -271,6 +290,20 @@ class CapacityRetryRepository(
                     lastResult = "OCI_AUTHENTICATION_FAILED",
                     requiresUserAction = true,
                     terminalReason = "OCI rejected the background worker\u2019s signed request (HTTP ${result.httpStatus}). Open ZeroVPN to refresh Oracle credentials.",
+                )
+                is BackgroundLaunchResult.TransientNetworkFailure -> counted.copy(
+                    state = CapacityRetryState.ACTIVE,
+                    retryCycleCount = session.retryCycleCount + 1,
+                    pendingMemoryGb = attemptedMemoryGb,
+                    lastHttpStatus = null,
+                    lastOciErrorCode = null,
+                    lastSafeErrorCategory = result.category,
+                    lastRedactedRequestId = null,
+                    lastResult = "TRANSIENT_NETWORK_FAILURE",
+                    requiresUserAction = false,
+                    terminalReason = null,
+                    nextEligibleAttemptAtUtc = nextEligibleLaunchAt(now).toString(),
+                    transientNetworkDeferrals = session.transientNetworkDeferrals + 1,
                 )
                 is BackgroundLaunchResult.TransmissionFailure -> counted.copy(
                     state = CapacityRetryState.FAILED_AMBIGUOUS_RECONCILIATION_REQUIRED,

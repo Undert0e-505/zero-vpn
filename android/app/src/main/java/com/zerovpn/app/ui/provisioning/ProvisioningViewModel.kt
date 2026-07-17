@@ -945,6 +945,11 @@ class ProvisioningViewModel : ViewModel() {
                     initialHttpStatus = pendingRetryHttpStatus,
                     initialOciErrorCode = if (pendingRetryLastResult == "OUT_OF_HOST_CAPACITY") "InternalError" else "TooManyRequests",
                     initialLastResult = pendingRetryLastResult,
+                    availabilityDomain = resourceIds?.availabilityDomain,
+                    ubuntuImageOcid = resourceIds?.ubuntuImageOcid,
+                    vcnOcid = resourceIds?.vcnId,
+                    identityHost = null,
+                    iaasHost = null,
                 ),
             )
             if (startResult is CapacityRetryStartResult.MissingStoredCredentials) {
@@ -2947,6 +2952,21 @@ class ProvisioningViewModel : ViewModel() {
                     resourceIds = readyResourceIds
                     retryLaunchSubnetId = readyResourceIds.subnetId
                     retryLaunchSshPublicKey = sshPublicKey
+                    // Persist durable launch context for the retry worker
+                    // (AD and image are discovered during provisioning; persist them so the
+                    // worker doesn't need to repeat Identity/image lookups every 15 minutes)
+                    capacityRetryRepository?.let { repo ->
+                        repo.activeSession()?.let { session ->
+                            repo.updateSession(session.sessionId) { s ->
+                                s.copy(
+                                    availabilityDomain = s.availabilityDomain ?: readyResourceIds.availabilityDomain,
+                                    ubuntuImageOcid = s.ubuntuImageOcid ?: readyResourceIds.ubuntuImageOcid,
+                                    vcnOcid = s.vcnOcid ?: readyResourceIds.vcnId,
+                                )
+                            }
+                            _capacityRetrySessions.value = repo.sessions()
+                        }
+                    }
                     persistState()
                 },
             )

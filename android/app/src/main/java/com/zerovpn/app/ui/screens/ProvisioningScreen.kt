@@ -481,6 +481,15 @@ private fun CapacityRetryStatusCard(
                 lineHeight = 18.sp,
             )
         }
+        if (session.lastResult == "TRANSIENT_NETWORK_FAILURE") {
+            Text(
+                text = "Network unavailable during Oracle preparation. No VM request was sent. Automatic retry remains active.",
+                fontSize = 13.sp,
+                color = WarningYellow,
+                lineHeight = 18.sp,
+            )
+            InfoRow("Transient deferrals", session.transientNetworkDeferrals.toString())
+        }
         InfoRow("Last result", session.lastResult ?: session.lastSafeErrorCategory ?: "not yet")
         InfoRow(
             "Next target attempt",

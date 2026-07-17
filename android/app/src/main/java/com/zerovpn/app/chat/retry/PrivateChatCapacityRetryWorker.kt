@@ -27,6 +27,7 @@ internal data class PrivateChatCapacityRetryWorkerDependencies(
     val notifier: CapacityRetryNotifier,
     val launcher: BackgroundLaunchExecutor,
     val workScheduler: CapacityRetryWorkScheduler,
+    val networkDiagnosticsCollector: NetworkDiagnosticsCollector? = null,
 )
 
 internal fun privateChatCapacityRetryWorkerDependencies(context: Context): PrivateChatCapacityRetryWorkerDependencies {
@@ -39,6 +40,7 @@ internal fun privateChatCapacityRetryWorkerDependencies(context: Context): Priva
         notifier = CapacityRetryNotifier(appContext),
         launcher = OciBackgroundLauncher(),
         workScheduler = CapacityRetryWorkScheduler(appContext),
+        networkDiagnosticsCollector = NetworkDiagnosticsCollector(appContext),
     )
 }
 
@@ -218,6 +220,8 @@ class PrivateChatCapacityRetryWorker(
                     pendingMemoryGb = started.pendingMemoryGb,
                     retryToken = retryToken,
                     sessionId = sessionId,
+                    durableAvailabilityDomain = started.availabilityDomain,
+                    durableImageOcid = started.ubuntuImageOcid,
                 )
             } catch (cancelled: CancellationException) {
                 record("Launch result: other (cancelled; reconciliation required)")
@@ -279,10 +283,24 @@ class PrivateChatCapacityRetryWorker(
                     is BackgroundLaunchResult.LocalPreparationFailure -> "other (local preparation)"
                     is BackgroundLaunchResult.TransmissionFailure -> "other (transmission ambiguous)"
                     is BackgroundLaunchResult.AuthenticationFailure -> "other (authentication failed)"
+                    is BackgroundLaunchResult.TransientNetworkFailure -> "transient network failure"
                 },
             )
             val updated = repository.finishLaunchAttempt(sessionId, result)
             updated?.let { record("Session updated: new state " + it.state.name) }
+
+            // Collect network diagnostics for transient failures
+            if (result is BackgroundLaunchResult.TransientNetworkFailure) {
+                val networkDiagnostics = dependencies.networkDiagnosticsCollector?.collect(
+                    failedHostname = result.failedHostname,
+                    dnsExceptionClass = result.exceptionClass,
+                    consecutiveTransientFailures = updated?.transientNetworkDeferrals ?: 0,
+                )
+                if (networkDiagnostics != null) {
+                    record("Network diagnostics: available=${networkDiagnostics.activeNetworkAvailable}, transport=${networkDiagnostics.transport ?: "unknown"}, validated=${networkDiagnostics.validatedInternet}, failedHostname=${networkDiagnostics.failedHostname ?: "N/A"}")
+                }
+            }
+
             when (updated?.state) {
                 CapacityRetryState.INSTANCE_ACQUIRED -> {
                     workScheduler.cancel(updated)
@@ -302,6 +320,15 @@ class PrivateChatCapacityRetryWorker(
                     // OCI auth failed (HTTP 401). Pause and notify user — do NOT auto-generate a new API key.
                     workScheduler.cancel(updated)
                     notifier.notifyAuthRequired(updated)
+                }
+                CapacityRetryState.ACTIVE -> {
+                    // TransientNetworkFailure keeps the session ACTIVE for retry.
+                    // Only notify after 3+ consecutive transient failures.
+                    if (result is BackgroundLaunchResult.TransientNetworkFailure &&
+                        (updated?.transientNetworkDeferrals ?: 0) >= 3) {
+                        notifier.notifyTransientNetworkIssue(updated)
+                    }
+                    // Work remains enqueued — no cancellation
                 }
                 else -> Unit
             }
@@ -379,6 +406,14 @@ class CapacityRetryNotifier(private val context: Context) {
         )
     }
 
+    fun notifyTransientNetworkIssue(session: CapacityRetrySession) {
+        notify(
+            NOTIFICATION_TRANSIENT_NETWORK,
+            "Private Chat retry: network unavailable",
+            "ZeroVPN could not reach Oracle endpoints. Automatic retry remains active.",
+        )
+    }
+
     private fun notify(
         id: Int,
         title: String,
@@ -434,6 +469,7 @@ class CapacityRetryNotifier(private val context: Context) {
         private const val NOTIFICATION_TIMEOUT = 5203
         private const val NOTIFICATION_AMBIGUOUS_RECONCILIATION = 5204
         private const val NOTIFICATION_TERMINAL_FAILURE = 5205
+        private const val NOTIFICATION_TRANSIENT_NETWORK = 5206
         private const val NOTIFICATION_DIAGNOSTICS_REQUEST = 5299
     }
 }

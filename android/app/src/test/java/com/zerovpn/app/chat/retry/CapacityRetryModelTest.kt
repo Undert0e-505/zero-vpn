@@ -150,6 +150,7 @@ class CapacityRetryModelTest {
             nextEligibleAttemptAtUtc = "2026-07-15T13:00:00Z",
             pendingMemoryGb = 4,
             retryCycleCount = 3,
+            workerCyclesStarted = 2,
             launchRequestCount6Gb = 4,
             launchRequestCount4Gb = 2,
             lastHttpStatus = 500,
@@ -157,6 +158,12 @@ class CapacityRetryModelTest {
             lastSafeErrorCategory = "capacity",
             lastResult = "OUT_OF_HOST_CAPACITY_BOTH_CONFIGS",
             sourceExitId = "oci:source",
+            ubuntuImageOcid = "ocid1.image.oc1..ubuntu",
+            vcnOcid = "ocid1.vcn.oc1..vcn",
+            identityHost = "identity.eu-zurich-1.oci.oraclecloud.com",
+            iaasHost = "iaas.eu-zurich-1.oci.oraclecloud.com",
+            transientNetworkDeferrals = 2,
+            reconciliationOnlyRuns = 0,
         )
         val decoded = CapacityRetrySession.fromJson(session.toJson())
         assertEquals(session, decoded)

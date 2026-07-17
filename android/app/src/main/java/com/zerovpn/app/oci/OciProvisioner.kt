@@ -266,6 +266,8 @@ class OciProvisioner(
         var subnetId: String? = null,
         var igwId: String? = null,
         var instanceId: String? = null,
+        var availabilityDomain: String? = null,
+        var ubuntuImageOcid: String? = null,
     )
 
     // --- Event helper ---
@@ -877,7 +879,7 @@ class OciProvisioner(
         // mutation requests (VCN, instance, network), probe with a read-only GET using
         // the new API-key auth context. Retry with backoff on 401 NotAuthenticated only.
         val activationProbePath = "/20160918/users/${auth.userOcid}/apiKeys"
-        val backoffMs = longArrayOf(1000, 2000, 4000, 8000, 15000)
+        val backoffMs = longArrayOf(2000, 4000, 8000, 16000, 30000)
         var activationSuccess = false
         var attemptCount = 0
         for ((index, delayMs) in backoffMs.withIndex()) {
@@ -1090,6 +1092,7 @@ class OciProvisioner(
         emit(Phase.VM_LAUNCH, Status.RUNNING, "Finding availability domain...")
         val adResp = ociGetArray(auth, idHost, "/20160918/availabilityDomains?compartmentId=$cid")
         val adName = adResp.getJSONObject(0).getString("name")
+        rids.availabilityDomain = adName
         emit(Phase.VM_LAUNCH, Status.RUNNING, "Availability domain selected: $adName (region=$homeRegion)")
 
         // Find Ubuntu image
@@ -1112,6 +1115,7 @@ class OciProvisioner(
             }
             imageId = imgResp24.getJSONObject(0).getString("id")
         }
+        rids.ubuntuImageOcid = imageId
 
         // Launch instance
         val launchPath = "/20160918/instances"

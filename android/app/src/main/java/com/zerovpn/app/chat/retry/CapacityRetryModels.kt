@@ -112,6 +112,14 @@ data class CapacityRetrySession(
     val subnetId: String? = null,
     val sshPublicKey: String? = null,
     val sourceExitId: String? = null,
+    // --- Durable launch context (persisted from foreground, loaded by worker) ---
+    val ubuntuImageOcid: String? = null,
+    val vcnOcid: String? = null,
+    val identityHost: String? = null,
+    val iaasHost: String? = null,
+    // --- Counters ---
+    val transientNetworkDeferrals: Int = 0,
+    val reconciliationOnlyRuns: Int = 0,
     val requiresUserAction: Boolean = false,
     val terminalReason: String? = null,
 ) {
@@ -167,6 +175,12 @@ data class CapacityRetrySession(
         .put("subnetId", subnetId)
         .put("sshPublicKey", sshPublicKey)
         .put("sourceExitId", sourceExitId)
+        .put("ubuntuImageOcid", ubuntuImageOcid)
+        .put("vcnOcid", vcnOcid)
+        .put("identityHost", identityHost)
+        .put("iaasHost", iaasHost)
+        .put("transientNetworkDeferrals", transientNetworkDeferrals)
+        .put("reconciliationOnlyRuns", reconciliationOnlyRuns)
         .put("requiresUserAction", requiresUserAction)
         .put("terminalReason", terminalReason)
 
@@ -194,6 +208,10 @@ data class CapacityRetrySession(
             initialHttpStatus: Int? = null,
             initialOciErrorCode: String? = null,
             initialLastResult: String? = null,
+            ubuntuImageOcid: String? = null,
+            vcnOcid: String? = null,
+            identityHost: String? = null,
+            iaasHost: String? = null,
             clock: Clock = Clock.systemUTC(),
         ): CapacityRetrySession {
             val now = Instant.now(clock)
@@ -249,6 +267,12 @@ data class CapacityRetrySession(
                 subnetId = subnetId,
                 sshPublicKey = sshPublicKey,
                 sourceExitId = sourceExitId,
+                ubuntuImageOcid = ubuntuImageOcid,
+                vcnOcid = vcnOcid,
+                identityHost = identityHost,
+                iaasHost = iaasHost,
+                transientNetworkDeferrals = 0,
+                reconciliationOnlyRuns = 0,
             )
         }
 
@@ -269,8 +293,10 @@ data class CapacityRetrySession(
             lastWorkerStartedAtUtc = json.optNullableString("lastWorkerStartedAtUtc"),
             lastWorkerFinishedAtUtc = json.optNullableString("lastWorkerFinishedAtUtc"),
             retryCycleCount = json.optInt("retryCycleCount", 0),
-            launchRequestCount6Gb = json.optInt("launchRequestCount6Gb", 0),
-            launchRequestCount4Gb = json.optInt("launchRequestCount4Gb", 0),
+            // Legacy counter migration: if workerCyclesStarted == 0 but retryCycleCount > 0,
+            // the session was created before accurate counters existed. Reset legacy counters.
+            launchRequestCount6Gb = if (json.optInt("workerCyclesStarted", 0) == 0 && json.optInt("retryCycleCount", 0) > 0) 0 else json.optInt("launchRequestCount6Gb", 0),
+            launchRequestCount4Gb = if (json.optInt("workerCyclesStarted", 0) == 0 && json.optInt("retryCycleCount", 0) > 0) 0 else json.optInt("launchRequestCount4Gb", 0),
             workerCyclesStarted = json.optInt("workerCyclesStarted", 0),
             prerequisiteRequestsSent = json.optInt("prerequisiteRequestsSent", 0),
             instanceLaunchRequests6Gb = json.optInt("instanceLaunchRequests6Gb", 0),
@@ -298,6 +324,14 @@ data class CapacityRetrySession(
             subnetId = json.optNullableString("subnetId"),
             sshPublicKey = json.optNullableString("sshPublicKey"),
             sourceExitId = json.optNullableString("sourceExitId"),
+            ubuntuImageOcid = json.optNullableString("ubuntuImageOcid"),
+            vcnOcid = json.optNullableString("vcnOcid"),
+            identityHost = json.optNullableString("identityHost"),
+            iaasHost = json.optNullableString("iaasHost"),
+            // Legacy counter migration: if workerCyclesStarted == 0 but retryCycleCount > 0,
+            // the session was created before accurate counters existed. Reset legacy counters.
+            transientNetworkDeferrals = json.optInt("transientNetworkDeferrals", 0),
+            reconciliationOnlyRuns = json.optInt("reconciliationOnlyRuns", 0),
             requiresUserAction = json.optBoolean("requiresUserAction", false),
             terminalReason = json.optNullableString("terminalReason"),
         )

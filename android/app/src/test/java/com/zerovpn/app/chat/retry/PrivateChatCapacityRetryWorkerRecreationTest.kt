@@ -177,6 +177,8 @@ class PrivateChatCapacityRetryWorkerRecreationTest {
                 pendingMemoryGb: Int,
                 retryToken: String,
                 sessionId: String,
+                durableAvailabilityDomain: String?,
+                durableImageOcid: String?,
             ): BackgroundLaunchResult {
                 receivedRetryToken = retryToken
                 throw IllegalStateException(
