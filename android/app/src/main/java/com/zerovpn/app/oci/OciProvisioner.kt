@@ -221,6 +221,7 @@ class OciProvisioner(
         val regionDiscoverySource: String,
         val identityHost: String,
         val iaasHost: String,
+        val isTransientNetworkFailure: Boolean = false,
     )
 
     data class ProvisionResult(
@@ -525,14 +526,17 @@ class OciProvisioner(
                     )
                 }
                 if (isManualDiscovery && candidate == manualRegion) {
-                    val error = "Could not resolve Oracle Identity endpoint $idHost. " +
-                        "Check network/DNS, try mobile data instead of Wi-Fi, temporarily disable Android Private DNS, " +
-                        "adblock/firewall/VPN settings, then retry."
-                    emit(Phase.API_KEY, Status.ERROR, error)
+                    // DNS failure on the user-selected/persisted region is a TRANSIENT network issue,
+                    // NOT a reason to fail provisioning, scan other regions, or reset auth.
+                    // Return a transient-failure result so the caller can preserve the session.
+                    val transientError = "Network unavailable during Oracle region preflight ($candidate). " +
+                        "ZeroVPN will retry later. No cloud resources were created."
+                    emit(Phase.API_KEY, Status.WARNING, transientError)
                     return RegionDiscoveryResult(
                         success = false,
-                        discoverySource = preferredRegionSource,
-                        error = error,
+                        homeRegionId = candidate,
+                        discoverySource = preferredRegionSource + "-transient-network-failure",
+                        error = transientError,
                         attemptedHosts = attemptedHosts,
                     )
                 }
@@ -634,10 +638,14 @@ class OciProvisioner(
             val normalized = OciRegions.normalizeRegionHint(region) ?: return
             if (ordered.none { it.equals(normalized, ignoreCase = true) }) ordered += normalized
         }
+        // Authority order: persisted/user-selected → token region → auth bootstrap region.
+        // Only scan common regions when NO authoritative region exists at all.
         add(preferredRegion)
         add(auth.tokenRegion)
         add(auth.selectedRegion)
-        OciRegions.common.forEach { add(it.id) }
+        if (ordered.isEmpty()) {
+            OciRegions.common.forEach { add(it.id) }
+        }
         return ordered
     }
 
@@ -693,15 +701,17 @@ class OciProvisioner(
     ): PreflightResult {
         val discovery = discoverHomeRegion(auth, preferredRegion, preferredRegionSource)
         if (!discovery.success || discovery.homeRegionId.isNullOrBlank()) {
+            val isTransient = discovery.discoverySource.contains("transient-network-failure")
             return PreflightResult(
                 success = false,
-                homeRegion = preferredRegion ?: auth.selectedRegion,
+                homeRegion = discovery.homeRegionId ?: preferredRegion ?: auth.selectedRegion,
                 isUkRegion = false,
                 error = discovery.error ?: "Oracle login succeeded, but ZeroVPN could not discover your home region.",
                 initialRegion = auth.selectedRegion,
                 regionDiscoverySource = discovery.discoverySource,
                 identityHost = discovery.homeRegionId?.let { OciEndpoints.identityHost(it) } ?: "",
                 iaasHost = discovery.homeRegionId?.let { OciEndpoints.iaasHost(it) } ?: "",
+                isTransientNetworkFailure = isTransient,
             )
         }
 
@@ -920,7 +930,7 @@ class OciProvisioner(
         // implementation is broken — it is NOT activation delay.
         emit(Phase.API_KEY, Status.RUNNING, "Verifying API-key signing...")
         val signingProbePath = "/20160918/users/${auth.userOcid}/apiKeys"
-        val signingProbeResult = probeApiKeySigning(auth, idHost, signingProbePath)
+        val signingProbeResult = probeApiKeySigning(auth, uploadedFingerprint, idHost, signingProbePath)
         when (signingProbeResult) {
             is SigningProbeResult.Success -> {
                 emit(Phase.API_KEY, Status.RUNNING, "API-key signing verified: Oracle accepted the signed request.")
@@ -1007,13 +1017,13 @@ class OciProvisioner(
      * API-key-authenticated GET probe for Stage 2 signing verification.
      * Returns Success, AuthenticationRejected (401), or Error.
      */
-    private suspend fun probeApiKeySigning(auth: AuthResult, host: String, path: String): SigningProbeResult {
+    private suspend fun probeApiKeySigning(auth: AuthResult, fingerprint: String, host: String, path: String): SigningProbeResult {
         return kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
             try {
                 val (authHeader, dateStr, _) = OciRequestSigner.buildAuthHeader(
                     tenancyOcid = auth.tenancyOcid,
                     userOcid = auth.userOcid,
-                    fingerprint = auth.fingerprint,
+                    fingerprint = fingerprint,
                     privateKey = auth.privateKey,
                     method = "GET",
                     path = path,

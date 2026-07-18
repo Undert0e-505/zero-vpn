@@ -2793,6 +2793,20 @@ class ProvisioningViewModel : ViewModel() {
 
             if (!preflightResult!!.success) {
                 eventJob?.cancel()
+                if (preflightResult!!.isTransientNetworkFailure) {
+                    // DNS/network failure on a known region — transient, not a hard failure.
+                    // Preserve auth, preserve region, allow retry. Don't scan other regions.
+                    setFailedOracleOperation(PendingOracleOperation.Provision, preflightResult!!.error)
+                    _state.value = ProvisioningState.Failure(
+                        failedPhase = Phase.API_KEY,
+                        lastSuccessPhase = Phase.AUTH,
+                        errorMessage = preflightResult!!.error,
+                    )
+                    // Do NOT clear authResult — the browser token and API key are still valid.
+                    // The user can retry without re-authenticating.
+                    persistState()
+                    return
+                }
                 setFailedOracleOperation(PendingOracleOperation.Provision, preflightResult!!.error)
                 _state.value = ProvisioningState.Failure(
                     failedPhase = Phase.API_KEY,
