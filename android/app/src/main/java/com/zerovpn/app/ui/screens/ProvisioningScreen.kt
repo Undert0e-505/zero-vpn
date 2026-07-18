@@ -261,6 +261,29 @@ fun ProvisioningScreen(
                 )
             }
 
+            is ProvisioningState.RegionSelectionRequired -> {
+                OracleOnboardingContent(
+                    onboardingState = onboardingState,
+                    selectedRegion = selectedOracleRegion,
+                    regions = viewModel.oracleRegions,
+                    privateChatRequested = privateChatRequested,
+                    capacityRetryPolicyEnabled = capacityRetryPolicyEnabled,
+                    privateChatToggleEnabled = isPrivateChatRequestToggleEnabled(hasActiveCapacityRetry),
+                    hasActiveCapacityRetry = hasActiveCapacityRetry,
+                    hidePrivateChatSwitch = shouldHidePrivateChatSwitch(visibleRetrySession),
+                    onPrivateChatRequestedChange = viewModel::setPrivateChatRequested,
+                    onCapacityRetryPolicyChange = viewModel::setCapacityRetryPolicyEnabled,
+                    onSelectRegion = viewModel::selectOracleRegion,
+                    onExistingAccount = { viewModel.startProvisioning(context) },
+                    onCreateAccount = { viewModel.launchOracleSignup(context) },
+                    onAccountCreated = {
+                        viewModel.acknowledgeAccountCreated()
+                        viewModel.startProvisioning(context)
+                    },
+                    onCancel = { viewModel.cancel(); onBack() },
+                )
+            }
+
             is ProvisioningState.Running -> {
                 if (currentPhase == Phase.AUTH) {
                     AuthWaitingContent(
@@ -786,7 +809,7 @@ private fun OracleOnboardingContent(
                 color = TextPrimary,
             )
             Text(
-                text = "ZeroVPN will try to discover your home region automatically after sign-in. If discovery fails, choose the region shown in Oracle Cloud Console and retry.",
+                text = "Choose the Oracle home region shown in Oracle Cloud Console. ZeroVPN saves it before sign-in and uses it for provisioning.",
                 fontSize = 13.sp,
                 color = TextDim,
                 lineHeight = 18.sp,
@@ -799,7 +822,7 @@ private fun OracleOnboardingContent(
                     colors = ButtonDefaults.outlinedButtonColors(contentColor = TextPrimary),
                 ) {
                     Text(
-                        text = selectedRegion?.let { OciRegions.labelFor(it) } ?: "Optional: choose region manually",
+                        text = selectedRegion?.let { OciRegions.labelFor(it) } ?: "Choose your Oracle home region (required)",
                         fontSize = 13.sp,
                         fontWeight = FontWeight.Medium,
                     )
@@ -856,6 +879,7 @@ private fun OracleOnboardingContent(
         ) {
             Button(
                 onClick = onExistingAccount,
+                enabled = selectedRegion != null,
                 modifier = Modifier.fillMaxWidth().height(48.dp),
                 shape = RoundedCornerShape(8.dp),
                 colors = ButtonDefaults.buttonColors(

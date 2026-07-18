@@ -184,7 +184,7 @@ class OciProvisioner(
         val userOcid: String,
         val tenancyOcid: String,
         val fingerprint: String,
-        val selectedRegion: String,
+        val authBootstrapRegion: String,
         val tokenRegion: String? = null,
         val tokenRegionSource: String? = null,
         /**
@@ -389,7 +389,7 @@ class OciProvisioner(
             userOcid = userOcid,
             tenancyOcid = tenancyOcid,
             fingerprint = fingerprint,
-            selectedRegion = region,
+            authBootstrapRegion = region,
             tokenRegion = tokenRegion,
             tokenRegionSource = tokenRegionSource,
         )
@@ -456,266 +456,25 @@ class OciProvisioner(
 
     // --- Phase 2: Preflight ---
 
-    data class RegionDiscoveryResult(
-        val success: Boolean,
-        val homeRegionId: String? = null,
-        val discoverySource: String,
-        val identityEndpointUsed: String? = null,
-        val subscribedRegions: List<String> = emptyList(),
-        val error: String? = null,
-        val attemptedHosts: List<String> = emptyList(),
-    )
-
-    suspend fun discoverHomeRegion(
-        auth: AuthResult,
-        preferredRegion: String? = null,
-        preferredRegionSource: String = "persisted",
-    ): RegionDiscoveryResult {
-        emit(Phase.API_KEY, Status.RUNNING, "Discovering Oracle home region...")
-        if (isDevMode) {
-            emit(Phase.API_KEY, Status.RUNNING, "Token region source: ${auth.tokenRegionSource ?: "none"}")
-        }
-
-        val manualRegion = preferredRegion
-            ?.takeIf { preferredRegionSource.startsWith("user-selected") }
-        val isManualDiscovery = manualRegion != null
-        val candidates = buildRegionCandidates(auth, preferredRegion)
-        if (isDevMode) {
-            emit(Phase.API_KEY, Status.RUNNING, "Region discovery candidates: ${candidates.joinToString(", ")}")
-        }
-
-        var sawDnsSuccess = false
-        var authFailure: String? = null
-        val attemptedHosts = mutableListOf<String>()
-        var lastDnsException: Throwable? = null
-        for (candidate in candidates) {
-            val idHost = OciEndpoints.identityHost(candidate)
-            val identityEndpoint = OciEndpoints.identityEndpoint(candidate)
-            attemptedHosts += idHost
-            if (isDevMode) {
-                emit(Phase.API_KEY, Status.RUNNING, "Trying candidate region: $candidate")
-                emit(Phase.API_KEY, Status.RUNNING, "Identity host: $idHost")
-                emit(Phase.API_KEY, Status.RUNNING, "Identity URL: $identityEndpoint")
-                emit(Phase.API_KEY, Status.RUNNING, "Realm/domain suffix: ${OciEndpoints.realm(candidate)}")
-                emit(
-                    Phase.API_KEY,
-                    Status.RUNNING,
-                    "Region trace: tokenRegionId=${auth.tokenRegion ?: "none"} manualRegionId=${manualRegion ?: "none"} " +
-                        "discoveryCandidateRegionId=$candidate finalIdentityRegionId=pending finalHomeRegionId=pending " +
-                        "finalProvisioningRegionId=pending signerRegionId=$candidate identityHost=$idHost " +
-                        "identityUrl=$identityEndpoint realm=${OciEndpoints.realm(candidate)}",
-                )
-            }
-
-            val dnsResult = kotlinx.coroutines.withTimeoutOrNull(2500L) {
-                kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-                    OciEndpoints.resolveHost(idHost)
-                }
-            } ?: Result.failure(java.net.SocketTimeoutException("DNS preflight timed out"))
-            if (dnsResult.isFailure) {
-                lastDnsException = dnsResult.exceptionOrNull()
-                if (isDevMode) {
-                    val e = lastDnsException
-                    emit(Phase.API_KEY, Status.WARNING, "DNS preflight failed for $candidate: ${e?.javaClass?.simpleName}: ${e?.message}")
-                    emit(
-                        Phase.API_KEY,
-                        Status.WARNING,
-                        "DNS attempted host count=${attemptedHosts.size}; hosts=${attemptedHosts.joinToString(", ")}; " +
-                            "lastHost=$idHost; lastDnsException=${e?.javaClass?.simpleName}: ${e?.message}; " +
-                            "manualRegionSelected=$isManualDiscovery; selectedManualHostAttempted=${manualRegion?.let { OciEndpoints.identityHost(it) in attemptedHosts } ?: false}",
-                    )
-                }
-                if (isManualDiscovery && candidate == manualRegion) {
-                    // DNS failure on the user-selected/persisted region is a TRANSIENT network issue,
-                    // NOT a reason to fail provisioning, scan other regions, or reset auth.
-                    // Return a transient-failure result so the caller can preserve the session.
-                    val transientError = "Network unavailable during Oracle region preflight ($candidate). " +
-                        "ZeroVPN will retry later. No cloud resources were created."
-                    emit(Phase.API_KEY, Status.WARNING, transientError)
-                    return RegionDiscoveryResult(
-                        success = false,
-                        homeRegionId = candidate,
-                        discoverySource = preferredRegionSource + "-transient-network-failure",
-                        error = transientError,
-                        attemptedHosts = attemptedHosts,
-                    )
-                }
-                continue
-            }
-            sawDnsSuccess = true
-            if (isDevMode) emit(Phase.API_KEY, Status.RUNNING, "DNS preflight OK for $candidate")
-
-            val query = queryRegionSubscriptions(auth, candidate)
-            if (isDevMode) emit(Phase.API_KEY, Status.RUNNING, "regionSubscriptions HTTP ${query.code} for $candidate")
-
-            if (query.isSuccessful && query.body != null) {
-                val subscriptions = try {
-                    JSONArray(if (query.body.isBlank()) "[]" else query.body)
-                } catch (e: Exception) {
-                    if (isDevMode) emit(Phase.API_KEY, Status.WARNING, "Could not parse subscriptions for $candidate: ${e.message}")
-                    continue
-                }
-                val subscribed = mutableListOf<String>()
-                var homeRegion = candidate
-                for (i in 0 until subscriptions.length()) {
-                    val sub = subscriptions.getJSONObject(i)
-                    val name = OciRegions.normalizeRegionHint(
-                        sub.optString("region_name")
-                        .ifBlank { sub.optString("regionName") }
-                        .ifBlank { sub.optString("region_key") }
-                    ).orEmpty()
-                    if (name.isNotBlank()) subscribed += name
-                    if (sub.optBoolean("is_home_region", false) || sub.optBoolean("isHomeRegion", false)) {
-                        homeRegion = name.ifBlank { candidate }
-                    }
-                }
-                val source = when {
-                    preferredRegion != null && candidate == preferredRegion -> preferredRegionSource
-                    auth.tokenRegion != null && candidate == auth.tokenRegion -> auth.tokenRegionSource ?: "token-claim"
-                    candidate == auth.selectedRegion -> "auth-bootstrap-probe"
-                    else -> "probe-regionSubscriptions"
-                }
-                emit(Phase.API_KEY, Status.SUCCESS, "Discovered Oracle home region: $homeRegion")
-                if (isDevMode) {
-                    emit(Phase.API_KEY, Status.RUNNING, "Region discovery source: $source")
-                    emit(Phase.API_KEY, Status.RUNNING, "Identity endpoint used: $identityEndpoint")
-                    emit(Phase.API_KEY, Status.RUNNING, "Subscribed regions: ${subscribed.joinToString(", ").ifBlank { "unknown" }}")
-                    emit(
-                        Phase.API_KEY,
-                        Status.RUNNING,
-                        "Region trace: tokenRegionId=${auth.tokenRegion ?: "none"} manualRegionId=${manualRegion ?: "none"} " +
-                            "discoveryCandidateRegionId=$candidate finalIdentityRegionId=$candidate finalHomeRegionId=$homeRegion " +
-                            "finalProvisioningRegionId=$homeRegion signerRegionId=$homeRegion identityHost=${OciEndpoints.identityHost(homeRegion)} " +
-                            "identityUrl=${OciEndpoints.identityEndpoint(homeRegion)} realm=${OciEndpoints.realm(homeRegion)}",
-                    )
-                }
-                return RegionDiscoveryResult(
-                    success = true,
-                    homeRegionId = homeRegion,
-                    discoverySource = source,
-                    identityEndpointUsed = identityEndpoint,
-                    subscribedRegions = subscribed,
-                    attemptedHosts = attemptedHosts,
-                )
-            }
-
-            if (query.code == 401 || query.code == 403) {
-                authFailure = "Oracle login succeeded, but Oracle rejected the session while discovering your home region. Sign in to Oracle Cloud Console first, then retry."
-                if (isDevMode) emit(Phase.API_KEY, Status.WARNING, "Auth failure while probing $candidate: HTTP ${query.code}")
-            }
-        }
-
-        val error = authFailure ?: if (!sawDnsSuccess) {
-            val lastHost = attemptedHosts.lastOrNull() ?: "unknown"
-            val dnsDetail = lastDnsException?.let { "${it.javaClass.simpleName}: ${it.message}" } ?: "unknown"
-            if (isDevMode) {
-                emit(
-                    Phase.API_KEY,
-                    Status.ERROR,
-                    "DNS attempted host count=${attemptedHosts.size}; hosts=${attemptedHosts.joinToString(", ")}; " +
-                        "lastHost=$lastHost; lastDnsException=$dnsDetail; manualRegionSelected=$isManualDiscovery; " +
-                        "selectedManualHostAttempted=${manualRegion?.let { OciEndpoints.identityHost(it) in attemptedHosts } ?: false}",
-                )
-            }
-            "Could not resolve Oracle Identity endpoints after trying ${attemptedHosts.size} host(s). " +
-                "Last attempted host: $lastHost. Check network/DNS, try mobile data instead of Wi-Fi, " +
-                "temporarily disable Android Private DNS, adblock/firewall/VPN settings, then retry."
-        } else {
-            "Oracle login succeeded, but ZeroVPN could not discover your home region. Choose your Oracle home region manually and retry."
-        }
-        emit(Phase.API_KEY, Status.ERROR, error)
-        return RegionDiscoveryResult(
-            success = false,
-            discoverySource = "automatic-failed",
-            error = error,
-            attemptedHosts = attemptedHosts,
-        )
-    }
-
-    private fun buildRegionCandidates(auth: AuthResult, preferredRegion: String?): List<String> {
-        val ordered = mutableListOf<String>()
-        fun add(region: String?) {
-            val normalized = OciRegions.normalizeRegionHint(region) ?: return
-            if (ordered.none { it.equals(normalized, ignoreCase = true) }) ordered += normalized
-        }
-        // Authority order: persisted/user-selected → token region → auth bootstrap region.
-        // Only scan common regions when NO authoritative region exists at all.
-        add(preferredRegion)
-        add(auth.tokenRegion)
-        add(auth.selectedRegion)
-        if (ordered.isEmpty()) {
-            OciRegions.common.forEach { add(it.id) }
-        }
-        return ordered
-    }
-
-    private data class RegionSubscriptionsHttpResult(
-        val code: Int,
-        val body: String?,
-        val isSuccessful: Boolean,
-        val error: Exception? = null,
-    )
-
-    private suspend fun queryRegionSubscriptions(auth: AuthResult, candidateRegion: String): RegionSubscriptionsHttpResult {
-        val idHost = OciEndpoints.identityHost(candidateRegion)
-        val path = "/20160918/tenancies/${auth.tenancyOcid}/regionSubscriptions"
-        val url = "https://$idHost$path"
-        val (authHeader, dateStr, _) = OciRequestSigner.buildAuthHeader(
-            tenancyOcid = auth.tenancyOcid,
-            userOcid = auth.userOcid,
-            fingerprint = auth.fingerprint,
-            privateKey = auth.privateKey,
-            method = "GET",
-            path = path,
-            host = idHost,
-            useSecurityToken = true,
-            securityToken = auth.securityToken,
-        )
-        val request = Request.Builder()
-            .url(url)
-            .header("date", dateStr)
-            .header("Authorization", authHeader)
-            .get()
-            .build()
-        return kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-            try {
-                val resp = httpClient.newCall(request).execute()
-                RegionSubscriptionsHttpResult(
-                    code = resp.code,
-                    body = resp.body?.string() ?: "",
-                    isSuccessful = resp.isSuccessful,
-                )
-            } catch (e: Exception) {
-                if (isDevMode) {
-                    emit(Phase.API_KEY, Status.WARNING, "regionSubscriptions failed for $candidateRegion: ${e.javaClass.simpleName}: ${e.message}")
-                }
-                RegionSubscriptionsHttpResult(0, null, false, e)
-            }
-        }
-    }
-
     suspend fun preflight(
         auth: AuthResult,
         preferredRegion: String? = null,
         preferredRegionSource: String = "persisted",
     ): PreflightResult {
-        val discovery = discoverHomeRegion(auth, preferredRegion, preferredRegionSource)
-        if (!discovery.success || discovery.homeRegionId.isNullOrBlank()) {
-            val isTransient = discovery.discoverySource.contains("transient-network-failure")
-            return PreflightResult(
+        val authoritativeRegion = preferredRegion?.takeIf { it.isNotBlank() }
+            ?: return PreflightResult(
                 success = false,
-                homeRegion = discovery.homeRegionId ?: preferredRegion ?: auth.selectedRegion,
+                homeRegion = "",
                 isUkRegion = false,
-                error = discovery.error ?: "Oracle login succeeded, but ZeroVPN could not discover your home region.",
-                initialRegion = auth.selectedRegion,
-                regionDiscoverySource = discovery.discoverySource,
-                identityHost = discovery.homeRegionId?.let { OciEndpoints.identityHost(it) } ?: "",
-                iaasHost = discovery.homeRegionId?.let { OciEndpoints.iaasHost(it) } ?: "",
-                isTransientNetworkFailure = isTransient,
+                error = "REGION_SELECTION_REQUIRED",
+                initialRegion = auth.authBootstrapRegion,
+                regionDiscoverySource = "region-selection-required",
+                identityHost = "",
+                iaasHost = "",
             )
-        }
-
-        val homeRegion = discovery.homeRegionId
+        // A user-selected or persisted verified region is already authoritative. Do not
+        // spend the browser-token window on DNS preflight or candidate-region scanning.
+        val homeRegion = authoritativeRegion
         val idHost = OciEndpoints.identityHost(homeRegion)
         val iaasHost = OciEndpoints.iaasHost(homeRegion)
         val isUk = homeRegion in listOf("uk-london-1", "uk-cardiff-1")
@@ -768,12 +527,27 @@ class OciProvisioner(
                 if (keys.length() >= 3) {
                     val error = "API key limit reached (${keys.length()}/3). Delete an existing API key in the Oracle console."
                     emit(Phase.API_KEY, Status.ERROR, error)
-                    return PreflightResult(false, homeRegion, isUk, error, auth.selectedRegion, discovery.discoverySource, idHost, iaasHost)
+                    return PreflightResult(false, homeRegion, isUk, error, auth.authBootstrapRegion, preferredRegionSource, idHost, iaasHost)
                 }
             } else {
                 emit(Phase.API_KEY, Status.WARNING, "API key check: HTTP ${keyResult.first}")
             }
         } catch (e: Exception) {
+            if (isTransientNetworkFailure(e)) {
+                val error = "TRANSIENT_NETWORK_FAILURE: Oracle could not be reached in $homeRegion. The selected region and authenticated session were preserved; retry later."
+                emit(Phase.API_KEY, Status.WARNING, error)
+                return PreflightResult(
+                    success = false,
+                    homeRegion = homeRegion,
+                    isUkRegion = isUk,
+                    error = error,
+                    initialRegion = auth.authBootstrapRegion,
+                    regionDiscoverySource = preferredRegionSource,
+                    identityHost = idHost,
+                    iaasHost = iaasHost,
+                    isTransientNetworkFailure = true,
+                )
+            }
             emit(Phase.API_KEY, Status.WARNING, "API key check failed: ${e.javaClass.simpleName}: ${e.message}")
         }
 
@@ -783,12 +557,20 @@ class OciProvisioner(
             homeRegion = homeRegion,
             isUkRegion = isUk,
             error = null,
-            initialRegion = auth.selectedRegion,
-            regionDiscoverySource = discovery.discoverySource,
+            initialRegion = auth.authBootstrapRegion,
+            regionDiscoverySource = preferredRegionSource,
             identityHost = idHost,
             iaasHost = iaasHost,
         )
     }
+
+    private fun isTransientNetworkFailure(error: Throwable): Boolean =
+        generateSequence(error) { it.cause }.any {
+            it is java.net.UnknownHostException ||
+                it is java.net.ConnectException ||
+                it is java.net.SocketTimeoutException ||
+                it is javax.net.ssl.SSLException
+        }
     // --- Phase 3: API Key Upload ---
 
     private suspend fun uploadApiKey(
@@ -912,7 +694,7 @@ class OciProvisioner(
         }
         if (!keyRegistered) {
             val keyId = "${auth.tenancyOcid}/${auth.userOcid}/$uploadedFingerprint"
-            emit(Phase.API_KEY, Status.ERROR, "Key registration pending: fingerprint not found after $registrationAttempts attempt(s). keyId=$keyId")
+            emit(Phase.API_KEY, Status.ERROR, "API-key registration could not be confirmed after $registrationAttempts attempt(s).")
             throw ApiKeyVerificationException(
                 stage = "KEY_REGISTRATION_PENDING",
                 fingerprint = uploadedFingerprint,
@@ -937,7 +719,7 @@ class OciProvisioner(
             }
             is SigningProbeResult.AuthenticationRejected -> {
                 val keyId = "${auth.tenancyOcid}/${auth.userOcid}/$uploadedFingerprint"
-                emit(Phase.API_KEY, Status.ERROR, "API-key signature validation failed. Oracle registered the key but rejected the signed request. keyId=$keyId")
+                emit(Phase.API_KEY, Status.ERROR, "API-key signature validation failed. Oracle registered the key but rejected the signed request.")
                 throw ApiKeyVerificationException(
                     stage = "API_KEY_SIGNATURE_VALIDATION_FAILED",
                     fingerprint = uploadedFingerprint,
@@ -971,7 +753,7 @@ class OciProvisioner(
             publicKeySha256 = publicKeySha256,
         )
 
-        emit(Phase.API_KEY, Status.SUCCESS, "API key uploaded, registered, and signing verified: $uploadedFingerprint")
+        emit(Phase.API_KEY, Status.SUCCESS, "API key uploaded, registered, and signing verified.")
         return uploadedFingerprint
     }
 
@@ -1082,14 +864,13 @@ class OciProvisioner(
     ) : Exception(
         when (stage) {
             "KEY_REGISTRATION_PENDING" ->
-                "Key registration pending: fingerprint not found after $attemptCount attempt(s). " +
-                    "The key was uploaded but Oracle did not list it. keyId=$keyId, endpoint=$endpoint"
+                "Key registration pending after $attemptCount attempt(s). " +
+                    "The key was uploaded but Oracle did not list it."
             "API_KEY_SIGNATURE_VALIDATION_FAILED" ->
                 "Oracle registered the API key, but ZeroVPN could not authenticate with it. " +
-                    "No cloud resources were created. Do not create another key automatically. " +
-                    "keyId=$keyId, endpoint=$endpoint"
+                    "No cloud resources were created. Do not create another key automatically."
             else ->
-                "API-key verification failed at stage $stage after $attemptCount attempt(s). keyId=$keyId, endpoint=$endpoint"
+                "API-key verification failed at stage $stage after $attemptCount attempt(s)."
         }
     )
 

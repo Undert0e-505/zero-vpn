@@ -2,6 +2,12 @@
 
 Status: Phase 1 implementation
 
+## Oracle region ownership
+
+Foreground setup treats the OAuth endpoint as bootstrap transport metadata only. It is never an Oracle home-region or provisioning-region authority. Region authority is resolved in this order: the current user selection, a persisted verified home region, then an explicit trusted authentication home-region result. If none exists, setup enters `REGION_SELECTION_REQUIRED` and browser authentication does not start.
+
+The chosen region is persisted before browser authentication. Foreground preflight uses the actual signed OCI request in that region as its network test; it performs no DNS gate, common-region scan, or fallback to the OAuth bootstrap region. A DNS or connection timeout is `TRANSIENT_NETWORK_FAILURE` and preserves the chosen region and authentication state without uploading an API key.
+
 ## Purpose and boundary
 
 Private Chat is an optional workload installed after ZeroVPN has created, verified, and saved a working Oracle WireGuard exit. The Android app does not append Synapse to the existing WireGuard shell script. It commits the VPN profile, SSH key reference, OCI resource IDs, and owner peer first, then starts a separately recoverable workload operation.

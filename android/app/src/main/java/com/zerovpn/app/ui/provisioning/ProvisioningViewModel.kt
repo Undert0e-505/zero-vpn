@@ -74,6 +74,7 @@ import com.zerovpn.app.friends.SharedExitProfile
 import com.zerovpn.app.friends.SharedExitSource
 import com.zerovpn.app.friends.sha256
 import com.zerovpn.app.oci.OciProvisioner
+import com.zerovpn.app.oci.OciRegionAuthority
 import com.zerovpn.app.oci.VmLaunchFailure
 import com.zerovpn.app.oci.OciRegion
 import com.zerovpn.app.oci.OciRegions
@@ -1887,6 +1888,16 @@ class ProvisioningViewModel : ViewModel() {
         if (!::prefs.isInitialized) initPrefs(context)
         capacityRetryRepository?.setCapacityRetryPolicyEnabled(_capacityRetryPolicyEnabled.value)
         if (_state.value is ProvisioningState.Running || provisioningJob?.isActive == true) return
+        val regionResolution = OciRegionAuthority.resolve(
+            userSelectedRegion = _selectedOracleRegion.value,
+            persistedVerifiedHomeRegion = homeRegion,
+        )
+        if (!regionResolution.isAuthoritative) {
+            _state.value = ProvisioningState.RegionSelectionRequired
+            _oracleOnboardingState.value = OracleOnboardingState.NotStarted
+            persistState()
+            return
+        }
         val retrySession = capacityRetryRepository?.activeSession()
         if (
             retrySession?.state in setOf(
@@ -2748,7 +2759,9 @@ class ProvisioningViewModel : ViewModel() {
             }
             val uiSelectedRegion = _selectedOracleRegion.value
             val persistedRegion = homeRegion
-            val authBootstrapRegion = uiSelectedRegion ?: persistedRegion ?: AUTH_BOOTSTRAP_REGION
+            val authoritativeRegion = OciRegionAuthority.resolve(uiSelectedRegion, persistedRegion).regionId
+                ?: error("REGION_SELECTION_REQUIRED")
+            val authBootstrapRegion = AUTH_BOOTSTRAP_REGION
             provisioner = OciProvisioner(context, authBootstrapRegion, _isDevMode.value)
 
             // Collect events from provisioner
@@ -2776,7 +2789,7 @@ class ProvisioningViewModel : ViewModel() {
 
             // Phase 2: Preflight
             _currentPhase.value = Phase.API_KEY
-            val preferredRegion = uiSelectedRegion ?: persistedRegion
+            val preferredRegion = authoritativeRegion
             val preferredSource = when {
                 uiSelectedRegion != null -> "user-selected manual region"
                 persistedRegion != null -> "persisted"
@@ -2787,7 +2800,7 @@ class ProvisioningViewModel : ViewModel() {
                 Status.RUNNING,
                 "Region trace: uiSelectedRegionId=${uiSelectedRegion ?: "none"} persistedRegionId=${persistedRegion ?: "none"} " +
                     "tokenRegionId=${authResult?.tokenRegion ?: "none"} manualRegionId=${uiSelectedRegion ?: "none"} " +
-                    "discoveryCandidateRegionId=${preferredRegion ?: authResult?.selectedRegion ?: "none"}",
+                    "finalProvisioningRegionId=$preferredRegion signerRegionId=$preferredRegion",
             )
             preflightResult = prov.preflight(authResult!!, preferredRegion, preferredSource)
 

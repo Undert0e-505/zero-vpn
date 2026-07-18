@@ -28,7 +28,8 @@ class ApiKeyActivationGateTest {
         )
         val message = ex.message ?: ""
         assertTrue("Message should contain 'registration pending'", message.contains("registration pending"))
-        assertTrue("Message should contain keyId", message.contains("keyId="))
+        assertFalse("Message must not expose keyId", message.contains("keyId="))
+        assertFalse("Message must not expose a complete OCID", message.contains("ocid1."))
         assertTrue("Message should contain attempt count", message.contains("attempt"))
         assertFalse("Message must not contain private key material", message.contains("PRIVATE KEY"))
         assertFalse("Message must not contain authorization signature", message.contains("Signature algorithm"))
@@ -51,6 +52,8 @@ class ApiKeyActivationGateTest {
         assertFalse("Must not contain private key material", message.contains("PRIVATE KEY"))
         assertFalse("Must not contain signature value", message.contains("signature="))
         assertFalse("Must not contain Authorization header", message.contains("Authorization"))
+        assertFalse("Must not expose keyId", message.contains("keyId="))
+        assertFalse("Must not expose a complete OCID", message.contains("ocid1."))
     }
 
     @Test fun `apiKeyKeyIdFormatIsTenancySlashUserSlashFingerprint`() {

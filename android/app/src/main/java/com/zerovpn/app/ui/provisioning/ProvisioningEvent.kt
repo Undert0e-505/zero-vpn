@@ -53,6 +53,7 @@ enum class OracleOnboardingState {
 sealed class ProvisioningState {
     data object Idle : ProvisioningState()
     data object PreStart : ProvisioningState()
+    data object RegionSelectionRequired : ProvisioningState()
     data object Running : ProvisioningState()
     data class UkWarning(val homeRegion: String) : ProvisioningState()
     data class Success(
