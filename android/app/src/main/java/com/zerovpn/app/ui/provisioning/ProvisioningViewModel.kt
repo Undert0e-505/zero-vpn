@@ -224,6 +224,9 @@ class ProvisioningViewModel : ViewModel() {
     private val _selectedOracleRegion = MutableStateFlow<String?>(null)
     val selectedOracleRegion: StateFlow<String?> = _selectedOracleRegion.asStateFlow()
 
+    /** Exact authoritative selection captured before browser auth is launched. */
+    private var preAuthSelectedRegion: String? = null
+
     val oracleRegions: List<OciRegion> = OciRegions.common
 
     data class SshDebugInfo(
@@ -400,6 +403,8 @@ class ProvisioningViewModel : ViewModel() {
         }.getOrDefault(OracleOnboardingState.NotStarted)
         homeRegion = prefs.getString("home_region", null)
         _selectedOracleRegion.value = prefs.getString("selected_oracle_region", null)
+            ?: prefs.getString("pre_auth_selected_oracle_region", null)
+        preAuthSelectedRegion = prefs.getString("pre_auth_selected_oracle_region", null)
         retryLaunchSshPublicKey = prefs.getString("retry_launch_ssh_public_key", null)
         retryLaunchSubnetId = prefs.getString("retry_launch_subnet_id", null)
         apiKeyUserOcid = prefs.getString("api_key_user_ocid", null)
@@ -502,6 +507,8 @@ class ProvisioningViewModel : ViewModel() {
         }
         if (pendingCapacityRetryEligible) {
             _state.value = restoredCapacityFailureState()
+        } else if (OciRegionAuthority.resolve(_selectedOracleRegion.value, homeRegion).source == OciRegionAuthority.Source.REQUIRED) {
+            _state.value = ProvisioningState.RegionSelectionRequired
         }
     }
 
@@ -522,6 +529,7 @@ class ProvisioningViewModel : ViewModel() {
             listOf(
                 "home_region",
                 "selected_oracle_region",
+                "pre_auth_selected_oracle_region",
                 "api_key_user_ocid",
                 "api_key_tenancy_ocid",
                 "api_key_token_region",
@@ -567,6 +575,7 @@ class ProvisioningViewModel : ViewModel() {
             putInt("capacity_retry_pending_memory_gb", pendingRetryMemoryGb)
             homeRegion?.let { putString("home_region", it) }
             _selectedOracleRegion.value?.let { putString("selected_oracle_region", it) }
+            preAuthSelectedRegion?.let { putString("pre_auth_selected_oracle_region", it) }
             retryLaunchSshPublicKey?.let { putString("retry_launch_ssh_public_key", it) }
             retryLaunchSubnetId?.let { putString("retry_launch_subnet_id", it) }
             apiKeyUserOcid?.let { putString("api_key_user_ocid", it) }
@@ -727,7 +736,11 @@ class ProvisioningViewModel : ViewModel() {
         )
 
     fun showPreStart() {
-        _state.value = ProvisioningState.PreStart
+        _state.value = if (OciRegionAuthority.resolve(_selectedOracleRegion.value, null).isAuthoritative) {
+            ProvisioningState.PreStart
+        } else {
+            ProvisioningState.RegionSelectionRequired
+        }
         _oracleOnboardingState.value = OracleOnboardingState.NotStarted
         persistState()
     }
@@ -764,7 +777,11 @@ class ProvisioningViewModel : ViewModel() {
         _capacityRetryPolicyEnabled.value = false
         capacityRetryRepository?.setCapacityRetryPolicyEnabled(false)
         clearOracleOperationState()
-        _state.value = ProvisioningState.PreStart
+        _state.value = if (_selectedOracleRegion.value == null) {
+            ProvisioningState.RegionSelectionRequired
+        } else {
+            ProvisioningState.PreStart
+        }
         _oracleOnboardingState.value = OracleOnboardingState.NotStarted
         persistState()
     }
@@ -1404,6 +1421,22 @@ class ProvisioningViewModel : ViewModel() {
         persistState()
     }
 
+    fun hasCloudResourcesToCleanup(): Boolean = resourceIds?.let { ledger ->
+        listOf(ledger.vcnId, ledger.slId, ledger.subnetId, ledger.igwId, ledger.instanceId)
+            .any { !it.isNullOrBlank() }
+    } == true
+
+    private fun persistRegionBeforeBrowserAuth(region: String) {
+        _selectedOracleRegion.value = region
+        preAuthSelectedRegion = region
+        if (::prefs.isInitialized) {
+            prefs.edit()
+                .putString("selected_oracle_region", region)
+                .putString("pre_auth_selected_oracle_region", region)
+                .commit()
+        }
+    }
+
     fun updateProviderSwitchDiagnostics(diagnostics: ProviderSwitchDiagnostics) {
         _providerSwitchDiagnostics.value = diagnostics
     }
@@ -1898,6 +1931,8 @@ class ProvisioningViewModel : ViewModel() {
             persistState()
             return
         }
+        val oracleHomeRegion = regionResolution.regionId!!
+        persistRegionBeforeBrowserAuth(oracleHomeRegion)
         val retrySession = capacityRetryRepository?.activeSession()
         if (
             retrySession?.state in setOf(
@@ -2003,12 +2038,18 @@ class ProvisioningViewModel : ViewModel() {
             }
             ManualCapacityRetryDecision.AuthenticationRequired -> showCapacityRetryAuthenticationRequired()
             ManualCapacityRetryDecision.NotAvailable -> {
-                _state.value = ProvisioningState.Failure(
-                    failedPhase = Phase.AUTH,
-                    lastSuccessPhase = null,
-                    errorMessage = "The authenticated capacity retry session is unavailable. Start a new Oracle setup when you are ready to authenticate again.",
-                )
-                persistState()
+                // Fresh foreground setup failures retry foreground auth. Capacity-session
+                // errors are reserved for an actual persisted capacity retry continuation.
+                if (!pendingCapacityRetryEligible) {
+                    startProvisioning(context)
+                } else {
+                    _state.value = ProvisioningState.Failure(
+                        failedPhase = Phase.AUTH,
+                        lastSuccessPhase = null,
+                        errorMessage = "The authenticated capacity retry session is unavailable. Start a new Oracle setup when you are ready to authenticate again.",
+                    )
+                    persistState()
+                }
             }
         }
     }
@@ -2800,10 +2841,11 @@ class ProvisioningViewModel : ViewModel() {
                 chatCleanupRequired = "NOT TESTED"
                 refreshOracleOperationDiagnostics()
             }
-            val uiSelectedRegion = _selectedOracleRegion.value
+            val uiSelectedRegion = preAuthSelectedRegion ?: _selectedOracleRegion.value
             val persistedRegion = homeRegion
             val authoritativeRegion = OciRegionAuthority.resolve(uiSelectedRegion, persistedRegion).regionId
                 ?: error("REGION_SELECTION_REQUIRED")
+            persistRegionBeforeBrowserAuth(authoritativeRegion)
             val authBootstrapRegion = AUTH_BOOTSTRAP_REGION
             provisioner = OciProvisioner(context, authBootstrapRegion, _isDevMode.value)
 

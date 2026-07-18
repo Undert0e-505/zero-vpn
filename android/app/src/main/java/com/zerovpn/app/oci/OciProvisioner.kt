@@ -107,13 +107,14 @@ class OciProvisioner(
     private val context: Context,
     private val region: String,
     private val isDevMode: Boolean = false,
+    httpClientOverride: OkHttpClient? = null,
 ) {
     // When isDevMode is false, wire tap and signing string debug output are suppressed.
     // Only user-facing progress messages are emitted.
     private val _events = MutableSharedFlow<ProvisioningEvent>(replay = 64, extraBufferCapacity = 64)
     val events: SharedFlow<ProvisioningEvent> = _events.asSharedFlow()
 
-    private val httpClient = OkHttpClient.Builder()
+    private val httpClient = httpClientOverride ?: OkHttpClient.Builder()
         .connectTimeout(30, TimeUnit.SECONDS)
         .readTimeout(60, TimeUnit.SECONDS)
         .writeTimeout(30, TimeUnit.SECONDS)
@@ -217,7 +218,8 @@ class OciProvisioner(
         val homeRegion: String,
         val isUkRegion: Boolean,
         val error: String? = null,
-        val initialRegion: String,
+        /** Transport metadata used to reach Oracle's browser-auth service; never authoritative. */
+        val authBootstrapRegion: String,
         val regionDiscoverySource: String,
         val identityHost: String,
         val iaasHost: String,
@@ -467,7 +469,7 @@ class OciProvisioner(
                 homeRegion = "",
                 isUkRegion = false,
                 error = "REGION_SELECTION_REQUIRED",
-                initialRegion = auth.authBootstrapRegion,
+                authBootstrapRegion = auth.authBootstrapRegion,
                 regionDiscoverySource = "region-selection-required",
                 identityHost = "",
                 iaasHost = "",
@@ -541,7 +543,7 @@ class OciProvisioner(
                     homeRegion = homeRegion,
                     isUkRegion = isUk,
                     error = error,
-                    initialRegion = auth.authBootstrapRegion,
+                    authBootstrapRegion = auth.authBootstrapRegion,
                     regionDiscoverySource = preferredRegionSource,
                     identityHost = idHost,
                     iaasHost = iaasHost,
@@ -557,7 +559,7 @@ class OciProvisioner(
             homeRegion = homeRegion,
             isUkRegion = isUk,
             error = null,
-            initialRegion = auth.authBootstrapRegion,
+            authBootstrapRegion = auth.authBootstrapRegion,
             regionDiscoverySource = preferredRegionSource,
             identityHost = idHost,
             iaasHost = iaasHost,

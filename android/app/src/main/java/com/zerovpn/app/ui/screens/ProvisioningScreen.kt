@@ -198,7 +198,7 @@ fun ProvisioningScreen(
         val visibleRetrySession = capacityRetrySessions.lastOrNull {
             it.state != CapacityRetryState.NONE && it.state != CapacityRetryState.SUCCEEDED
         }
-        if ((state is ProvisioningState.Idle || state is ProvisioningState.PreStart) && visibleRetrySession != null) {
+        if (state is ProvisioningState.Idle && visibleRetrySession != null) {
             CapacityRetryStatusCard(
                 session = visibleRetrySession,
                 schedulerStatus = capacityRetrySchedulerStatuses[visibleRetrySession.sessionId],
@@ -365,6 +365,7 @@ fun ProvisioningScreen(
                     capacityRetrySchedulerStatuses = capacityRetrySchedulerStatuses,
                     capacityRetryDiagnostics = capacityRetryDiagnostics,
                     capacityRetrySession = capacityRetrySessions.lastOrNull {
+                        s.failedPhase == Phase.VM_LAUNCH &&
                         it.state in setOf(
                             CapacityRetryState.WAITING_FOR_RETRY,
                             CapacityRetryState.ACTIVE,
@@ -376,6 +377,7 @@ fun ProvisioningScreen(
                     },
                     onRetry = { viewModel.retry(context) },
                     onCleanup = { viewModel.cleanup(context) },
+                    resourceLedgerHasEntries = viewModel.hasCloudResourcesToCleanup(),
                     onKeepTrying24h = { viewModel.startCapacityRetry(context) },
                     onStopRetry = { viewModel.stopActiveCapacityRetry(context) },
                     onVpnOnlyInstead = { viewModel.setupVpnOnlyInstead(context) },
@@ -1465,6 +1467,7 @@ private fun FailureContent(
     capacityRetrySession: CapacityRetrySession?,
     onRetry: () -> Unit,
     onCleanup: () -> Unit,
+    resourceLedgerHasEntries: Boolean,
     onKeepTrying24h: () -> Unit,
     onStopRetry: () -> Unit,
     onVpnOnlyInstead: () -> Unit,
@@ -1726,21 +1729,24 @@ private fun FailureContent(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(12.dp),
         ) {
-            OutlinedButton(
-                onClick = onCleanup,
-                modifier = Modifier.weight(1f).height(48.dp),
-                shape = RoundedCornerShape(8.dp),
-                colors = ButtonDefaults.outlinedButtonColors(
-                    contentColor = TextDim,
-                ),
-            ) {
-                Icon(
-                    imageVector = Icons.Default.CleaningServices,
-                    contentDescription = null,
-                    modifier = Modifier.size(20.dp),
+            if (resourceLedgerHasEntries) {
+                OutlinedButton(
+                    onClick = onCleanup,
+                    modifier = Modifier.weight(1f).height(48.dp),
+                    shape = RoundedCornerShape(8.dp),
+                    colors = ButtonDefaults.outlinedButtonColors(contentColor = TextDim),
+                ) {
+                    Icon(Icons.Default.CleaningServices, null, Modifier.size(20.dp))
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text("Cleanup", fontSize = 14.sp, fontWeight = FontWeight.Medium)
+                }
+            } else {
+                Text(
+                    "No cloud resources created",
+                    color = TextDim,
+                    fontSize = 13.sp,
+                    modifier = Modifier.weight(1f),
                 )
-                Spacer(modifier = Modifier.width(8.dp))
-                Text("Cleanup", fontSize = 14.sp, fontWeight = FontWeight.Medium)
             }
             if (capacityRetrySession == null) {
                 Button(
