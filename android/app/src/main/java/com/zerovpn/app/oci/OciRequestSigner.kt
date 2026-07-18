@@ -124,53 +124,32 @@ object OciRequestSigner {
         securityToken: String? = null,
         body: String? = null,
     ): Triple<String, String, String> {
-        // Returns (authHeader, dateUsed) so caller can set the same date on the request
-        val date = headers["date"] ?: java.time.format.DateTimeFormatter.RFC_1123_DATE_TIME
-            .format(java.time.ZonedDateTime.now(java.time.ZoneOffset.UTC))
-
-        // For POST/PUT/PATCH, OCI requires body headers to be signed too
-        val isBodyRequest = method.lowercase() in listOf("post", "put", "patch")
-        val contentType = "application/json"
-        val bodyBytes = body?.toByteArray(Charsets.UTF_8) ?: ByteArray(0)
-        val contentLength = bodyBytes.size.toString()
-        val contentSha256 = if (isBodyRequest) {
-            java.util.Base64.getEncoder().encodeToString(
-                java.security.MessageDigest.getInstance("SHA-256").digest(bodyBytes)
-            )
-        } else ""
-
-        val signingHeaders = if (isBodyRequest) {
-            listOf(
-                "date" to date,
-                "(request-target)" to "${method.lowercase()} $path",
-                "host" to host,
-                "content-length" to contentLength,
-                "content-type" to contentType,
-                "x-content-sha256" to contentSha256,
+        val auth = if (useSecurityToken) {
+            OciAuthContext.SecurityTokenBootstrap(
+                securityToken = requireNotNull(securityToken) { "Security-token auth requires a token." },
+                privateKey = privateKey,
+                tenancyOcid = tenancyOcid,
+                userOcid = userOcid,
+                fingerprint = fingerprint,
             )
         } else {
-            listOf(
-                "date" to date,
-                "(request-target)" to "${method.lowercase()} $path",
-                "host" to host,
+            OciAuthContext.ApiKey(
+                tenancyOcid = tenancyOcid,
+                userOcid = userOcid,
+                fingerprint = fingerprint,
+                privateKey = privateKey,
+                region = "",
             )
         }
-
-        val signingString = signingHeaders.joinToString("\n") { (k, v) -> "$k: $v" }
-        val signature = sign(privateKey, signingString)
-        val headerNames = signingHeaders.joinToString(" ") { it.first }
-
-        // For security token auth: keyId = ST{token} (entire token embedded)
-        // For API key auth: keyId = {tenancy}/{user}/{fingerprint}
-        val keyId = if (useSecurityToken && securityToken != null) {
-            "ST$" + securityToken
-        } else {
-            "$tenancyOcid/$userOcid/$fingerprint"
-        }
-
-        // OCI expects this exact format order: algorithm, headers, keyId, signature, version
-        val authHeader = """Signature algorithm="rsa-sha256",headers="$headerNames",keyId="$keyId",signature="$signature",version="1""""
-        return Triple(authHeader, date, signingString)
+        val signed = OciSignedClient().sign(
+            auth = auth,
+            method = method,
+            host = host,
+            pathAndQuery = path,
+            body = body?.toByteArray(Charsets.UTF_8),
+            dateOverride = headers["date"],
+        )
+        return Triple(signed.authorization, signed.date, signed.stringToSign)
     }
 
     /**

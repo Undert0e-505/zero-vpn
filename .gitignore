@@ -80,3 +80,5 @@ crash*.log
 hs_err_pid*.log
 
 .kotlin/
+
+.codex-lane/
