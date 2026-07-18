@@ -1952,6 +1952,15 @@ class ProvisioningViewModel : ViewModel() {
             persistState()
             return
         }
+        if (preflightResult?.isTransientNetworkFailure == true && authResult != null) {
+            if (!acquireProvisioningLease(ProvisioningLeaseOperation.FOREGROUND_AUTH_CONTINUATION)) return
+            _state.value = ProvisioningState.Running
+            persistState()
+            launchProvisioningJob(context.applicationContext) {
+                retryKnownRegionAfterTransientNetworkFailure(context)
+            }
+            return
+        }
         val repository = capacityRetryRepository ?: CapacityRetryRepository(prefs).also { capacityRetryRepository = it }
         val now = Instant.now()
         var session = repository.activeSession()?.let { active ->
@@ -2002,6 +2011,40 @@ class ProvisioningViewModel : ViewModel() {
                 persistState()
             }
         }
+    }
+
+    private suspend fun retryKnownRegionAfterTransientNetworkFailure(context: Context) {
+        val auth = authResult ?: return
+        val knownRegion = OciRegionAuthority.resolve(_selectedOracleRegion.value, homeRegion).regionId
+            ?: run {
+                _state.value = ProvisioningState.RegionSelectionRequired
+                persistState()
+                return
+            }
+        retryKnownRegionPreflight(context, auth, knownRegion)
+    }
+
+    private suspend fun retryKnownRegionPreflight(context: Context, auth: OciProvisioner.AuthResult, knownRegion: String) {
+        val prov = provisioner ?: OciProvisioner(context, AUTH_BOOTSTRAP_REGION, _isDevMode.value).also { provisioner = it }
+        completeKnownRegionPreflight(context, prov, auth, knownRegion)
+    }
+
+    private suspend fun completeKnownRegionPreflight(
+        context: Context,
+        prov: OciProvisioner,
+        auth: OciProvisioner.AuthResult,
+        knownRegion: String,
+    ) {
+        _currentPhase.value = Phase.API_KEY
+        val retried = prov.preflight(auth, knownRegion, "preserved-authoritative-region")
+        preflightResult = retried
+        if (!retried.success) {
+            setFailedOracleOperation(PendingOracleOperation.Provision, retried.error)
+            _state.value = ProvisioningState.Failure(Phase.API_KEY, Phase.AUTH, retried.error)
+            persistState()
+            return
+        }
+        doProvision(context, prov)
     }
 
     private fun retryExistingCapacitySession(context: Context, session: CapacityRetrySession) {

@@ -596,7 +596,7 @@ class OciProvisioner(
         // The signing string must use the same value OkHttp will send
         val contentLength = bodyBytes.size.toString()
 
-        val (authHeader, dateStr, signingStr) = OciRequestSigner.buildAuthHeader(
+        val (authHeader, dateStr, _) = OciRequestSigner.buildAuthHeader(
                 tenancyOcid = auth.tenancyOcid,
                 userOcid = auth.userOcid,
                 fingerprint = auth.fingerprint,
@@ -607,13 +607,9 @@ class OciProvisioner(
                 useSecurityToken = true, securityToken = auth.securityToken,
                 body = jsonBody, )
 
-        // DEBUG: Show signing string and auth header on screen (dev mode only)
+        // Developer diagnostics never render signing strings or key material.
         if (isDevMode) {
             emit(Phase.API_KEY, Status.RUNNING, "API key signerRegionId=$homeRegion identityHost=$idHost identityUrl=https://$idHost")
-            emit(Phase.API_KEY, Status.RUNNING, "POST signing string:")
-            signingStr.split("\n").forEachIndexed { i, line ->
-                emit(Phase.API_KEY, Status.RUNNING, " [$i] $line")
-            }
             emit(Phase.API_KEY, Status.RUNNING, "Authorization header generated")
         }
 
@@ -634,7 +630,7 @@ class OciProvisioner(
         }
         emit(Phase.API_KEY, Status.RUNNING, "Upload response: HTTP ${httpResp.code}")
         if (!httpResp.isSuccessful && httpResp.code != 409) {
-            throw Exception("API key upload failed: ${httpResp.code} ${httpResp.body.take(200)}")
+            throw Exception("API key upload failed: HTTP ${httpResp.code}")
         }
 
         val uploadedFingerprint = try {
