@@ -67,10 +67,10 @@ class OciSignedClient(private val clock: Clock = Clock.systemUTC()) {
         }
         val signature = Base64.getEncoder().encodeToString(rsa.sign())
         val names = values.keys.toList()
-        // Keep Oracle's documented Signature-v1 parameter order. Some OCI auth paths
-        // reject the previously emitted algorithm-first form even though token auth accepts it.
-        val authorization = "Signature version=\"1\",keyId=\"$keyId\",algorithm=\"rsa-sha256\"," +
-            "headers=\"${names.joinToString(" ")}\",signature=\"$signature\""
+        // Match Oracle's own Java SDK Authorization parameter order. The signed string,
+        // header set and keyId are unchanged; only the header parameter ordering differs.
+        val authorization = "Signature headers=\"${names.joinToString(" ")}\",keyId=\"$keyId\"," +
+            "algorithm=\"rsa-sha256\",signature=\"$signature\",version=\"1\""
         val transmitted = linkedMapOf("date" to date)
         if (hasBody) {
             transmitted["content-length"] = values.getValue("content-length")

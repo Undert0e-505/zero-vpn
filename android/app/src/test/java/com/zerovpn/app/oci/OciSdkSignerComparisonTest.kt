@@ -140,6 +140,13 @@ class OciSdkSignerComparisonTest {
         val zero = zeroVpnSign()
         val oracle = oracleSdkSign()
 
+        // Full Authorization header must now match byte-for-byte.
+        assertEquals(
+            "Activation GET Authorization header must match Oracle SDK exactly",
+            oracle.authorization,
+            zero.authorization,
+        )
+
         val zeroParts = parseAuthorization(zero.authorization)
         val oracleParts = parseAuthorization(oracle.authorization)
 
@@ -203,32 +210,22 @@ class OciSdkSignerComparisonTest {
     }
 
     @Test
-    fun authorizationParameterFormattingDiffersOnlyByOrder() {
+    fun authorizationParameterFormattingMatchesOracleSdk() {
         val zero = zeroVpnSign()
         val oracle = oracleSdkSign()
 
-        val zeroParts = parseAuthorization(zero.authorization)
-        val oracleParts = parseAuthorization(oracle.authorization)
+        val zeroOrder = zero.authorization.removePrefix("Signature ").split(",").map { it.substringBefore("=").trim() }
+        val oracleOrder = oracle.authorization.removePrefix("Signature ").split(",").map { it.substringBefore("=").trim() }
 
-        // Parameter values must be identical; only order may differ.
-        assertEquals("version value must match", oracleParts.version, zeroParts.version)
-        assertEquals("keyId value must match", oracleParts.keyId, zeroParts.keyId)
-        assertEquals("algorithm value must match", oracleParts.algorithm, zeroParts.algorithm)
-        assertEquals("headers value must match", oracleParts.headers, zeroParts.headers)
-        assertEquals("signature value must match", oracleParts.signature, zeroParts.signature)
-
-        // ZeroVPN currently emits: version,keyId,algorithm,headers,signature
         assertEquals(
-            "ZeroVPN parameter order",
-            listOf("version", "keyId", "algorithm", "headers", "signature"),
-            zero.authorization.removePrefix("Signature ").split(",").map { it.substringBefore("=").trim() },
+            "ZeroVPN Authorization parameter order must equal Oracle SDK order",
+            listOf("headers", "keyId", "algorithm", "signature", "version"),
+            zeroOrder,
         )
-
-        // Oracle SDK emits: headers,keyId,algorithm,signature,version
         assertEquals(
             "Oracle SDK parameter order",
             listOf("headers", "keyId", "algorithm", "signature", "version"),
-            oracle.authorization.removePrefix("Signature ").split(",").map { it.substringBefore("=").trim() },
+            oracleOrder,
         )
     }
 

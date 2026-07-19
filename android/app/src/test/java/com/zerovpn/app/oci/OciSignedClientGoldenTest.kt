@@ -129,7 +129,7 @@ class OciSignedClientGoldenTest {
         assertEquals(expected, request.stringToSign)
         assertEquals(names, request.signedHeaderNames)
         assertEquals("${auth.tenancyOcid}/${auth.userOcid}/${auth.fingerprint}", request.keyId)
-        assertTrue(request.authorization.startsWith("Signature version=\"1\",keyId=\"${request.keyId}\",algorithm=\"rsa-sha256\","))
+        assertTrue(request.authorization.startsWith("Signature headers=\"${names.joinToString(" ")}\",keyId=\"${request.keyId}\",algorithm=\"rsa-sha256\","))
         assertTrue(request.authorization.contains("headers=\"${names.joinToString(" ")}\""))
         assertFalse(request.authorization.contains("ST$"))
         val encoded = request.authorization.substringAfter("signature=\"").substringBefore('"')

@@ -69,8 +69,8 @@ class OciSignerOracleReferenceTest {
         val stringToSign = signedHeaders.entries.joinToString("\n") { "${it.key}: ${it.value}" }
         val signature = signRsaSha256(auth.privateKey, stringToSign)
         val keyId = "${auth.tenancyOcid}/${auth.userOcid}/${auth.fingerprint}"
-        val authorization = "Signature version=\"1\",keyId=\"$keyId\",algorithm=\"rsa-sha256\"," +
-            "headers=\"${signedHeaders.keys.joinToString(" ")}\",signature=\"$signature\""
+        val authorization = "Signature headers=\"${signedHeaders.keys.joinToString(" ")}\",keyId=\"$keyId\"," +
+            "algorithm=\"rsa-sha256\",signature=\"$signature\",version=\"1\""
 
         return OracleSignedResult(
             method = normalizedMethod,
