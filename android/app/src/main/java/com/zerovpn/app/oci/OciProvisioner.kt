@@ -888,7 +888,7 @@ class OciProvisioner(
             emit(Phase.API_KEY, Status.RUNNING, "Verifying API-key activation (attempt ${index + 1}/${backoffMs.size})...")
             kotlinx.coroutines.delay(delayMs)
             try {
-                val probeResult = probeApiKeyActivation(auth, idHost, activationProbePath)
+                val probeResult = probeApiKeyActivation(auth, idHost, activationProbePath, uploadedFingerprint)
                 if (probeResult) {
                     activationSuccess = true
                     emit(Phase.API_KEY, Status.RUNNING, "API-key activation confirmed after ${index + 1} probe attempt(s).")
@@ -923,9 +923,14 @@ class OciProvisioner(
      * Send a read-only GET using API-key auth to verify the newly uploaded key is active.
      * Returns true on HTTP 200, false on HTTP 401, throws on other errors.
      */
-    private suspend fun probeApiKeyActivation(auth: AuthResult, host: String, path: String): Boolean {
+    private suspend fun probeApiKeyActivation(
+        auth: AuthResult,
+        host: String,
+        path: String,
+        uploadedFingerprint: String? = null,
+    ): Boolean {
         return kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-            val (authHeader, dateStr, _) = OciRequestSigner.buildAuthHeader(
+            val (authHeader, dateStr, signingStr) = OciRequestSigner.buildAuthHeader(
                 tenancyOcid = auth.tenancyOcid,
                 userOcid = auth.userOcid,
                 fingerprint = auth.fingerprint,
@@ -936,6 +941,52 @@ class OciProvisioner(
                 useSecurityToken = false,
                 securityToken = null,
             )
+            val keyId = "${auth.tenancyOcid}/${auth.userOcid}/${auth.fingerprint}"
+            val signingStrSha256 = java.security.MessageDigest.getInstance("SHA-256")
+                .digest(signingStr.toByteArray(Charsets.UTF_8))
+                .joinToString("") { "%02x".format(it) }
+            val diagnostics = OciSignerDiagnostics.build(
+                method = "GET",
+                pathAndQuery = path,
+                signedHeaderNames = signingStr.split("\n").map { it.substringBefore(":") },
+                keyId = keyId,
+                date = dateStr,
+                host = host,
+                stringToSignSha256 = signingStrSha256,
+                authorizationHasVersion = authHeader.contains("version=\"1\""),
+                authorizationHasKeyId = authHeader.contains("keyId=\""),
+                authorizationHasAlgorithm = authHeader.contains("algorithm=\"rsa-sha256\""),
+                authorizationHasHeaders = authHeader.contains("headers=\""),
+                authorizationHasSignature = authHeader.contains("signature=\""),
+            )
+            val authContextFingerprint = (auth.authContext as? OciAuthContext.ApiKey)?.fingerprint ?: auth.fingerprint
+            val publicKeyDigest = runCatching {
+                OciCredentialIdentity.sha256Digest(auth.keyPair.public as RSAPublicKey)
+            }.getOrNull() ?: ""
+            val persistedPublicKeyDigest = (auth.authContext as? OciAuthContext.ApiKey)?.publicKeySha256
+            val fingerprintDiagnostics = OciSignerDiagnostics.buildFingerprintDiagnostics(
+                authFingerprint = auth.fingerprint,
+                authContextFingerprint = authContextFingerprint,
+                uploadedFingerprint = uploadedFingerprint ?: authContextFingerprint,
+                publicKeyDigest = publicKeyDigest,
+                persistedPublicKeyDigest = persistedPublicKeyDigest,
+                signingKeyIdSource = "auth.fingerprint",
+            )
+            if (isDevMode) {
+                emit(Phase.API_KEY, Status.RUNNING, "API-key activation GET signer diagnostics:")
+                diagnostics.forEach { (k, v) ->
+                    emit(Phase.API_KEY, Status.RUNNING, " signer: $k=$v")
+                }
+                emit(Phase.API_KEY, Status.RUNNING, "API-key activation GET fingerprint diagnostics:")
+                fingerprintDiagnostics.forEach { (k, v) ->
+                    emit(Phase.API_KEY, Status.RUNNING, " fingerprint: $k=$v")
+                }
+                emit(Phase.API_KEY, Status.RUNNING, "GET signing string:")
+                signingStr.split("\n").forEachIndexed { i, line ->
+                    emit(Phase.API_KEY, Status.RUNNING, " [$i] $line")
+                }
+                emit(Phase.API_KEY, Status.RUNNING, "Authorization header structure: OK (redacted)")
+            }
             val req = Request.Builder()
                 .url("https://$host$path")
                 .header("date", dateStr)
