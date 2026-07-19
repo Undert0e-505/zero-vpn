@@ -41,14 +41,14 @@ class OciSignedClient(private val clock: Clock = Clock.systemUTC()) {
         val hasBody = normalizedMethod in setOf("POST", "PUT", "PATCH")
         val bytes = if (hasBody) body ?: ByteArray(0) else null
         val values = linkedMapOf(
-            "date" to date,
             "(request-target)" to "${normalizedMethod.lowercase()} $pathAndQuery",
             "host" to host,
+            "date" to date,
         )
         if (hasBody) {
-            values["content-length"] = bytes!!.size.toString()
+            values["x-content-sha256"] = Base64.getEncoder().encodeToString(sha256(bytes!!))
             values["content-type"] = "application/json"
-            values["x-content-sha256"] = Base64.getEncoder().encodeToString(sha256(bytes))
+            values["content-length"] = bytes.size.toString()
         }
         val stringToSign = values.entries.joinToString("\n") { "${it.key}: ${it.value}" }
         val privateKey = when (auth) {
@@ -71,11 +71,14 @@ class OciSignedClient(private val clock: Clock = Clock.systemUTC()) {
         // reject the previously emitted algorithm-first form even though token auth accepts it.
         val authorization = "Signature version=\"1\",keyId=\"$keyId\",algorithm=\"rsa-sha256\"," +
             "headers=\"${names.joinToString(" ")}\",signature=\"$signature\""
-        val transmitted = linkedMapOf("date" to date)
+        val transmitted = linkedMapOf(
+            "host" to host,
+            "date" to date,
+        )
         if (hasBody) {
-            transmitted["content-length"] = values.getValue("content-length")
-            transmitted["content-type"] = values.getValue("content-type")
             transmitted["x-content-sha256"] = values.getValue("x-content-sha256")
+            transmitted["content-type"] = values.getValue("content-type")
+            transmitted["content-length"] = values.getValue("content-length")
         }
         transmitted["Authorization"] = authorization
         return OciSignedRequest(
