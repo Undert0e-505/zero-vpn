@@ -8,6 +8,9 @@ import java.security.MessageDigest
 import java.security.PrivateKey
 import java.util.Base64
 import java.util.function.Supplier
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import com.oracle.bmc.auth.SimpleAuthenticationDetailsProvider
 import com.oracle.bmc.http.signing.DefaultRequestSigner
 import com.oracle.bmc.http.signing.SigningStrategy
@@ -34,6 +37,10 @@ object OciOracleSdkActivationDiagnostic {
     /**
      * Perform one Oracle-SDK-signed activation GET and return safe diagnostics.
      *
+     * The SDK signing and the blocking HTTP call run inside [ioDispatcher] (default
+     * [Dispatchers.IO]) so the diagnostic cannot trigger Android's
+     * `NetworkOnMainThreadException` when invoked from the UI/main coroutine.
+     *
      * @param httpClient OkHttp client to use for the single GET.
      * @param tenancyOcid real auth tenancy OCID.
      * @param userOcid real auth user OCID.
@@ -41,8 +48,9 @@ object OciOracleSdkActivationDiagnostic {
      * @param privateKey the generated private key whose public key was uploaded.
      * @param host identity host for the region, e.g. `identity.eu-zurich-1.oraclecloud.com`.
      * @param path activation path, e.g. `/20160918/users/{userOcid}/apiKeys`.
+     * @param ioDispatcher dispatcher for blocking SDK signing and HTTP work.
      */
-    fun run(
+    suspend fun run(
         httpClient: OkHttpClient,
         tenancyOcid: String,
         userOcid: String,
@@ -50,7 +58,8 @@ object OciOracleSdkActivationDiagnostic {
         privateKey: PrivateKey,
         host: String,
         path: String,
-    ): Result {
+        ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
+    ): Result = withContext(ioDispatcher) {
         val sdkSigned = signWithOracleSdk(tenancyOcid, userOcid, fingerprint, privateKey, host, path)
 
         // Build the same GET with ZeroVPN's signer for comparison. The date will differ
@@ -98,7 +107,7 @@ object OciOracleSdkActivationDiagnostic {
             "oracleSdkFinalRequestMatchesSignedValues" to "true",
         )
 
-        return Result(
+        Result(
             success = code in 200..299,
             httpCode = code,
             signerUsed = "oracle-sdk-runtime",
