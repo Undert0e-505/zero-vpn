@@ -999,7 +999,56 @@ class OciProvisioner(
                 .header("Authorization", authHeader)
                 .get()
                 .build()
+
             val resp = httpClient.newCall(req).execute()
+            val finalRequest = resp.request
+
+            // Diagnostic-only: compare signed request values against what OkHttp actually transmitted.
+            // This is Dev Mode only and does not change signer logic or the request path.
+            if (isDevMode) {
+                val signedRequest = OciSignedClient().sign(
+                    auth = OciAuthContext.ApiKey(
+                        tenancyOcid = auth.tenancyOcid,
+                        userOcid = auth.userOcid,
+                        fingerprint = auth.fingerprint,
+                        privateKey = auth.privateKey,
+                        region = "",
+                    ),
+                    method = "GET",
+                    host = host,
+                    pathAndQuery = path,
+                    dateOverride = dateStr,
+                )
+                val signedUrl = "https://${signedRequest.host}${signedRequest.pathAndQuery}"
+                val finalDiagnostics = OciSignerDiagnostics.buildFinalRequestDiagnostics(
+                    signedMethod = signedRequest.method,
+                    signedUrl = signedUrl,
+                    signedEncodedPath = signedRequest.pathAndQuery.substringBefore('?'),
+                    signedQuery = signedRequest.pathAndQuery.substringAfter('?', ""),
+                    signedHost = signedRequest.host,
+                    signedDate = signedRequest.date,
+                    signedContentSha256 = signedRequest.headers["x-content-sha256"],
+                    signedContentType = signedRequest.headers["content-type"],
+                    signedContentLength = signedRequest.headers["content-length"],
+                    signedAuthorization = signedRequest.authorization,
+                    finalMethod = finalRequest.method,
+                    finalUrl = finalRequest.url.toString(),
+                    finalEncodedPath = finalRequest.url.encodedPath,
+                    finalQuery = finalRequest.url.query,
+                    finalUrlHost = finalRequest.url.host,
+                    finalHostHeader = finalRequest.header("host"),
+                    finalDateHeader = finalRequest.header("date"),
+                    finalContentSha256Header = finalRequest.header("x-content-sha256"),
+                    finalContentTypeHeader = finalRequest.header("content-type"),
+                    finalContentLengthHeader = finalRequest.header("content-length"),
+                    finalAuthorizationHeader = finalRequest.header("Authorization"),
+                )
+                emit(Phase.API_KEY, Status.RUNNING, "API-key activation GET final-request diagnostics:")
+                finalDiagnostics.forEach { (k, v) ->
+                    emit(Phase.API_KEY, Status.RUNNING, " final: $k=$v")
+                }
+            }
+
             resp.use { response ->
                 when (response.code) {
                     in 200..299 -> true

@@ -98,6 +98,106 @@ object OciSignerDiagnostics {
         )
     }
 
+    /**
+     * Safe final-request diagnostics for the API-key activation GET.
+     *
+     * Compares the signed request values against the values OkHttp actually transmits.
+     * Never logs the full Authorization header, signature value, request body, or full OCIDs.
+     */
+    fun buildFinalRequestDiagnostics(
+        signedMethod: String,
+        signedUrl: String,
+        signedEncodedPath: String,
+        signedQuery: String,
+        signedHost: String,
+        signedDate: String,
+        signedContentSha256: String?,
+        signedContentType: String?,
+        signedContentLength: String?,
+        signedAuthorization: String,
+        finalMethod: String,
+        finalUrl: String,
+        finalEncodedPath: String,
+        finalQuery: String?,
+        finalUrlHost: String,
+        finalHostHeader: String?,
+        finalDateHeader: String?,
+        finalContentSha256Header: String?,
+        finalContentTypeHeader: String?,
+        finalContentLengthHeader: String?,
+        finalAuthorizationHeader: String?,
+    ): Map<String, String> {
+        val mismatches = mutableListOf<String>()
+        if (signedMethod != finalMethod) mismatches.add("method differs: signed=$signedMethod final=$finalMethod")
+        if (signedEncodedPath != finalEncodedPath) mismatches.add("encoded path differs")
+        val finalQueryNorm = finalQuery ?: ""
+        if (signedQuery != finalQueryNorm) mismatches.add("query string differs: signed='$signedQuery' final='$finalQueryNorm'")
+        val finalHostHeaderNorm = finalHostHeader ?: ""
+        if (!signedHost.equals(finalUrlHost, ignoreCase = true)) mismatches.add("signed host differs from final URL host")
+        if (!signedHost.equals(finalHostHeaderNorm, ignoreCase = true)) mismatches.add("host header missing or differs")
+        if (signedDate != finalDateHeader) mismatches.add("date header differs: signed=$signedDate final=$finalDateHeader")
+        if (signedContentSha256 != null && signedContentSha256 != finalContentSha256Header) mismatches.add("x-content-sha256 header differs")
+        if (signedContentType != null && signedContentType != finalContentTypeHeader) mismatches.add("content-type header differs")
+        if (signedContentLength != null && signedContentLength != finalContentLengthHeader) mismatches.add("content-length header differs")
+        if (finalAuthorizationHeader == null) mismatches.add("authorization header missing from final request")
+
+        val authDiagnostics = finalAuthorizationHeader?.let { buildAuthorizationDiagnostics(it) } ?: emptyMap()
+        val authorizationSha256 = finalAuthorizationHeader?.let { hexSha256(it) } ?: "none"
+        val signatureSha256 = finalAuthorizationHeader?.let { auth ->
+            extractQuoted(auth, "signature")?.let { hexSha256(it) } ?: "none"
+        } ?: "none"
+
+        val authPresent = finalAuthorizationHeader != null
+        return linkedMapOf(
+            "finalRequestMatchesSignedValues" to (mismatches.isEmpty() && authPresent).toString(),
+            "finalRequestMismatch" to if (mismatches.isEmpty()) "none" else mismatches.first(),
+            "signedMethod" to signedMethod,
+            "finalMethod" to finalMethod,
+            "signedUrl" to abbreviateUrl(signedUrl),
+            "finalUrl" to abbreviateUrl(finalUrl),
+            "signedEncodedPath" to abbreviatePath(signedEncodedPath),
+            "finalEncodedPath" to abbreviatePath(finalEncodedPath),
+            "signedQuery" to signedQuery,
+            "finalQuery" to (finalQuery ?: ""),
+            "signedHost" to signedHost,
+            "finalUrlHost" to finalUrlHost,
+            "finalHostHeader" to (finalHostHeader ?: "missing"),
+            "signedDate" to signedDate,
+            "finalDateHeader" to (finalDateHeader ?: "missing"),
+            "signedContentSha256" to (signedContentSha256 ?: "n/a"),
+            "finalContentSha256Header" to (finalContentSha256Header ?: "missing"),
+            "signedContentType" to (signedContentType ?: "n/a"),
+            "finalContentTypeHeader" to (finalContentTypeHeader ?: "missing"),
+            "signedContentLength" to (signedContentLength ?: "n/a"),
+            "finalContentLengthHeader" to (finalContentLengthHeader ?: "missing"),
+            "authorizationHeaderPresent" to authPresent.toString(),
+            "authorizationScheme" to (authDiagnostics["authHeader.scheme"] ?: "missing"),
+            "authorizationVersion" to (authDiagnostics["authHeader.version"] ?: "missing"),
+            "authorizationHasKeyId" to (authDiagnostics["authHeader.keyIdAbbrev"] != null && authDiagnostics["authHeader.keyIdAbbrev"] != "***").toString(),
+            "authorizationHasAlgorithm" to (authDiagnostics["authHeader.algorithm"] ?: "missing"),
+            "authorizationHasHeaders" to (authDiagnostics["authHeader.headersRaw"] != null && authDiagnostics["authHeader.headersRaw"] != "missing").toString(),
+            "authorizationHasSignature" to (authDiagnostics["authHeader.signaturePresent"] ?: "false"),
+            "authorizationHeaderSha256" to authorizationSha256,
+            "signatureValueSha256" to signatureSha256,
+        )
+    }
+
+    /** Abbreviate a URL, keeping scheme, host and redacting OCIDs in the path. */
+    private fun abbreviateUrl(url: String): String {
+        return try {
+            val parsed = java.net.URL(url)
+            val redactedPath = abbreviatePath(parsed.path + (parsed.query?.let { "?$it" } ?: ""))
+            "${parsed.protocol}://${parsed.host}$redactedPath"
+        } catch (e: Exception) {
+            abbreviatePath(url)
+        }
+    }
+
+    private fun hexSha256(input: String): String {
+        val digest = java.security.MessageDigest.getInstance("SHA-256").digest(input.toByteArray(Charsets.UTF_8))
+        return digest.joinToString("") { "%02x".format(it) }
+    }
+
     /** Extract the value inside `name="value"` from a Signature Authorization header. */
     private fun extractQuoted(authorization: String, name: String): String? {
         val prefix = "$name=\""
