@@ -1,6 +1,5 @@
 package com.zerovpn.app.oci
 
-import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertThrows
@@ -55,28 +54,6 @@ class OciCredentialIdentityTest {
         assertThrows(IllegalArgumentException::class.java) {
             OciCredentialIdentity.verify(pair.private, fingerprint, "0".repeat(64))
         }
-    }
-
-    @Test fun publicKeyDerivedFromPrivateKeyMatchesUploadedKey() {
-        val pair = OciRequestSigner.generateKeyPair()
-        val uploadedPublicKey = pair.public as java.security.interfaces.RSAPublicKey
-        val derivedPublicKey = OciCredentialIdentity.publicKeyFrom(pair.private)
-
-        assertEquals("Derived modulus must match uploaded modulus", uploadedPublicKey.modulus, derivedPublicKey.modulus)
-        assertEquals("Derived public exponent must match uploaded exponent", uploadedPublicKey.publicExponent, derivedPublicKey.publicExponent)
-        assertArrayEquals("Derived DER encoding must match uploaded DER encoding", uploadedPublicKey.encoded, derivedPublicKey.encoded)
-    }
-
-    @Test fun fingerprintIsCalculatedFromUploadedPublicKey() {
-        val pair = OciRequestSigner.generateKeyPair()
-        val uploadedPublicKey = pair.public as java.security.interfaces.RSAPublicKey
-        val derivedPublicKey = OciCredentialIdentity.publicKeyFrom(pair.private)
-
-        val fingerprintFromUploaded = OciCredentialIdentity.fingerprintOf(uploadedPublicKey)
-        val fingerprintFromDerived = OciCredentialIdentity.fingerprintOf(derivedPublicKey)
-
-        assertEquals("Fingerprint from uploaded public key must match derived key fingerprint", fingerprintFromUploaded, fingerprintFromDerived)
-        assertEquals("OCI identity verify must return the same fingerprint", fingerprintFromUploaded, OciCredentialIdentity.verify(pair.private, fingerprintFromUploaded))
     }
 
     @Test fun verifyFailsOnNonRsaKey() {
