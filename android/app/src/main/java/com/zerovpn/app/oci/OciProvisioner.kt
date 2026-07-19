@@ -113,7 +113,7 @@ class OciProvisioner(
     private val _events = MutableSharedFlow<ProvisioningEvent>(replay = 64, extraBufferCapacity = 64)
     val events: SharedFlow<ProvisioningEvent> = _events.asSharedFlow()
 
-    private val httpClient = OkHttpClient.Builder()
+    internal var httpClient = OkHttpClient.Builder()
         .connectTimeout(30, TimeUnit.SECONDS)
         .readTimeout(60, TimeUnit.SECONDS)
         .writeTimeout(30, TimeUnit.SECONDS)
@@ -781,7 +781,7 @@ class OciProvisioner(
     }
     // --- Phase 3: API Key Upload ---
 
-    private suspend fun uploadApiKey(
+    internal suspend fun uploadApiKey(
         auth: AuthResult,
         homeRegion: String,
         onUploaded: ((String) -> Unit)? = null,
@@ -875,11 +875,58 @@ class OciProvisioner(
 
         onUploaded?.invoke(uploadedFingerprint)
 
+        val activationProbePath = "/20160918/users/${auth.userOcid}/apiKeys"
+
+        // Dev Mode diagnostic: use Oracle SDK signer for exactly one activation GET.
+        // This is isolated from normal mode and does not create cloud resources.
+        if (isDevMode) {
+            emit(Phase.API_KEY, Status.RUNNING, "Running Oracle SDK runtime signer diagnostic...")
+            val result = try {
+                OciOracleSdkActivationDiagnostic.run(
+                    httpClient = httpClient,
+                    tenancyOcid = auth.tenancyOcid,
+                    userOcid = auth.userOcid,
+                    fingerprint = uploadedFingerprint,
+                    privateKey = auth.privateKey,
+                    host = idHost,
+                    path = activationProbePath,
+                )
+            } catch (e: Exception) {
+                emit(
+                    Phase.API_KEY,
+                    Status.ERROR,
+                    "Oracle SDK signer cannot be used at Android runtime: ${e.javaClass.simpleName}: ${e.message}",
+                )
+                throw OracleSdkRuntimeNotAvailableException(e)
+            }
+            if (isDevMode) {
+                emit(Phase.API_KEY, Status.RUNNING, "Oracle SDK runtime signer diagnostics:")
+                result.diagnostics.forEach { (k, v) ->
+                    emitDeveloperOnly(Phase.API_KEY, Status.RUNNING, " sdk: $k=$v")
+                }
+            }
+            if (result.success) {
+                emit(Phase.API_KEY, Status.SUCCESS, "API-key validation succeeded with Oracle SDK signer")
+                throw OracleSdkActivationSucceededException()
+            } else {
+                emit(
+                    Phase.API_KEY,
+                    Status.ERROR,
+                    "API-key validation failed even with Oracle SDK signer (HTTP ${result.httpCode})",
+                )
+                throw ApiKeyActivationFailedException(
+                    fingerprint = uploadedFingerprint,
+                    keyId = "${auth.tenancyOcid}/${auth.userOcid}/$uploadedFingerprint",
+                    endpoint = "https://$idHost$activationProbePath",
+                    attemptCount = 1,
+                )
+            }
+        }
+
         // --- API-key activation gate ---
         // OCI IAM propagation can take a few seconds after upload. Before sending any
         // mutation requests (VCN, instance, network), probe with a read-only GET using
         // the new API-key auth context. Retry with backoff on 401 NotAuthenticated only.
-        val activationProbePath = "/20160918/users/${auth.userOcid}/apiKeys"
         val backoffMs = longArrayOf(2000, 4000, 8000, 16000, 32000)
         var activationSuccess = false
         var attemptCount = 0
@@ -1072,6 +1119,23 @@ class OciProvisioner(
         "API-key activation failed after $attemptCount probe attempt(s). " +
             "The key was uploaded successfully but OCI IAM did not authenticate it within the bounded window. " +
             "keyId=$keyId, endpoint=$endpoint"
+    )
+
+    /**
+     * Thrown in Dev Mode when the Oracle SDK runtime-signer diagnostic succeeds.
+     * Stops provisioning before any cloud resources are created.
+     */
+    class OracleSdkActivationSucceededException : Exception(
+        "API-key validation succeeded with Oracle SDK signer. Diagnostic complete — stopping before cloud resource creation."
+    )
+
+    /**
+     * Thrown in Dev Mode when Oracle SDK classes cannot be used at Android runtime.
+     * The message contains the exact build/runtime blocker.
+     */
+    class OracleSdkRuntimeNotAvailableException(cause: Throwable) : Exception(
+        "Oracle SDK signer cannot be used at Android runtime: ${cause.javaClass.simpleName}: ${cause.message}",
+        cause,
     )
 
     // --- Phase 4: Network Creation ---

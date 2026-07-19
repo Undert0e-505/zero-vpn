@@ -193,5 +193,6 @@ dependencies {
     testImplementation("org.json:json:20240303")
     testImplementation("org.robolectric:robolectric:4.16.1")
     testImplementation("com.oracle.oci.sdk:oci-java-sdk-common:3.60.0")
+    implementation("com.oracle.oci.sdk:oci-java-sdk-common:3.60.0")
     debugImplementation(libs.androidx.compose.ui.tooling)
 }
