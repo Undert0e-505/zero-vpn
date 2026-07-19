@@ -10,7 +10,7 @@ import org.junit.Test
  * Tests for the API-key activation gate diagnostics.
  *
  * After uploading a new API key, the provisioner probes with a read-only GET
- * using API-key auth. On 401 it retries with backoff (1s, 2s, 4s, 8s, 15s).
+ * using API-key auth. On 401 it retries with backoff (2s, 4s, 8s, 16s, 32s).
  * Only 401 triggers retries; other HTTP errors stop immediately.
  *
  * These tests verify the exception diagnostics and keyId format. The actual

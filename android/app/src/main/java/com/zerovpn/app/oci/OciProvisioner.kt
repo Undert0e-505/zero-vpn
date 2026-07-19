@@ -877,7 +877,7 @@ class OciProvisioner(
         // mutation requests (VCN, instance, network), probe with a read-only GET using
         // the new API-key auth context. Retry with backoff on 401 NotAuthenticated only.
         val activationProbePath = "/20160918/users/${auth.userOcid}/apiKeys"
-        val backoffMs = longArrayOf(1000, 2000, 4000, 8000, 15000)
+        val backoffMs = longArrayOf(2000, 4000, 8000, 16000, 32000)
         var activationSuccess = false
         var attemptCount = 0
         for ((index, delayMs) in backoffMs.withIndex()) {
