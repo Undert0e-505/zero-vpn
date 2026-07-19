@@ -973,9 +973,14 @@ class OciProvisioner(
                 signingKeyIdSource = "auth.fingerprint",
             )
             if (isDevMode) {
+                val authDiagnostics = OciSignerDiagnostics.buildAuthorizationDiagnostics(authHeader)
                 emit(Phase.API_KEY, Status.RUNNING, "API-key activation GET signer diagnostics:")
                 diagnostics.forEach { (k, v) ->
                     emit(Phase.API_KEY, Status.RUNNING, " signer: $k=$v")
+                }
+                emit(Phase.API_KEY, Status.RUNNING, "API-key activation GET Authorization diagnostics:")
+                authDiagnostics.forEach { (k, v) ->
+                    emit(Phase.API_KEY, Status.RUNNING, " auth: $k=$v")
                 }
                 emit(Phase.API_KEY, Status.RUNNING, "API-key activation GET fingerprint diagnostics:")
                 fingerprintDiagnostics.forEach { (k, v) ->

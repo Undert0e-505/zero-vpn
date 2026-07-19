@@ -153,6 +153,48 @@ class OciSignerOracleReferenceTest {
         assertEquals("Upload POST Authorization must match reference", ref.authorization, zero.authorization)
     }
 
+    @Test fun activationGetAuthorizationHeadersRawValueIsSpaceSeparated() {
+        val path = "/20160918/users/${userOcid}/apiKeys"
+        val zero = OciSignedClient(fixedClock).sign(
+            apiKeyAuth, "GET", "identity.eu-zurich-1.oraclecloud.com", path,
+        )
+        val headersRaw = zero.authorization
+            .substringAfter("headers=\"").substringBefore("\"")
+        assertEquals("Activation GET headers= must be space-separated", "date (request-target) host", headersRaw)
+        assertFalse("Activation GET headers= must not contain comma", headersRaw.contains(','))
+        assertFalse("Activation GET headers= must not contain brackets", headersRaw.contains('[') || headersRaw.contains(']'))
+    }
+
+    @Test fun postAuthorizationHeadersRawValueIsSpaceSeparated() {
+        val path = "/20160918/users/${userOcid}/apiKeys"
+        val body = """{"key":"test"}""".toByteArray()
+        val zero = OciSignedClient(fixedClock).sign(
+            apiKeyAuth, "POST", "identity.eu-zurich-1.oraclecloud.com", path, body,
+        )
+        val headersRaw = zero.authorization
+            .substringAfter("headers=\"").substringBefore("\"")
+        assertEquals(
+            "POST headers= must be space-separated and match signing-string order",
+            "date (request-target) host content-length content-type x-content-sha256",
+            headersRaw,
+        )
+        assertFalse("POST headers= must not contain comma", headersRaw.contains(','))
+    }
+
+    @Test fun regressionDefaultJoinToStringWouldProduceCommasAndFail() {
+        val path = "/20160918/users/${userOcid}/apiKeys"
+        val zero = OciSignedClient(fixedClock).sign(
+            apiKeyAuth, "GET", "identity.eu-zurich-1.oraclecloud.com", path,
+        )
+        val headersRaw = zero.authorization
+            .substringAfter("headers=\"").substringBefore("\"")
+        val commaFormatted = zero.signedHeaderNames.joinToString()
+        assertFalse(
+            "Authorization headers= must not match default joinToString() comma output",
+            headersRaw == commaFormatted,
+        )
+    }
+
     @Test fun authorizationHeaderStructureIsWellFormed() {
         val path = "/20160918/instances/ocid1.instance.oc1..test"
         val zero = OciSignedClient(fixedClock).sign(

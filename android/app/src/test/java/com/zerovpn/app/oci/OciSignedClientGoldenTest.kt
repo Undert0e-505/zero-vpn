@@ -55,6 +55,62 @@ class OciSignedClientGoldenTest {
         assertEquals(a, b)
     }
 
+    @Test fun activationGetAuthorizationHeadersRawValueIsSpaceSeparated() {
+        val request = signer.sign(auth, "GET", "identity.eu-zurich-1.oraclecloud.com", "/20160918/users/user/apiKeys")
+        val headersRaw = request.authorization
+            .substringAfter("headers=\"").substringBefore("\"")
+        assertEquals("date (request-target) host", headersRaw)
+    }
+
+    @Test fun activationGetAuthorizationHeadersContainsNoComma() {
+        val request = signer.sign(auth, "GET", "identity.eu-zurich-1.oraclecloud.com", "/20160918/users/user/apiKeys")
+        val headersRaw = request.authorization
+            .substringAfter("headers=\"").substringBefore("\"")
+        assertFalse("headers= must not contain a comma", headersRaw.contains(','))
+    }
+
+    @Test fun activationGetAuthorizationHeadersContainsNoBrackets() {
+        val request = signer.sign(auth, "GET", "identity.eu-zurich-1.oraclecloud.com", "/20160918/users/user/apiKeys")
+        val headersRaw = request.authorization
+            .substringAfter("headers=\"").substringBefore("\"")
+        assertFalse("headers= must not contain '['", headersRaw.contains('['))
+        assertFalse("headers= must not contain ']'", headersRaw.contains(']'))
+    }
+
+    @Test fun authorizationHeadersMatchesSigningStringLineOrder() {
+        val body = "{\"a\":1}".toByteArray()
+        val request = signer.sign(auth, "POST", "iaas.eu-zurich-1.oraclecloud.com", "/20160918/vcns", body)
+        val namesFromStringToSign = request.stringToSign.split("\n").map { it.substringBefore(":") }
+        val headersRaw = request.authorization
+            .substringAfter("headers=\"").substringBefore("\"")
+        val namesFromAuth = headersRaw.split(" ")
+        assertEquals(namesFromStringToSign, namesFromAuth)
+    }
+
+    @Test fun postAuthorizationHeadersRawValueIsSpaceSeparated() {
+        val body = "{\"a\":1}".toByteArray()
+        val request = signer.sign(auth, "POST", "iaas.eu-zurich-1.oraclecloud.com", "/20160918/vcns", body)
+        val headersRaw = request.authorization
+            .substringAfter("headers=\"").substringBefore("\"")
+        assertEquals(
+            "date (request-target) host content-length content-type x-content-sha256",
+            headersRaw,
+        )
+    }
+
+    @Test fun regressionHeadersValueMustNotUseDefaultJoinToStringCommaFormatting() {
+        // A default Kotlin List.joinToString() would produce "date, (request-target), host".
+        // Oracle requires space-separated header names.
+        val request = signer.sign(auth, "GET", "identity.eu-zurich-1.oraclecloud.com", "/x")
+        val headersRaw = request.authorization
+            .substringAfter("headers=\"").substringBefore("\"")
+        assertFalse(
+            "headers= must not use default comma formatting",
+            headersRaw == request.signedHeaderNames.joinToString(),
+        )
+        assertEquals("date (request-target) host", headersRaw)
+    }
+
     @Test fun foregroundAndBackgroundPostAreByteIdentical() {
         val body = "{\"fixed\":true}".toByteArray()
         val a = signer.sign(auth, "POST", "iaas.eu-zurich-1.oraclecloud.com", "/x", body)

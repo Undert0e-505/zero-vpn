@@ -76,6 +76,38 @@ object OciSignerDiagnostics {
     private fun extractQuery(pathAndQuery: String): String =
         pathAndQuery.substringAfter('?', "")
 
+    /**
+     * Safe Authorization-header diagnostics.
+     *
+     * Parses the actual `headers="..."` value from the real Authorization header
+     * and reports whether it is comma- or space-separated, bracketed, etc.
+     * Never logs the full Authorization header, signature, or full OCIDs.
+     */
+    fun buildAuthorizationDiagnostics(authorization: String): Map<String, String> {
+        val headersRaw = extractQuoted(authorization, "headers")
+        return linkedMapOf(
+            "authHeader.scheme" to (if (authorization.startsWith("Signature ")) "Signature" else "UNKNOWN"),
+            "authHeader.version" to (extractQuoted(authorization, "version") ?: "missing"),
+            "authHeader.algorithm" to (extractQuoted(authorization, "algorithm") ?: "missing"),
+            "authHeader.headersRaw" to (headersRaw ?: "missing"),
+            "authHeader.headersContainsComma" to (headersRaw?.contains(',')?.toString() ?: "n/a"),
+            "authHeader.headersHasBrackets" to ((headersRaw?.contains('[') == true || headersRaw?.contains(']') == true).toString()),
+            "authHeader.headersUsesSpaces" to (headersRaw?.contains(' ')?.toString() ?: "n/a"),
+            "authHeader.keyIdAbbrev" to abbreviateKeyId(extractQuoted(authorization, "keyId") ?: ""),
+            "authHeader.signaturePresent" to authorization.contains("signature=\"").toString(),
+        )
+    }
+
+    /** Extract the value inside `name="value"` from a Signature Authorization header. */
+    private fun extractQuoted(authorization: String, name: String): String? {
+        val prefix = "$name=\""
+        val start = authorization.indexOf(prefix)
+        if (start < 0) return null
+        val valueStart = start + prefix.length
+        val end = authorization.indexOf('"', valueStart)
+        return if (end >= valueStart) authorization.substring(valueStart, end) else null
+    }
+
     /** Abbreviate an OCI API-key fingerprint to `fp:..last`. */
     fun abbreviateFingerprint(fingerprint: String): String {
         if (fingerprint.length <= 12) return fingerprint
