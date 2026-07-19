@@ -849,7 +849,7 @@ class OciProvisioner(
             auth.fingerprint
         }
         if (uploadedFingerprint != auth.fingerprint) {
-            emit(Phase.API_KEY, Status.WARNING, "Uploaded API key fingerprint differs from local fingerprint; using OCI response")
+            emit(Phase.API_KEY, Status.WARNING, "Uploaded API key fingerprint differs from local fingerprint; using OCI response (fingerprint redacted)")
         }
 
         // Switch from security-token auth to durable API-key auth.
@@ -903,7 +903,7 @@ class OciProvisioner(
         }
         if (!activationSuccess) {
             val keyId = "${auth.tenancyOcid}/${auth.userOcid}/$uploadedFingerprint"
-            emit(Phase.API_KEY, Status.ERROR, "API-key activation failed after $attemptCount probe attempt(s). keyId=$keyId")
+            emit(Phase.API_KEY, Status.ERROR, "API-key activation failed after $attemptCount probe attempt(s). (keyId redacted)")
             throw ApiKeyActivationFailedException(
                 fingerprint = uploadedFingerprint,
                 keyId = keyId,
@@ -912,7 +912,7 @@ class OciProvisioner(
             )
         }
 
-        emit(Phase.API_KEY, Status.SUCCESS, "API key uploaded and activated: $uploadedFingerprint")
+        emit(Phase.API_KEY, Status.SUCCESS, "API key uploaded and activated")
         return uploadedFingerprint
     }
 
